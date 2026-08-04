@@ -1,0 +1,38 @@
+{
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "Qwen/Qwen2.5-14B-Instruct",
+  "images_base_url": "https://api.siliconflow.cn/v1",
+  "images_model": "Kwai-Kolors/Kolors",
+  "image_prompt": "请将用户的输入升华具有大师水准的准确且标准且丰富的的英文绘图提示词，请尽可能让画面栩栩如生，以便绘图模型能够完美绘制。",
+  "api_key": "sk-dplqbsomzrruqpclshnwysqlmhpdbylvfxbnvtvwygvsvfaz",
+  "temperature": 0.2,
+  "max_tokens": 1024,
+  "frequency_penalty": 0.0,
+  "presence_penalty": 0.0,
+  "top_p": 0.9,
+  "db_model": "Qwen/Qwen2.5-14B-Instruct",
+  "images_api_key": "sk-dplqbsomzrruqpclshnwysqlmhpdbylvfxbnvtvwygvsvfaz",
+  "system_prompt": "你是温柔听话的女友。",
+  "role_name": "小蛋糕",
+  "user_name": "主人",
+  "memory": {
+    "max_history_rounds": 10,
+    "summary_threshold": 20,
+    "summary_interval": 10
+  },
+  "agent": {
+    "max_tool_rounds": 5,
+    "tool_call_timeout": 30,
+    "enable_tools": false,
+    "allowed_tools": []
+  },
+  "stt": {
+    "local_enabled": true,
+    "local_model": "base",
+    "local_device": "cpu",
+    "local_compute_type": "int8",
+    "api_timeout": 15,
+    "hf_endpoint": "https://hf-mirror.com"
+  },
+  "active_role_card": "10584528558d"
+}

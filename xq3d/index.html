@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>楚汉棋境 · 3D象棋探索</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <canvas id="game-canvas"></canvas>
+
+  <script>
+    // 运行时错误探针：出现异常时写入 DOM，便于排查（正常运行时无任何显示）
+    window.addEventListener('error', e => {
+      const d = document.createElement('div');
+      d.className = 'err';
+      d.textContent = 'ERR: ' + e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '');
+      document.body.appendChild(d);
+    });
+    window.addEventListener('unhandledrejection', e => {
+      const d = document.createElement('div');
+      d.className = 'err';
+      d.textContent = 'REJ: ' + e.reason;
+      document.body.appendChild(d);
+    });
+  </script>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./assets/three.module.min.js"
+    }
+  }
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
