@@ -1,0 +1,54 @@
+# Python 运行时缓存
+__pycache__/
+*.py[cod]
+
+# Node 工具链（TS 迁移阶段 0 引入）
+node_modules/
+dist/
+
+# todo_list 插件运行时数据（用户任务数据，勿提交）
+plugins/todo_list/data/
+# harness 任务系统运行时日志（断点续跑状态，勿提交）
+harness_tasks.json
+harness_tasks.json.tmp
+harness_task_memory.json
+harness_task_memory.json.tmp
+
+# 编译探针残留（调试会话产生的重命名 .pyc，无运行价值）
+*.pyc-check
+
+# 视频收藏夹运行时数据（用户收藏数据，勿提交；歌单 music_playlists.json 同例）
+video_favorites.json
+video_favorites.json.tmp
+
+# codex/opencode 独立进程运行时状态与日志（热重载断点续跑，勿提交）
+codex_runtime.json
+codex_runtime.json.tmp
+codex_logs/
+
+# 角色对话轮断点（热重载续跑运行时状态，勿提交）
+data/turn_checkpoints/
+
+# ---------- 多智能体并发治理：统一忽略运行产物（2026-08-27） ----------
+# 编辑器/并发任务备份残留
+*.bak
+*.bak-*
+*.testbak
+# 运行日志（根目录滚动日志与 _server 变体）
+restart_check.log
+server_restart.log
+server_stdout.log
+server_stderr.log
+_server_restart.log
+_server_stderr.log
+*.log
+# 聊天/状态数据库
+chat_memory.db
+chat_memory.db-shm
+chat_memory.db-wal
+# 构建/缓存
+.ruff_cache/
+web/generated/
+# 异常目录残留（占位/临时）
+%TEMP%/
+undefined/
