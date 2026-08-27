@@ -34,6 +34,25 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger("harness.flow_dsl")
+_FLOW_CLASSES: Dict[str, type] = {}   # 类名 -> Flow 子类（TaskSystem handler 重启恢复用）
+
+
+def _make_flow_handler(cls_name: str, method_name: str) -> Callable:
+    """生成可持久化 handler：按类名重建 Flow 实例并调用指定方法。
+
+    同步方法直接返回值；异步方法返回 coroutine（TaskSystem 会 await）。
+    """
+    def handler(payload: Any = None, **kw) -> Any:
+        cls = _FLOW_CLASSES.get(cls_name)
+        if cls is None:
+            raise RuntimeError(f"Flow 类未登记: {cls_name}")
+        flow = cls()
+        m = flow._methods.get(method_name)
+        if m is None:
+            raise RuntimeError(f"Flow 方法不存在: {cls_name}.{method_name}")
+        args = [payload] if payload is not None else []
+        return m.func(*args) if not m.is_async else m.func(*args)
+    return handler
 
 
 class FlowMethodDefinition:
@@ -174,3 +193,31 @@ class Flow:
     def results(self) -> Dict[str, Any]:
         """查看各方法执行结果。"""
         return dict(self._results)
+    def __init_subclass__(cls, **kw):
+        """子类定义时自动登记到 _FLOW_CLASSES（供 TaskSystem handler 重启恢复）。"""
+        super().__init_subclass__(**kw)
+        _FLOW_CLASSES[cls.__name__] = cls
+
+    def submit_to_tasks(self, tasks, name: str = "", goal: str = "",
+                        queue: str = "flows", durable: bool = True) -> str:
+        """把本 Flow 提交给 TaskSystem 执行（断点续跑/失败反思/LLM 预算全生效）。
+
+        每个方法注册为可持久化 handler（flow:<类名>:<方法名>），
+        @listen 依赖自动转成步骤 deps，结果经 {{步骤id.result}} 模板传递。
+        提交后由 TaskSystem 调度，重启后自动恢复未完成步骤。
+        """
+        cls_name = type(self).__name__
+        steps = []
+        for m in self._methods.values():
+            handler_name = f"flow:{cls_name}:{m.name}"
+            tasks.register_handler(handler_name, _make_flow_handler(cls_name, m.name))
+            step = {"id": m.name, "action": "handler", "handler": handler_name, "args": {}}
+            if m.is_start:
+                step["deps"] = []
+            else:
+                step["deps"] = list(m.listen)
+                if m.listen:
+                    step["args"] = {"payload": f"{{{{{m.listen[0]}.result}}}}"}
+            steps.append(step)
+        return tasks.submit_flow(name or cls_name, steps, queue=queue,
+                                 durable=durable, goal=goal or name or cls_name)
