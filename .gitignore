@@ -52,3 +52,4 @@ web/generated/
 # 异常目录残留（占位/临时）
 %TEMP%/
 undefined/
+web/vendor/

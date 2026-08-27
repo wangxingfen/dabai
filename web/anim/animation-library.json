@@ -1,0 +1,473 @@
+{
+  "$schema": "./animation-library-schema.json",
+  "version": "1.0.0",
+  "description": "Mixamo 动作表情库配置 — 定义所有可用动作的元数据、情绪标签和播放参数",
+  "baseUrl": "/anim/",
+  "autoLoadOnBoot": true,
+  "categories": {
+    "idle": {
+      "label": "空闲待机",
+      "description": "角色待机时的循环动作",
+      "animations": [
+        {
+          "name": "idle_normal",
+          "file": "idle/Idle.fbx",
+          "emotion": "neutral",
+          "loop": true,
+          "description": "普通待机呼吸"
+        },
+        {
+          "name": "idle_happy",
+          "file": "idle/Idle_Happy.fbx",
+          "emotion": "happy",
+          "loop": true,
+          "description": "开心待机，身体微晃"
+        },
+        {
+          "name": "idle_sad",
+          "file": "idle/Idle_Sad.fbx",
+          "emotion": "sad",
+          "loop": true,
+          "description": "伤心待机，低头垂肩"
+        },
+        {
+          "name": "idle_angry",
+          "file": "idle/Idle_Angry.fbx",
+          "emotion": "angry",
+          "loop": true,
+          "description": "生气待机，双手叉腰"
+        },
+        {
+          "name": "idle_shy",
+          "file": "idle/Shy_Idle.fbx",
+          "emotion": "shy",
+          "loop": true,
+          "description": "害羞待机，身体微扭"
+        }
+      ]
+    },
+    "gesture": {
+      "label": "手势动作",
+      "description": "手臂和手部的表意动作",
+      "animations": [
+        {
+          "name": "wave",
+          "file": "gesture/Waving.fbx",
+          "emotion": "happy",
+          "loop": false,
+          "description": "招手问好"
+        },
+        {
+          "name": "clap",
+          "file": "gesture/Clapping.fbx",
+          "emotion": "excited",
+          "loop": false,
+          "description": "鼓掌"
+        },
+        {
+          "name": "point",
+          "file": "gesture/Pointing.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "指方向"
+        },
+        {
+          "name": "thumbs_up",
+          "file": "gesture/Thumbs_Up.fbx",
+          "emotion": "proud",
+          "loop": false,
+          "description": "点赞"
+        },
+        {
+          "name": "no_gesture",
+          "file": "gesture/No_Gesture.fbx",
+          "emotion": "sad",
+          "loop": false,
+          "description": "摆手拒绝"
+        },
+        {
+          "name": "yes_gesture",
+          "file": "gesture/Yes_Gesture.fbx",
+          "emotion": "happy",
+          "loop": false,
+          "description": "点头同意"
+        },
+        {
+          "name": "come_here",
+          "file": "gesture/Come_Here.fbx",
+          "emotion": "playful",
+          "loop": false,
+          "description": "招手让过来"
+        },
+        {
+          "name": "scratch_head",
+          "file": "gesture/Scratch_Head.fbx",
+          "emotion": "thoughtful",
+          "loop": false,
+          "description": "挠头困惑"
+        },
+        {
+          "name": "arms_crossed",
+          "file": "gesture/Arms_Crossed.fbx",
+          "emotion": "angry",
+          "loop": true,
+          "description": "抱臂"
+        }
+      ]
+    },
+    "emotion": {
+      "label": "情绪表达",
+      "description": "全身情绪表达动作",
+      "animations": [
+        {
+          "name": "surprise_react",
+          "file": "emotion/Surprise.fbx",
+          "emotion": "surprised",
+          "loop": false,
+          "description": "惊讶后退"
+        },
+        {
+          "name": "victory_cheer",
+          "file": "emotion/Victory.fbx",
+          "emotion": "excited",
+          "loop": false,
+          "description": "胜利欢呼"
+        },
+        {
+          "name": "bow_respect",
+          "file": "emotion/Bow.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "鞠躬"
+        },
+        {
+          "name": "shy_back",
+          "file": "emotion/Shy_Back.fbx",
+          "emotion": "shy",
+          "loop": false,
+          "description": "害羞后退"
+        },
+        {
+          "name": "laugh",
+          "file": "emotion/Laughing.fbx",
+          "emotion": "happy",
+          "loop": false,
+          "description": "大笑"
+        },
+        {
+          "name": "cry",
+          "file": "emotion/Crying.fbx",
+          "emotion": "sad",
+          "loop": false,
+          "description": "哭泣"
+        },
+        {
+          "name": "sigh_deep",
+          "file": "emotion/Sigh.fbx",
+          "emotion": "tired",
+          "loop": false,
+          "description": "叹气"
+        },
+        {
+          "name": "yawn",
+          "file": "emotion/Yawning.fbx",
+          "emotion": "tired",
+          "loop": false,
+          "description": "打哈欠"
+        },
+        {
+          "name": "taunt",
+          "file": "emotion/Taunt.fbx",
+          "emotion": "playful",
+          "loop": false,
+          "description": "调皮挑衅"
+        },
+        {
+          "name": "blow_kiss",
+          "file": "emotion/Blow_Kiss.fbx",
+          "emotion": "love",
+          "loop": false,
+          "description": "飞吻"
+        }
+      ]
+    },
+    "walk": {
+      "label": "移动行走",
+      "description": "各种行走和移动动作",
+      "animations": [
+        {
+          "name": "walk_normal",
+          "file": "walk/Walking.fbx",
+          "emotion": "neutral",
+          "loop": true,
+          "description": "普通行走"
+        },
+        {
+          "name": "walk_happy",
+          "file": "walk/Walking_Happy.fbx",
+          "emotion": "happy",
+          "loop": true,
+          "description": "开心走路"
+        },
+        {
+          "name": "walk_sad",
+          "file": "walk/Walking_Sad.fbx",
+          "emotion": "sad",
+          "loop": true,
+          "description": "伤心走路"
+        },
+        {
+          "name": "run",
+          "file": "walk/Running.fbx",
+          "emotion": "excited",
+          "loop": true,
+          "description": "跑步"
+        },
+        {
+          "name": "walk_backwards",
+          "file": "walk/Walking_Backwards.fbx",
+          "emotion": "neutral",
+          "loop": true,
+          "description": "倒退走"
+        },
+        {
+          "name": "turn_left",
+          "file": "walk/Turn_Left.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "向左转"
+        },
+        {
+          "name": "turn_right",
+          "file": "walk/Turn_Right.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "向右转"
+        }
+      ]
+    },
+    "dance": {
+      "label": "舞蹈动作",
+      "description": "各种舞蹈和庆祝动作",
+      "animations": [
+        {
+          "name": "dance_silly",
+          "file": "dance/Silly_Dancing.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "搞怪跳舞"
+        },
+        {
+          "name": "dance_hiphop",
+          "file": "dance/Hip_Hop_Dancing.fbx",
+          "emotion": "excited",
+          "loop": true,
+          "description": "街舞"
+        },
+        {
+          "name": "dance_twist",
+          "file": "dance/Twist_Dance.fbx",
+          "emotion": "happy",
+          "loop": true,
+          "description": "扭腰舞"
+        },
+        {
+          "name": "dance_macarena",
+          "file": "dance/Macarena.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "玛卡莲娜舞"
+        },
+        {
+          "name": "dance_chicken",
+          "file": "dance/Chicken_Dance.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "小鸡舞"
+        },
+        {
+          "name": "dance_breakdance",
+          "file": "dance/Breakdance.fbx",
+          "emotion": "excited",
+          "loop": true,
+          "description": "霹雳舞"
+        },
+        {
+          "name": "dance_ballet",
+          "file": "dance/Ballet.fbx",
+          "emotion": "elegant",
+          "loop": true,
+          "description": "芭蕾舞"
+        },
+        {
+          "name": "dance_salsa",
+          "file": "dance/Salsa_Dancing.fbx",
+          "emotion": "excited",
+          "loop": true,
+          "description": "萨尔萨舞"
+        },
+        
+        {
+          "name": "dance_gangnam",
+          "file": "dance/Gangnam_Style.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "江南style"
+        },
+        {
+          "name": "dance_robot",
+          "file": "dance/Robot_Dance.fbx",
+          "emotion": "cool",
+          "loop": true,
+          "description": "机器人舞"
+        },
+        {
+          "name": "dance_moonwalk",
+          "file": "dance/Moonwalk.fbx",
+          "emotion": "cool",
+          "loop": true,
+          "description": "太空步"
+        },
+        
+        {
+          "name": "dance_belly",
+          "file": "dance/Belly_Dancing.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "肚皮舞"
+        }
+      ]
+    },
+    "pose": {
+      "label": "姿势造型",
+      "description": "静态姿势和造型",
+      "animations": [
+        {
+          "name": "pose_cool",
+          "file": "pose/Cool_Pose.fbx",
+          "emotion": "proud",
+          "loop": true,
+          "description": "酷酷的姿势"
+        },
+        {
+          "name": "pose_shy",
+          "file": "pose/Shy_Pose.fbx",
+          "emotion": "shy",
+          "loop": true,
+          "description": "害羞姿势"
+        },
+        {
+          "name": "sit_chair",
+          "file": "pose/Sitting_On_Chair.fbx",
+          "emotion": "calm",
+          "loop": true,
+          "description": "坐在椅子上"
+        },
+        {
+          "name": "sit_floor",
+          "file": "pose/Sitting_On_Floor.fbx",
+          "emotion": "calm",
+          "loop": true,
+          "description": "坐在地上"
+        },
+        {
+          "name": "kneel",
+          "file": "pose/Kneeling.fbx",
+          "emotion": "sad",
+          "loop": true,
+          "description": "跪下"
+        },
+        {
+          "name": "lie_down",
+          "file": "pose/Lying_Down.fbx",
+          "emotion": "tired",
+          "loop": true,
+          "description": "躺下"
+        }
+      ]
+    }
+  },
+  "emotionMap": {
+    "happy": [
+      "idle_happy",
+      "laugh",
+      "dance_twist",
+      "walk_happy",
+      "yes_gesture",
+      "wave"
+    ],
+    "excited": [
+      "victory_cheer",
+      "clap",
+      "run",
+      "dance_hiphop",
+      "dance_breakdance",
+      "dance_salsa"
+    ],
+    "sad": [
+      "idle_sad",
+      "cry",
+      "kneel",
+      "walk_sad",
+      "no_gesture"
+    ],
+    "angry": [
+      "idle_angry",
+      "arms_crossed"
+    ],
+    "surprised": [
+      "surprise_react"
+    ],
+    "shy": [
+      "idle_shy",
+      "pose_shy",
+      "shy_back"
+    ],
+    "thoughtful": [
+      "scratch_head"
+    ],
+    "tired": [
+      "sigh_deep",
+      "yawn",
+      "lie_down"
+    ],
+    "calm": [
+      "sit_chair",
+      "sit_floor"
+    ],
+    "proud": [
+      "pose_cool",
+      "thumbs_up"
+    ],
+    "playful": [
+      "dance_silly",
+      "dance_macarena",
+      "dance_chicken",
+      "taunt",
+      "come_here",
+      "dance_gangnam",
+      "dance_belly"
+    ],
+    "love": [
+      "blow_kiss"
+    ],
+    "neutral": [
+      "idle_normal",
+      "walk_normal",
+      "point",
+      "bow_respect",
+      "walk_backwards",
+      "turn_left",
+      "turn_right"
+    ],
+    "elegant": [
+      "dance_ballet"
+    ],
+    "passionate": [
+    ],
+    "cool": [
+      "dance_robot",
+      "dance_moonwalk"
+    ]
+  }
+}
