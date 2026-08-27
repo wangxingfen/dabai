@@ -1,0 +1,15 @@
+{
+  "dsh_base_url": "http://127.0.0.1:3080",
+  "cwd": "D:\\AI\\dabai",
+  "agent_preset": "code",
+  "require_confirm": true,
+  "poll_interval": 1.5,
+  "timeout": 600,
+  "stall_timeout": 600,
+  "tool_stall_timeout": 3600,
+  "settle_seconds": 5.0,
+  "fresh_session_per_task": true,
+  "session_ids": {
+    "d:\\ai\\dabai": "session-bridge-dcf26da4e218"
+  }
+}
