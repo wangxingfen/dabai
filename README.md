@@ -8,6 +8,24 @@
 
 该项目使用 **JavaScript, Python, HTML, CSS** 编写，包含 159 个文件，62,354 行代码。
 
+## 🧠 Harness 扩展框架（技能 / 插件）
+
+「大白」内置稳定的 harness 运行时，通过**技能（Skill）**与**插件（Plugin）**
+持续扩展能力，无需改动核心代码：
+
+- 📖 完整文档见 [HARNESS.md](HARNESS.md)
+- 🖥 管理台：浏览器打开 http://<大白地址>/harness
+- 🧩 技能目录 skills/（内置：文件助手、天气、AI 画图）
+- 🔌 插件目录 plugins/（内置：hello_plugin 示例）
+- 🪶 渐进式披露：settings.json 开启 harness.progressive_disclosure 后，on_demand 技能按需注入
+  （一句话摘要 + 内置 skill_help 工具拉取完整说明书），技能再多也不撑爆上下文
+- ⚙️ 管理 API：/api/harness/status 、/api/harness/skills 、/api/harness/plugins 、/api/harness/reload
+
+```bash
+# 新增一个技能：建目录 → 写 skill.json（可加 skill.py 实现）→ 管理台热重载
+mkdir skills/my_skill
+```
+
 ## 🚀 快速开始
 
 ### 安装
@@ -93,7 +111,7 @@ dabai/
             ├── network/
             ├── ui/
             ├── vr/
-        ├── app.js
+        ├── app.ts
         ├── humanBaseline.json
         ├── index.html
         ├── style.css
@@ -127,8 +145,6 @@ dabai/
     ├── game_engine.py
     ├── key.pem
     ├── key.pem.bak
-    ├── mcp_client.py
-    ├── mcp_servers.json
     ├── memory.py
     ├── package-lock.json
     ├── package.json
@@ -156,6 +172,29 @@ dabai/
 ## 🖼️ 截图
 
 > 在此处添加项目截图或演示动图。
+
+## 🧠 上下文机制优化
+
+### 1. 分层记忆（省 token）
+- 短期窗口（最近轮次，按 `short_term_max_tokens` 预算、单轮超长截断）；
+- 长期摘要（只带最新摘要，`summary_max_tokens` 预算）；
+- 常驻长期记忆（按 importance 取 top-k，`long_term_max_tokens` 预算）；
+- 按需召回（关键词检索，`recall_max_tokens` 强制封顶）。
+- 每轮对话把 raw/packed 估算与真实 prompt 用量写入 `context_stats` 表，
+  用 `python memory_benchmark.py` 回放真实数据量化节省（实测约 70%+）。
+- 详细设计见 [MEMORY_HIERARCHY.md](MEMORY_HIERARCHY.md)。
+
+### 2. 工具参数严格校验
+- 工具执行前按定义（`function.parameters`，与技能工具 inputSchema 同构）校验
+  required、类型、enum、嵌套 object/array、数值/长度边界；
+- 安全类型自动转换（"30"→30、"true"→True），无法转换或缺参时
+  不执行工具，而是把中文错误回填给模型自行修正（`tool_validation.py`）。
+
+### 3. 工具执行反馈 / 心跳
+- 工具执行期间每 `tool_heartbeat_interval_sec`（默认 5s）向前端推送
+  `tool_call_progress` 心跳事件，工具链卡片实时显示“已运行 N 秒”，
+  长任务不再“静默无输出”；
+- 超时以结构化错误回填给模型，不抛异常中断对话；并行工具调用同样带心跳。
 
 ## 🤝 参与贡献
 
