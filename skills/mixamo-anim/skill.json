@@ -1,0 +1,169 @@
+{
+  "name": "mixamo-anim",
+  "title": "Mixamo 动作库",
+  "version": "1.0.0",
+  "description": "操作大白自己的 Mixamo 动作库（D:\\AI\\dabai\\web\\anim）：下载 3D 表情动作（自动 Without Skin）、管理动作文件与 animation-library.json、优化情绪映射。大白需要下载新动作、整理动作库、检查缺失文件、调整情绪映射时使用。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 Mixamo 动作库】操作 D:\\AI\\dabai\\web\\anim 动作库。触发词：下载/管理/优化 Mixamo 动作、表情动作、动作库。流程：anim_status 看浏览器/登录/动作库状态 → 未启动则 anim_start → 未登录则让用户在弹出的浏览器窗口登录一次，anim_check_login 确认 + anim_save_cookies 保存 → anim_download 单个 / anim_batch 批量（后台，用 anim_status 轮询）→ anim_library 管理（scan/verify/categorize/list）→ anim_optimize 优化（validate/emotions/fix）。下载自动选 Without Skin 纯动作。完整手册：skill_help(\"mixamo-anim\")。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_status",
+        "description": "Mixamo 动作库综合状态：下载服务（浏览器是否运行、登录状态、代理、正在下载/队列）、动作库统计（各分类在盘数、缺失动作、未注册文件）、最近日志。开始任何下载/管理任务前先看这个。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_start",
+        "description": "启动 Mixamo 代理浏览器（Playwright + fq 代理，自动起 clash）。proto 可选指定代理协议（clash/xray/hy2/mieru 等）。启动后若未登录，需让用户在弹出的浏览器窗口登录 Mixamo/Adobe。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "proto": {
+              "type": "string",
+              "description": "代理协议（可选，默认自动选可用端口：clash/xray/hysteria/hy2/singbox/naive/juicity/mieru/shadowquic）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_stop",
+        "description": "关闭 Mixamo 代理浏览器（同时中止进行中的批量下载）。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_check_login",
+        "description": "检测 Mixamo 登录状态（基于 Adobe IMS 会话令牌 ims_sid/idg_token 和页面无 Log In 按钮）。登录是唯一需要用户参与的环节，检测到已登录后即可全自动下载。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_save_cookies",
+        "description": "保存当前浏览器 cookies 到 data/mixamo_cookies.json（用户登录成功后调用，之后重启浏览器可免登录）。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_download",
+        "description": "下载单个 Mixamo 动作（自动选择 Without Skin 纯动作文件，保存到 web/anim/ 对应分类目录）。name 用配置里的动作标识（如 idle_normal、wave），anim_library list 可查。已存在的动作会跳过。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "动作名（animation-library.json 里的 name，如 idle_normal）"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_batch",
+        "description": "批量下载多个 Mixamo 动作（后台异步执行，立即返回；用 anim_status 轮询进度，anim_stop 可中止）。未登录会拒绝启动——需先让用户登录并 anim_save_cookies。全部自动选 Without Skin。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "names": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "动作名（animation-library.json 里的 name）"
+              },
+              "description": "要下载的动作名数组"
+            }
+          },
+          "required": [
+            "names"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_library",
+        "description": "动作库管理。action：stats=统计（同 anim_status）；list=列动作（可按 category/emotion/status=missing|have 筛选）；scan=扫描磁盘 .fbx 并匹配配置；verify=校验配置 vs 磁盘（缺失/未注册文件）；categorize=把放错位置的 .fbx 移到配置指定分类目录（dry_run=true 默认只预览，false 实际移动）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "stats / list / scan / verify / categorize（默认 stats）"
+            },
+            "category": {
+              "type": "string",
+              "description": "list 用：分类过滤（idle/gesture/emotion/walk/dance/pose）"
+            },
+            "emotion": {
+              "type": "string",
+              "description": "list 用：情绪过滤（happy/sad/angry/...）"
+            },
+            "status": {
+              "type": "string",
+              "description": "list 用：missing=只列缺失文件的动作；have=只列在盘的动作"
+            },
+            "dry_run": {
+              "type": "boolean",
+              "description": "categorize 用：true=只预览不移动（默认）；false=实际移动文件"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_optimize",
+        "description": "动作库优化。action：validate=校验配置结构（重复名/缺失字段/情绪映射引用无效/动作未进情绪池）；emotions=查看 emotionMap 情绪映射及每个情绪的动作在盘情况；fix=自动修复（清理无效引用、把未入池动作按自身 emotion 加入情绪池，会写回 animation-library.json）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "validate / emotions / fix（默认 validate）"
+            }
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}

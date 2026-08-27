@@ -1,0 +1,9 @@
+{
+  "name": "todo_list",
+  "title": "TODO 任务清单",
+  "version": "1.0.0",
+  "description": "复杂任务自动分解、优先级/截止时间管理、任务状态跟踪、定时与重复提醒，并提供 /api/todo/* REST API（JSON 交互）供其他模块调用。",
+  "author": "dabai",
+  "enabled": true,
+  "entry": "plugin.py"
+}

@@ -1,0 +1,143 @@
+{
+  "name": "tasks",
+  "title": "长任务与批量任务",
+  "version": "1.0.0",
+  "description": "把多步骤长任务（DAG 流程）和批量任务提交给 harness 任务系统后台执行：断点续跑、失败重试、并发受控，可随时查进度/取消/重试。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_flow_plan",
+        "description": "规划长任务（只规划不执行）：把用户简短需求交给规划器，产出理解复述+多步骤方案，自动校验工具名与必填参数（笔误自动纠正）。autostart=true 校验通过后直接开跑。详细步骤写法先 skill_help(\"tasks\")。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "goal": {"type": "string", "description": "用户的原始需求（尽量用用户原话，规划与后续执行都围绕它）"},
+            "hints": {"type": "string", "description": "补充约束（如用户偏好、范围限制），可选"},
+            "autostart": {"type": "boolean", "description": "true=校验通过后直接提交执行，返回任务ID；false=只返回方案"},
+            "policy": {"type": "string", "enum": ["abort", "continue"]}
+          },
+          "required": ["goal"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_flow_submit",
+        "description": "提交多步骤长任务后台执行（断点续跑）。提交时即校验工具名与必填参数，错误当场拒绝。goal=用户原话（必填，注入每个 LLM 步骤防失忆）。危险动作步骤加 confirm 字段。需求模糊先 harness_flow_plan。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "任务名称（给用户看的）"},
+            "goal": {"type": "string", "description": "任务目标（用户原话/你对需求的一句话复述）"},
+            "steps": {
+              "type": "array",
+              "description": "步骤列表，按依赖自动编排。每步：{id, deps:[前置步骤id], action, ...}。action 四类：tool（tool=工具名, args=参数，必填参数缺一不可）；llm（prompt=指令，可引用 {{步骤id.result}}；自动携带任务目标与已完成步骤摘要）；batch（tool=工具名, items=参数数组, concurrency=并发数）；handler（预留）。危险动作（删除/覆盖/发送/花钱）在该步加 confirm:\"危险性说明\"，执行前需用户批准。步骤失败会自动反思重规划（默认开启）。",
+              "items": {"type": "object"}
+            },
+            "policy": {"type": "string", "enum": ["abort", "continue"], "description": "失败策略：abort=任一步失败即中止全部（默认）；continue=只放弃失败分支，独立分支继续"},
+            "timeout": {"type": "number", "description": "整体超时秒数（默认 3600）"}
+          },
+          "required": ["name", "goal", "steps"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_batch_submit",
+        "description": "提交批量任务：把一个工具并行应用到一批参数上（并发受控、单条失败不影响其它、结果按序返回）。适合『把这10首歌都搜一下』『逐个查询这些文件』类需求。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "任务名称"},
+            "tool": {"type": "string", "description": "要批量执行的工具名"},
+            "items": {
+              "type": "array",
+              "description": "参数列表，每个元素是该工具的一次完整参数对象",
+              "items": {"type": "object"}
+            },
+            "concurrency": {"type": "integer", "description": "批内并发数（默认 3）"}
+          },
+          "required": ["name", "tool", "items"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_status",
+        "description": "查询长任务/批量任务的进度与结果（含每个步骤/条目的状态和产出）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {"type": "string", "description": "任务ID（提交时返回）"}
+          },
+          "required": ["task_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_list",
+        "description": "列出最近的任务（可按状态过滤：pending/running/succeeded/failed/cancelled）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "state": {"type": "string", "enum": ["pending", "running", "succeeded", "failed", "cancelled"]},
+            "limit": {"type": "integer", "description": "返回条数（默认 10）"}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_confirm",
+        "description": "批准或拒绝流程中等待用户确认的危险步骤（状态为等待确认的任务）。approve=true 批准继续执行，false 拒绝该步骤。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {"type": "string"},
+            "approve": {"type": "boolean", "description": "true=批准该步骤继续，false=拒绝"},
+            "note": {"type": "string", "description": "备注（拒绝原因等），可选"}
+          },
+          "required": ["task_id", "approve"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_cancel",
+        "description": "取消一个运行中/排队的任务（流程会连带取消未完成步骤）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {"type": "string"}
+          },
+          "required": ["task_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_retry",
+        "description": "重试失败/取消的任务。流程重试会保留已成功步骤的结果，只补跑失败部分。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {"type": "string"}
+          },
+          "required": ["task_id"]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "name": "sys_search",
+  "title": "系统文件搜索",
+  "version": "1.0.0",
+  "description": "大白的基础能力：全盘多条件搜索文件/目录、最近修改文件、定位可执行程序（只读，带时间预算与结果上限）。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "full",
+  "prompt": "【技能 系统文件搜索】sys_find 按 名称/扩展名/目录/大小/修改时间 多条件全盘找文件或目录；sys_recent 列最近修改的文件；sys_locate 定位 PATH 里的可执行程序。用户说\"找一下 XX 文件\"\"有没有 XXX 格式的文件\"\"最近改过哪些文件\"时优先用这些工具，不要猜路径；搜索结果里给出真实完整路径，拿不准先搜再操作。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "sys_find",
+        "description": "全盘多条件搜索文件/目录（只读）：按名称关键词或通配符（*.mp4）、扩展名（mp4,py,ts）、所在目录、大小范围（MB）、最近修改天数过滤；kind 可选 file/dir/both。自动跳过 Windows/AppData/缓存等噪音目录；带时间预算，超时返回部分结果并提示。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "文件名关键词，或含 * ? 的通配符（如 *报告*.xlsx）；与 ext 至少填一个"},
+            "ext": {"type": "string", "description": "扩展名过滤，逗号分隔（如 mp4,py 或 .mp4）"},
+            "dir": {"type": "string", "description": "只搜某个目录，逗号分隔可多个（默认全盘）"},
+            "kind": {"type": "string", "enum": ["file", "dir", "both"], "description": "搜文件/目录/两者（默认 file）"},
+            "min_size_mb": {"type": "number", "description": "最小文件大小（MB）"},
+            "max_size_mb": {"type": "number", "description": "最大文件大小（MB）"},
+            "newer_than_days": {"type": "number", "description": "只看最近 N 天内修改的"},
+            "max_results": {"type": "integer", "description": "最多返回几条（默认 50，最大 200）"},
+            "timeout": {"type": "number", "description": "扫描时间预算（秒，默认 25，最大 60）"},
+            "include_sys": {"type": "boolean", "description": "true 才进入 Windows/Program Files 等系统目录（默认 false）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sys_recent",
+        "description": "列出最近修改的文件（只读，按修改时间倒序）：默认近 7 天，可指定天数/目录/扩展名。适合\"最近改过哪些文件\"\"刚下的文件在哪\"这类问题。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "days": {"type": "integer", "description": "看最近多少天（默认 7）"},
+            "dir": {"type": "string", "description": "只搜某个目录（默认全盘用户目录）"},
+            "ext": {"type": "string", "description": "扩展名过滤，逗号分隔（如 py,ts）"},
+            "max_results": {"type": "integer", "description": "最多返回几条（默认 50，最大 200）"},
+            "timeout": {"type": "number", "description": "扫描时间预算（秒，默认 25，最大 60）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sys_locate",
+        "description": "定位 PATH 里的可执行程序（如 python、codex、ffmpeg），返回完整路径；找不到提示用 sys_find 全盘找。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "可执行程序名（如 python、ffmpeg）"}
+          },
+          "required": ["name"]
+        }
+      }
+    }
+  ]
+}

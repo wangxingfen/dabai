@@ -1,0 +1,65 @@
+{
+  "name": "sub_agents",
+  "title": "子智能体（通用任务）",
+  "version": "1.0.0",
+  "description": "把任意复杂任务下发给独立子智能体后台执行：可同时大量分派、各自任务不同、互不影响，完成自动向主智能体汇报。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "full",
+  "prompt": "【子智能体下发】遇到独立的复杂任务（要查资料、算东西、跑脚本、整理文件、多步骤操作等）时，把任务拆成若干个小而具体的子任务，用 sub_agent_spawn 逐个下发给子智能体并行处理——每个子智能体独立在后台执行、互不影响，做完会自动向主智能体汇报。适合：同一件事拆多个角度并行查证、批量小任务同时跑、以及「你去做别的，让子智能体盯着这件事」。用 sub_agents_list 随时查看有哪些子进程在干活、sub_agent_status 看单个进展、sub_agent_cancel 收回某个子智能体。⚠ 纯闲聊不需要下发；需要用户当场确认/操作的事不要下发；不确定拆分时就先派一个让子智能体自己想办法完成。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_spawn",
+        "description": "把一项具体任务下发给一个子智能体，由它在后台自主执行（可调用工具），完成或出错后自动向主智能体汇报。可同时下发给多个子智能体并行处理不同任务（超出并发上限自动排队，无需用户确认）。任务描述尽量具体：目标、约束、期望输出。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {"type": "string", "description": "要交给子智能体完成的具体任务（越具体越好，如'查一下明天上海的天气并给出穿衣服建议'）。"},
+            "title": {"type": "string", "description": "可选：任务标题（用于任务中心展示，默认取任务前40字）。"},
+            "note": {"type": "string", "description": "可选：备注/约束（如'优先用网络搜索'、'结果控制在200字内'）。"}
+          },
+          "required": ["task"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agents_list",
+        "description": "查看当前有哪些子智能体在干活（执行中/排队中、各自的任务标题与ID）。用户问'有什么任务在跑/有谁在干活/子进程情况'时使用。",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_status",
+        "description": "查看单个子智能体的完整状态：任务内容、进度日志、结果/错误。需要追某个子智能体的细节时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {"type": "string", "description": "子智能体 ID（sub_agents_list 可查）。"}
+          },
+          "required": ["worker_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_cancel",
+        "description": "收回（取消）一个正在排队/执行的子智能体（静默，不产生汇报）。用户不想要某个后台任务了时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {"type": "string", "description": "子智能体 ID（sub_agents_list 可查）。"},
+            "reason": {"type": "string", "description": "可选：取消原因，会记录到日志。"}
+          },
+          "required": ["worker_id"]
+        }
+      }
+    }
+  ]
+}

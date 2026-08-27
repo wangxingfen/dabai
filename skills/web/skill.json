@@ -1,0 +1,45 @@
+{
+  "name": "web",
+  "title": "联网搜索",
+  "version": "1.0.0",
+  "description": "大白的基础能力：联网搜索实时信息 + 读取网页正文（自动直连/本地代理兜底，只读）。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "full",
+  "prompt": "【技能 联网搜索】web_search 按关键词搜网页（DuckDuckGo 主 + Bing 兜底，直连/代理自动切换）；read_web 深挖网页：mode=text 正文（含表格）、links 链接清单（继续往下挖）、headings 标题大纲、tables 表格、html 原始结构；复杂或 JS 渲染页面自动用无头 Chrome 导出真实 DOM；keyword 参数可在站内定位关键词上下文。需要实时信息、新闻、文档、教程、资料、查证时优先用这两个工具，不要凭空编造；没查到就直说。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "按关键词在网页上搜索，返回最多 10 条结果的标题、链接和摘要。适合查实时信息、新闻、教程、文档、资料，回答前先查证而不是凭空编造。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "搜索关键词（中文/英文均可）"},
+            "max_results": {"type": "integer", "description": "最多返回几条（默认 5，最大 10）"}
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_web",
+        "description": "读取并深挖一个网页。mode=text 返回正文（含表格）；links 返回页面链接清单（可继续往下挖）；headings 返回标题大纲（看懂页面结构）；tables 返回表格；html 返回原始 HTML。复杂/JS 渲染页面会自动用无头 Chrome 导出真实 DOM（结果标注「已用无头 Chrome 渲染 JS」）。keyword 参数可在正文里定位关键词及上下文。适合打开 web_search 找到的链接看详细内容。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string", "description": "网页完整地址（http:// 或 https:// 开头）"},
+            "mode": {"type": "string", "enum": ["text", "links", "headings", "tables", "html"], "description": "挖法：text 正文（默认）/ links 链接清单 / headings 标题大纲 / tables 表格 / html 原始 HTML"},
+            "keyword": {"type": "string", "description": "站内定位：在正文中找这个关键词并返回上下文（可选）"},
+            "js": {"type": "string", "enum": ["auto", "true", "false"], "description": "是否用无头 Chrome 渲染 JS：auto（默认，内容太少自动启用）/ true / false"},
+            "max_chars": {"type": "integer", "description": "最多返回多少字符（默认 3000，最大 8000）"}
+          },
+          "required": ["url"]
+        }
+      }
+    }
+  ]
+}

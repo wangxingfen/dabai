@@ -1,0 +1,56 @@
+{
+  "name": "appearance",
+  "title": "外观形象",
+  "version": "1.0.0",
+  "description": "管理大白的 3D 造型与所处场景：查看/切换角色模型与背景。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【外观形象技能】用户要求换装/换形象/变身、换场景时使用。规则：先调用 get_available_models / get_available_backgrounds 查询当前可用列表，再用精确文件名（含扩展名）调用 switch_character_model / switch_background_scene；传入 'default' 恢复默认。模型文件名只是外观皮肤，不是身份本身。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_available_models",
+        "description": "获取当前可用的3D角色模型列表。在切换角色前先调用此工具了解有哪些模型可用。",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_available_backgrounds",
+        "description": "获取当前可用的3D背景场景列表。在切换背景前先调用此工具了解有哪些场景可用。",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_character_model",
+        "description": "换上新的3D造型——这是你自己穿着的皮肤外观，换模型就像换衣服一样，身份不变。只有用户明确要求换装/换形象/变身时才调用，不要擅自更换造型。请使用 get_available_models 查询到的精确文件名（含扩展名），传入 'default' 恢复默认角色。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "model_name": {"type": "string", "description": "模型文件名（必须精确匹配可用列表中的文件名），如 '小蛋糕.vrm'。传入 'default' 恢复默认角色。"}
+          },
+          "required": ["model_name"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_background_scene",
+        "description": "换一个你所在的环境场景——这是你身处的世界。根据对话氛围和心情自主更换场景，营造沉浸感。请使用 get_available_backgrounds 查询到的精确文件名（含扩展名），传入 'default' 恢复默认星空背景。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "bg_name": {"type": "string", "description": "背景文件名（必须精确匹配可用列表中的文件名），如 '太空飞船走廊.glb'。传入 'default' 恢复默认星空背景。"}
+          },
+          "required": ["bg_name"]
+        }
+      }
+    }
+  ]
+}

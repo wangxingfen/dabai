@@ -1,0 +1,1496 @@
+"""代码工程（code_ops）—— 大白自带的顶级编程能力：批量检索 / 分析 / 修改代码。
+
+设计要点：
+- 纯标准库实现，无第三方依赖；所有路径默认限制在 root（当前工作目录）内，
+  分析其它项目时显式传 root；
+- 检索/分析默认跳过 node_modules/.git/__pycache__ 等噪音目录
+  （include_noise=true 可包含）；
+- code_edit 采用「唯一锚点」精准替换：锚点出现 0 次或多于 1 次时只报告、不擅改，
+  避免误伤；修改前自动留 .bak-<时间戳> 备份，修改后返回 diff 预览；
+- git 感知：code_git_status/diff/log/blame 让大白知道改了什么、谁改的，
+  配合 code_review 在交付前自审自己的改动；
+- code_patch 支持统一的补丁式编辑（多文件、严格上下文校验、可预览）；
+- code_test 跑完整测试套件，验证不再停留在语法级；
+- code_smoke 冒烟关卡：语法 + import（模块能加载）+ 可选冒烟命令，
+  改库/模块后必须跑，缺依赖/循环导入/顶层报错当场暴露；
+- 安全边界：默认拒绝修改大白核心（harness/*.py 与项目根目录 *.py，
+  会触发整进程自动重启），确需修改必须显式 allow_core=true 并先向用户说明；
+- 所有返回均为可读文本，输出统一截断防刷屏。
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_MAX_OUT = 30000
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+NOISE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    ".idea", ".vscode", ".ruff_cache", ".pytest_cache", ".mypy_cache",
+    "codex_logs", "audio_cache", "undefined", ".trae-html-share-packages",
+    ".next", ".nuxt", "coverage",
+}
+
+CODE_EXTS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".html", ".css", ".scss", ".less", ".json", ".jsonc", ".java", ".kt",
+    ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".rb", ".php",
+    ".swift", ".sh", ".ps1", ".bat", ".cmd", ".md", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".sql", ".xml", ".gradle",
+}
+
+DEF_PATTERNS = {
+    ".py": [
+        r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)",
+        r"^\s*class\s+([A-Za-z_]\w*)",
+    ],
+    ".js": [
+        r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$]\w*)",
+        r"^\s*(?:export\s+)?class\s+([A-Za-z_$]\w*)",
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$]\w*)\s*=",
+        r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$]\w*)",
+    ],
+    ".ts": [
+        r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$]\w*)",
+        r"^\s*(?:export\s+)?class\s+([A-Za-z_$]\w*)",
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$]\w*)\s*=",
+        r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_$]\w*)",
+        r"^\s*(?:export\s+)?abstract\s+class\s+([A-Za-z_$]\w*)",
+    ],
+    ".go": [
+        r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)",
+        r"^type\s+([A-Za-z_]\w*)\s+(?:struct|interface)",
+    ],
+    ".java": [
+        r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native)\s+)*(?:class|interface|enum)\s+([A-Za-z_]\w*)",
+        r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native)\s+)*[\w<>\[\]?,\s]+\s+([A-Za-z_]\w*)\s*\(",
+    ],
+    ".kt": [
+        r"^\s*(?:data\s+|sealed\s+|enum\s+|abstract\s+)?(?:class|interface|object)\s+([A-Za-z_]\w*)",
+        r"^\s*(?:suspend\s+)?fun\s+([A-Za-z_]\w*)",
+    ],
+    ".rs": [
+        r"^\s*(?:pub\s+)?fn\s+([A-Za-z_]\w*)",
+        r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_]\w*)",
+    ],
+    ".rb": [
+        r"^\s*def\s+([A-Za-z_]\w*)",
+        r"^\s*class\s+([A-Za-z_]\w*)",
+    ],
+    ".php": [
+        r"^\s*function\s+([A-Za-z_]\w*)",
+        r"^\s*(?:class|interface|trait)\s+([A-Za-z_]\w*)",
+    ],
+    ".cs": [
+        r"^\s*(?:(?:public|private|protected|internal|static|sealed|abstract|partial|readonly)\s+)*(?:class|interface|struct|enum|record)\s+([A-Za-z_]\w*)",
+        r"^\s*(?:(?:public|private|protected|internal|static|virtual|override|async|partial)\s+)*[\w<>\[\],\s]+\s+([A-Za-z_]\w*)\s*\(",
+    ],
+    ".swift": [
+        r"^\s*(?:func|class|struct|enum|protocol)\s+([A-Za-z_]\w*)",
+    ],
+    ".sh": [
+        r"^\s*([A-Za-z_]\w*)\s*\(\)\s*\{?",
+    ],
+}
+
+_JS_EXTS = {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"}
+
+
+# ---------- 通用工具 ----------
+
+def _norm_root(root=None):
+    base = str(root or "").strip() or os.getcwd()
+    return Path(os.path.expanduser(base)).resolve()
+
+
+def _within(root: Path, p: Path) -> bool:
+    try:
+        return os.path.commonpath(
+            [os.path.normcase(str(root)), os.path.normcase(str(p))]
+        ) == os.path.normcase(str(root))
+    except ValueError:
+        return False
+
+
+def _resolve(root: Path, p: str) -> Path:
+    p = os.path.expanduser(str(p or "").strip())
+    if not p:
+        raise ValueError("路径不能为空")
+    abs_p = p if os.path.isabs(p) else str(root / p)
+    return Path(abs_p).resolve()
+
+
+def _read_text(path: Path):
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8-sig"
+    for enc in ("utf-8", "gb18030", "gbk", "latin-1"):
+        try:
+            return raw.decode(enc), enc
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8"
+
+
+def _is_binary(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" in f.read(8192)
+    except OSError:
+        return True
+
+
+def _split_list(s):
+    if not s:
+        return []
+    return [x.strip() for x in re.split(r"[\n,;]+", str(s)) if x.strip()]
+
+
+def _exts_of(exts_str=None):
+    if not exts_str:
+        return set(CODE_EXTS)
+    out = set()
+    for e in _split_list(exts_str):
+        e = e.strip().lower()
+        if not e.startswith("."):
+            e = "." + e
+        out.add(e)
+    return out
+
+
+def _norm_paths(paths):
+    """兼容字符串（逗号/换行分隔）或列表两种传法。"""
+    if not paths:
+        return []
+    if isinstance(paths, (list, tuple)):
+        out = []
+        for p in paths:
+            out.extend(x for x in re.split(r"[\n,;]+", str(p)) if x.strip())
+        return out
+    return _split_list(paths)
+
+
+def _trim(text: str, limit: int = _MAX_OUT) -> str:
+    text = str(text or "")
+    if len(text) > limit:
+        return text[:limit] + f"\n…（输出已截断，剩余 {len(text) - limit} 字符未显示）"
+    return text
+
+
+def _iter_files(root, exts=None, include_noise=False, max_depth=None,
+                paths=None, limit=0, skip_binary=True):
+    root = Path(root).resolve()
+    if exts is None:
+        exts = set(CODE_EXTS)
+    starts = [_resolve(root, p) for p in _norm_paths(paths)] if paths else [root]
+    seen, count = set(), 0
+    for start in starts:
+        if not start.exists():
+            continue
+        if start.is_file():
+            if start.suffix.lower() in exts:
+                yield start
+                count += 1
+            continue
+        for dirpath, dirnames, filenames in os.walk(start):
+            if max_depth is not None:
+                rel = os.path.relpath(dirpath, start)
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth >= max_depth:
+                    dirnames[:] = []
+                    continue
+            if not include_noise:
+                dirnames[:] = [d for d in dirnames if d not in NOISE_DIRS]
+            for fn in sorted(filenames):
+                fp = Path(dirpath) / fn
+                try:
+                    if fp.suffix.lower() not in exts:
+                        continue
+                    if skip_binary and _is_binary(fp):
+                        continue
+                except OSError:
+                    continue
+                if fp in seen:
+                    continue
+                seen.add(fp)
+                yield fp
+                count += 1
+                if limit and count >= limit:
+                    return
+
+
+def _rel(root: Path, fp: Path) -> str:
+    return os.path.relpath(str(fp), str(root))
+
+
+def _near_miss_hint(lines: list, anchor: str, max_hits: int = 3) -> str:
+    """锚点没找到时，给出最相近的真实行（行号+内容），帮模型快速修正锚点。"""
+    target = (anchor or "").strip()
+    if not target or not lines:
+        return ""
+    scored = []
+    for i, line in enumerate(lines):
+        ls = line.strip()
+        if not ls:
+            continue
+        ratio = difflib.SequenceMatcher(None, target, ls).ratio()
+        if ratio >= 0.55:
+            scored.append((ratio, i + 1, ls[:100]))
+    scored.sort(key=lambda x: -x[0])
+    if not scored:
+        return ""
+    hits = scored[:max_hits]
+    return ("最相近的现有内容（供修正锚点）：\n"
+            + "\n".join(f"  第 {ln} 行（相似 {r:.0%}）：{text}"
+                        for r, ln, text in hits))
+
+
+def _is_core(root: Path, fp: Path) -> bool:
+    """大白核心保护：harness/*.py 与项目根目录 *.py 会触发整进程自动重启。"""
+    root = Path(root).resolve()
+    if not ((root / "codex_runner.py").exists() and (root / "harness").is_dir()):
+        return False
+    try:
+        parts = fp.relative_to(root).parts
+    except ValueError:
+        return False
+    if parts and parts[0] == "harness":
+        return True
+    return len(parts) == 1 and fp.suffix.lower() == ".py"
+
+
+# ---------- 1. 批量检索 ----------
+
+def code_search(args: dict) -> str:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return "错误：query（检索内容）不能为空"
+    root = _norm_root(args.get("root"))
+    exts = _exts_of(args.get("exts"))
+    try:
+        context = max(0, min(int(args.get("context") or 0), 10))
+        limit = max(1, min(int(args.get("limit") or 100), 500))
+    except ValueError:
+        return "错误：context/limit 需为数字"
+    flags = 0 if args.get("case_sensitive") else re.IGNORECASE
+    pat_src = query if args.get("regex") is not False else re.escape(query)
+    try:
+        pattern = re.compile(pat_src, flags)
+    except re.error as e:
+        return f"错误：正则表达式无效 —— {e}"
+    include_noise = bool(args.get("include_noise"))
+    paths = args.get("paths")
+
+    files_lines = {}
+    total = 0
+    for fp in _iter_files(root, exts, include_noise, paths=paths):
+        if total >= limit:
+            break
+        try:
+            text, _ = _read_text(fp)
+        except OSError:
+            continue
+        lines = text.splitlines()
+        lns = []
+        for i, line in enumerate(lines, 1):
+            if pattern.search(line):
+                lns.append(i)
+                if total + len(lns) >= limit:
+                    break
+        if lns:
+            files_lines[str(fp)] = (lines, set(lns))
+            total += len(lns)
+    if not files_lines:
+        ext_desc = ("全部代码类型" if exts == set(CODE_EXTS)
+                    else ", ".join(sorted(exts)))
+        return f"未找到匹配（root={root}，扩展名过滤：{ext_desc}）。"
+
+    parts = [f"✅ 匹配 {total} 处："]
+    for fp_str, (lines, lns) in files_lines.items():
+        rel = _rel(root, Path(fp_str))
+        parts.append(f"=== {rel}（{len(lns)} 处）")
+        sorted_hits = sorted(lns)
+        intervals = []
+        for ln in sorted_hits:
+            lo, hi = max(1, ln - context), min(len(lines), ln + context)
+            if intervals and ln - intervals[-1][1] <= 2 * context + 1:
+                intervals[-1] = (intervals[-1][0], max(intervals[-1][1], hi))
+            else:
+                intervals.append((lo, hi))
+        for lo, hi in intervals:
+            for ln in range(lo, hi + 1):
+                mark = "▶" if ln in lns else " "
+                parts.append(f"  {mark} {ln:>5}│ {lines[ln - 1]}")
+    hint = ("\n提示：找函数/类的定义与引用请用 code_locate；读整段代码请用 code_read。"
+            if context == 0 else "")
+    return _trim("\n".join(parts) + hint)
+
+
+def code_list_files(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    exts = _exts_of(args.get("exts"))
+    include_noise = bool(args.get("include_noise"))
+    max_depth = args.get("max_depth")
+    try:
+        max_depth = int(max_depth) if max_depth else None
+        limit = max(1, min(int(args.get("limit") or 300), 2000))
+    except ValueError:
+        return "错误：max_depth/limit 需为数字"
+    files = list(_iter_files(
+        root, exts, include_noise, max_depth=max_depth,
+        paths=args.get("dirs"), limit=limit))
+    if not files:
+        return "该目录下没有匹配的代码文件。"
+    counts = {}
+    for fp in files:
+        counts[fp.suffix.lower()] = counts.get(fp.suffix.lower(), 0) + 1
+    if args.get("summary_only"):
+        lines = [f"共 {len(files)} 个代码文件："]
+        lines += [f"  {ext or '(无扩展名)'}：{counts[ext]}"
+                  for ext in sorted(counts)]
+        return _trim("\n".join(lines))
+    lines = [f"共 {len(files)} 个代码文件（限制 {limit}）："]
+    lines += [f"  {_rel(root, fp)}" for fp in files]
+    return _trim("\n".join(lines))
+
+
+def code_read(args: dict) -> str:
+    files_str = args.get("files")
+    if not files_str:
+        return ("错误：files 不能为空（逗号/换行分隔；"
+                "每项可用 路径、路径:行号、路径:起-止）")
+    root = _norm_root(args.get("root"))
+    try:
+        max_lines = max(10, min(int(args.get("max_lines") or 500), 5000))
+    except ValueError:
+        return "错误：max_lines 需为数字"
+    parts, errors = [], []
+    for item in _split_list(files_str):
+        path_spec, start, end = item, None, None
+        m = re.match(r"^(.*?):(\d+)(?:\s*-\s*(\d+))?$", item)
+        if m and ":" in item:
+            path_spec = m.group(1)
+            start = int(m.group(2))
+            end = int(m.group(3) or m.group(2))
+        try:
+            fp = _resolve(root, path_spec)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        if not _within(root, fp):
+            errors.append(f"越界路径（不在 root={root} 内）：{fp}")
+            continue
+        if not fp.is_file():
+            errors.append(f"文件不存在：{path_spec}")
+            continue
+        try:
+            text, enc = _read_text(fp)
+        except OSError as e:
+            errors.append(f"读取失败 {path_spec}: {e}")
+            continue
+        lines = text.splitlines()
+        total = len(lines)
+        if start is None:
+            start, end = 1, min(total, max_lines)
+        else:
+            start = max(1, min(start, total + 1))
+            end = min(max(start, end), total)
+        parts.append(f"### {_rel(root, fp)}（共 {total} 行，编码 {enc}，显示 {start}-{end}）")
+        width = len(str(end))
+        parts += [f"{i:>{width}}│ {lines[i - 1]}" for i in range(start, end + 1)]
+        if total > end:
+            parts.append(f"（还有 {total - end} 行未显示：可用 {_rel(root, fp)}:{end + 1}-{min(total, end + max_lines)} 继续读）")
+    body = "\n".join(parts)
+    if errors:
+        body += "\n\n⚠ 部分条目未读成功：\n" + "\n".join(f"  - {e}" for e in errors)
+    return _trim(body)
+
+
+# ---------- 2. 代码分析 ----------
+
+def code_locate(args: dict) -> str:
+    symbol = str(args.get("symbol") or "").strip()
+    if not symbol or not re.match(r"^[A-Za-z_]\w*$", symbol):
+        return "错误：symbol 需为合法标识符（字母/数字/下划线，不能以数字开头）"
+    root = _norm_root(args.get("root"))
+    kind = str(args.get("kind") or "all").lower()
+    try:
+        limit = max(1, min(int(args.get("limit") or 80), 400))
+    except ValueError:
+        return "错误：limit 需为数字"
+    exts = _exts_of(args.get("exts"))
+    paths = args.get("paths")
+    word = r"\b" + re.escape(symbol) + r"\b"
+    defs, refs = [], []
+    for fp in _iter_files(root, exts, False, paths=paths):
+        try:
+            text, _ = _read_text(fp)
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if not re.search(word, line):
+                continue
+            is_def = False
+            for p in DEF_PATTERNS.get(fp.suffix.lower(), []):
+                m = re.match(p, line)
+                if m and m.group(1) == symbol:
+                    is_def = True
+                    break
+            (defs if is_def else refs).append((fp, i, line.strip()))
+    def_lines = {(fp, i) for fp, i, _ in defs}
+    refs_only = [(fp, i, t) for fp, i, t in refs if (fp, i) not in def_lines]
+    out = [f"符号 {symbol} 的定位结果："]
+    if defs:
+        out.append(f"定义（{len(defs)} 处）：")
+        out += [f"  {_rel(root, fp)}:{i}  {t[:90]}" for fp, i, t in defs]
+    if kind in ("all", "ref") and refs_only:
+        shown = refs_only[:limit]
+        out.append(f"引用/其余出现（显示 {len(shown)}/{len(refs_only)} 处）：")
+        out += [f"  {_rel(root, fp)}:{i}  {t[:90]}" for fp, i, t in shown]
+    if kind == "def" and not defs:
+        out.append("  未找到定义。")
+    if kind in ("all", "ref") and not defs and not refs_only:
+        out.append("  项目中未找到该符号。")
+    return _trim("\n".join(out))
+
+
+def _analyze_file(fp: Path, root: Path) -> str:
+    try:
+        text, enc = _read_text(fp)
+    except OSError as e:
+        return f"### {_rel(root, fp)}\n读取失败：{e}"
+    lines = text.splitlines()
+    rel = _rel(root, fp)
+    imports, defs, todos = [], [], []
+    max_indent = 0
+    for i, line in enumerate(lines, 1):
+        s = line.strip()
+        if not s:
+            continue
+        suffix = fp.suffix.lower()
+        if suffix == ".py":
+            m = re.match(r"^\s*(?:import|from)\s+([\w.]+)", line)
+            if m:
+                imports.append((i, m.group(1)))
+        elif suffix in _JS_EXTS:
+            for m in re.finditer(r"(?:require\s*\(\s*|from\s+)(['\"])([^'\"]+)\1", line):
+                imports.append((i, m.group(2)))
+        for p in DEF_PATTERNS.get(suffix, []):
+            m = re.match(p, line)
+            if m:
+                defs.append((i, m.group(1)))
+                break
+        indent = len(line) - len(line.lstrip())
+        max_indent = max(max_indent, indent)
+        if re.search(r"TODO|FIXME|XXX|HACK", s, re.I):
+            todos.append((i, s[:80]))
+    out = [f"### {rel}（{len(lines)} 行，编码 {enc}）"]
+    if imports:
+        shown = "、".join(f"{i}:{imp}" for i, imp in imports[:20])
+        out.append(f"import/依赖（{len(imports)} 条，显示前 20）：{shown}")
+    if defs:
+        shown = "、".join(f"{i}:{name}" for i, name in defs[:30])
+        out.append(f"定义（{len(defs)} 个）：{shown}")
+    if todos:
+        out.append("⚠ TODO/FIXME：")
+        out += [f"  {i}: {t}" for i, t in todos[:10]]
+    n_funcs = sum(1 for _, name in defs if name)
+    blank = sum(1 for ln in lines if not ln.strip())
+    avg_len = sum(len(l) for l in lines) // max(len(lines), 1)
+    out.append(
+        f"结构提示：定义数 {n_funcs}；最大缩进深度约 {max_indent // 4} 层"
+        f"（缩进 {max_indent} 空格）；空行占比 {blank / max(len(lines), 1):.0%}；"
+        f"平均行长 {avg_len} 字符"
+    )
+    if len(lines) > 800:
+        out.append(f"⚠ 文件超过 800 行（{len(lines)}），建议评估拆分。")
+    return "\n".join(out)
+
+
+def _analyze_dir(d: Path, root: Path) -> str:
+    files = list(_iter_files(root, set(CODE_EXTS), False, paths=[str(d)]))
+    if not files:
+        return f"目录 {d} 下没有代码文件。"
+    by_ext, loc_of, todos = {}, {}, 0
+    for fp in files:
+        try:
+            text, _ = _read_text(fp)
+        except OSError:
+            continue
+        n = text.count("\n") + 1
+        loc_of[fp] = n
+        by_ext[fp.suffix.lower()] = by_ext.get(fp.suffix.lower(), 0) + 1
+        todos += len(re.findall(r"TODO|FIXME|XXX|HACK", text, re.I))
+    sizes = sorted(loc_of.items(), key=lambda kv: kv[1], reverse=True)
+    rel = _rel(root, d)
+    out = [
+        f"目录结构分析：{rel or '.'}",
+        f"代码文件 {len(files)} 个，总行数约 {sum(loc_of.values())}，"
+        f"TODO/FIXME 标记 {todos} 处",
+        "扩展名分布：",
+    ]
+    out += [f"  {ext or '(无扩展名)'}：{by_ext[ext]}"
+            for ext in sorted(by_ext)]
+    out.append("最大文件 Top5：")
+    out += [f"  {n} 行  {_rel(root, fp)}" for fp, n in sizes[:5]]
+    big = [f"  {n} 行  {_rel(root, fp)}" for fp, n in sizes if n > 800]
+    if big:
+        out.append(f"⚠ 超过 800 行的大文件（{len(big)} 个，建议拆分）：")
+        out += big[:10]
+    return "\n".join(out)
+
+
+def code_analyze(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    files = _split_list(args.get("files"))
+    if files:
+        targets = []
+        for f in files:
+            fp = _resolve(root, f)
+            if not _within(root, fp):
+                return f"⛔ 越界路径（不在 root={root} 内）：{fp}"
+            if fp.is_file():
+                targets.append(fp)
+            elif fp.is_dir():
+                targets.extend(_iter_files(
+                    root, set(CODE_EXTS), False, paths=[str(fp)]))
+            else:
+                return f"文件不存在：{f}"
+        if not targets:
+            return "指定位置没有可分析的代码文件。"
+        return _trim("\n\n".join(_analyze_file(fp, root) for fp in targets))
+    d = Path(args.get("dir")).resolve() if args.get("dir") else root
+    if not _within(root, d):
+        return f"⛔ 越界路径（不在 root={root} 内）：{d}"
+    return _trim(_analyze_dir(d, root))
+
+
+def _py_module_candidates(imp: str, root: Path, from_dir: Path):
+    imp = imp.strip()
+    if not imp:
+        return []
+    if imp.startswith("."):
+        parts = imp.split(".")
+        dots = len(parts) - 1
+        mod = ".".join(parts[1:])
+        base = from_dir
+        for _ in range(dots - 1):
+            base = base.parent
+    else:
+        base = root
+        mod = imp
+    mod_parts = [p for p in mod.split(".") if p]
+    if not mod_parts:
+        return []
+    parent = base / Path(*mod_parts[:-1]) if len(mod_parts) > 1 else base
+    cands = [
+        parent / (mod_parts[-1] + ".py"),
+        parent / mod_parts[-1] / "__init__.py",
+    ]
+    return [c for c in cands if c.is_file()]
+
+
+def _js_resolve(imp: str, from_dir: Path, root: Path):
+    imp = imp.strip().strip("'\"")
+    if not imp.startswith("."):
+        return None
+    base = (from_dir / imp).resolve()
+    cands = []
+    for ext in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
+        cands.append(Path(str(base) + ext))
+        cands.append(base / f"index{ext}")
+    hits = [c for c in cands if c.is_file()]
+    return hits[0] if hits else None
+
+
+def _imports_of(fp: Path):
+    try:
+        text, _ = _read_text(fp)
+    except OSError:
+        return []
+    out = []
+    suffix = fp.suffix.lower()
+    if suffix == ".py":
+        for m in re.finditer(r"^\s*(?:import|from)\s+([\w.]+)", text, re.M):
+            out.append(m.group(1))
+        for m in re.finditer(r"^\s*from\s+(\.[\w.]+)\s+import", text, re.M):
+            out.append(m.group(1))
+    elif suffix in _JS_EXTS:
+        for m in re.finditer(r"(?:require\s*\(\s*|from\s+)(['\"])([^'\"]+)\1", text):
+            out.append(m.group(2))
+    return out
+
+
+def _find_cycle(edges: dict):
+    visited = set()
+
+    def dfs(u, path):
+        if u in path:
+            i = path.index(u)
+            return path[i:] + [u]
+        if u in visited:
+            return None
+        visited.add(u)
+        for v in sorted(edges.get(u, ())):
+            if v in edges:
+                r = dfs(v, path + [u])
+                if r:
+                    return r
+        return None
+
+    for u in edges:
+        r = dfs(u, [])
+        if r:
+            return r
+    return None
+
+
+def code_deps(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    files = _split_list(args.get("files"))
+    try:
+        limit = max(1, min(int(args.get("limit") or 60), 300))
+    except ValueError:
+        return "错误：limit 需为数字"
+    if files:
+        targets = []
+        for f in files:
+            fp = _resolve(root, f)
+            if not _within(root, fp):
+                return f"⛔ 越界路径：{fp}"
+            if fp.is_file():
+                targets.append(fp)
+            else:
+                return f"文件不存在：{f}"
+    else:
+        targets = list(_iter_files(root, set(CODE_EXTS) & (
+            {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}), False))
+    if not targets:
+        return "没有可分析的代码文件。"
+    dep_map = {}   # rel -> [rel]
+    for fp in targets:
+        rel = _rel(root, fp)
+        deps = []
+        for imp in _imports_of(fp):
+            resolved = []
+            if fp.suffix.lower() == ".py":
+                resolved = _py_module_candidates(imp, root, fp.parent)
+            elif fp.suffix.lower() in _JS_EXTS:
+                r = _js_resolve(imp, fp.parent, root)
+                resolved = [r] if r else []
+            for c in resolved:
+                deps.append(_rel(root, c))
+        dep_map[rel] = sorted(set(deps))
+    out = [f"依赖分析（共 {len(targets)} 个文件，显示前 {limit} 个）："]
+    shown = 0
+    for rel in sorted(dep_map):
+        if shown >= limit:
+            out.append(f"…（还有 {len(dep_map) - shown} 个文件未显示）")
+            break
+        deps = dep_map[rel]
+        if deps:
+            out.append(f"  {rel}  →  {', '.join(deps)}")
+        else:
+            out.append(f"  {rel}  （无项目内依赖）")
+        shown += 1
+    incoming = {}
+    for rel, deps in dep_map.items():
+        for d in deps:
+            incoming.setdefault(d, 0)
+            incoming[d] += 1
+    orphans = [rel for rel in dep_map if rel not in incoming]
+    if orphans:
+        out.append(f"孤立文件（没有被任何文件引用，{len(orphans)} 个）：")
+        out += [f"  {rel}" for rel in orphans[:20]]
+    cycle = _find_cycle({rel: set(deps) for rel, deps in dep_map.items()})
+    if cycle:
+        out.append("⚠ 检测到循环依赖：")
+        out.append("  " + " → ".join(cycle))
+    else:
+        out.append("循环依赖：未检测到。")
+    return _trim("\n".join(out))
+
+
+# ---------- 3. 代码修改 ----------
+
+def code_edit(args: dict) -> str:
+    file_s = str(args.get("file") or "").strip()
+    if not file_s:
+        return "错误：file 不能为空"
+    root = _norm_root(args.get("root"))
+    try:
+        fp = _resolve(root, file_s)
+    except ValueError as e:
+        return f"错误：{e}"
+    if not _within(root, fp):
+        return f"⛔ 越界路径（不在 root={root} 内）：{fp}"
+    if not fp.is_file():
+        return f"文件不存在：{fp}"
+    if _is_core(root, fp) and not args.get("allow_core"):
+        return ("⛔ 这是大白核心文件（harness/*.py 或项目根目录 *.py），"
+                "直接修改会触发整进程自动重启。如确有需要，请先向用户说明，"
+                "再显式传 allow_core=true。")
+    mode = str(args.get("mode") or "replace").lower()
+    new = str(args.get("new") or "")
+    try:
+        text, enc = _read_text(fp)
+    except OSError as e:
+        return f"读取失败：{e}"
+    norm = text.replace("\r\n", "\n")
+    if mode == "insert":
+        anchor = str(args.get("anchor") or args.get("old") or "").strip()
+        if not anchor:
+            return "insert 模式需要 anchor（插入锚点文本）"
+        lines = norm.split("\n")
+        hit_idx = [i for i, l in enumerate(lines) if anchor in l]
+        if not hit_idx:
+            hint = _near_miss_hint(lines, anchor)
+            return ("未找到锚点文本，未做任何修改。（锚点需与文件内容逐字符一致）"
+                    + (("\n" + hint) if hint else ""))
+        if len(hit_idx) > 1:
+            pos_str = "、".join(str(i + 1) for i in hit_idx[:10])
+            return (f"⚠ 锚点出现 {len(hit_idx)} 次（第 {pos_str} 行），不唯一，"
+                    "未修改。请给出更长/更唯一的锚点。")
+        pos = str(args.get("position") or "after").lower()
+        idx = hit_idx[0]
+        ins = new.split("\n")
+        if pos == "before":
+            lines[idx:idx] = ins
+        else:
+            lines[idx + 1:idx + 1] = ins
+        changed_norm = "\n".join(lines)
+    else:
+        old = str(args.get("old") or "")
+        if not old:
+            return "replace 模式需要 old（要被替换的原文）"
+        count = norm.count(old)
+        if count == 0:
+            hint = _near_miss_hint(norm.split("\n"), old)
+            return ("未找到要替换的原文（出现 0 次），未做任何修改。"
+                    "原文需与文件内容逐字符一致（注意缩进/引号/换行）。"
+                    + (("\n" + hint) if hint else ""))
+        if count > 1 and not args.get("replace_all"):
+            return (f"⚠ 原文出现 {count} 次，锚点不唯一，未修改。"
+                    "请补上更多上下文使锚点唯一，或传 replace_all=true 全部替换。")
+        changed_norm = norm.replace(old, new) if args.get("replace_all") \
+            else norm.replace(old, new, 1)
+    diff = "\n".join(difflib.unified_diff(
+        norm.split("\n"), changed_norm.split("\n"),
+        fromfile="旧", tofile="新", lineterm=""))
+    if len(diff) > 8000:
+        diff = diff[:8000] + "\n…（diff 已截断，改动已按锚点完成；需要完整 diff 可查看备份文件）"
+    if args.get("preview"):
+        return "🔍 预览模式（未写入文件）：\n" + diff
+    nl = "\r\n" if "\r\n" in text else "\n"
+    out = nl.join(changed_norm.split("\n"))
+    if not out.endswith(nl):
+        out += nl
+    bak = fp.with_name(fp.name + f".bak-{int(time.time())}")
+    try:
+        bak.write_bytes(fp.read_bytes())
+    except OSError as e:
+        return f"备份失败（未修改文件）：{e}"
+    try:
+        fp.write_bytes(out.encode(enc if enc != "utf-8-sig" else "utf-8-sig"))
+    except UnicodeEncodeError:
+        fp.write_bytes(out.encode("utf-8"))
+        enc = "utf-8"
+    except OSError as e:
+        return f"写入失败（已留备份 {bak.name}）：{e}"
+    return (f"✅ 已修改：{_rel(root, fp)}（编码 {enc}）\n"
+            f"备份：{bak.name}（确认无误后可删除）\n"
+            "diff 预览：\n" + diff)
+
+
+# ---------- 4. git 感知与补丁 ----------
+
+def _git_run(root: Path, args_list, timeout: int = 60):
+    cmd = ["git", "-c", "core.quotepath=false", "-c", "color.ui=false"]
+    cmd += list(args_list)
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=str(root), creationflags=_CREATE_NO_WINDOW)
+        return r, ""
+    except FileNotFoundError:
+        return None, "未找到 git 命令，请先安装 Git。"
+    except subprocess.TimeoutExpired:
+        return None, f"git 命令超时（>{timeout}s）已终止"
+
+
+def _git_err(r, err: str) -> str:
+    if err:
+        return err
+    return (r.stderr or r.stdout or "").strip() or "未知错误"
+
+
+def _require_git_repo(root: Path):
+    r, err = _git_run(root, ["rev-parse", "--is-inside-work-tree"])
+    if r is None or r.returncode != 0:
+        return f"⚠ 该目录不是 git 仓库（root={root}）。{_git_err(r, err)}"
+    return None
+
+
+def code_git_status(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    bad = _require_git_repo(root)
+    if bad:
+        return bad
+    short = args.get("short") is not False
+    args_list = ["status", "--porcelain=v1", "--branch"] if short else ["status"]
+    r, err = _git_run(root, args_list)
+    if r is None or r.returncode != 0:
+        return f"git status 失败：{_git_err(r, err)}"
+    out = r.stdout.strip()
+    if not out:
+        return "✅ 工作区干净（无未提交改动）。"
+    if not short:
+        return _trim(out)
+    lines = [l for l in out.splitlines()]
+    counts = {"M": 0, "A": 0, "D": 0, "R": 0, "??": 0, "其他": 0}
+    for l in lines:
+        head = l[:2].strip()
+        if head == "??":
+            counts["??"] += 1
+        elif head in ("M", "A", "D", "R"):
+            counts[head] += 1
+        else:
+            counts["其他"] += 1
+    summary = "、".join(f"{k} {v} 个" for k, v in counts.items() if v)
+    return _trim(f"git 状态（{summary}）：\n" + out)
+
+
+def code_git_diff(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    bad = _require_git_repo(root)
+    if bad:
+        return bad
+    base = ["--staged"] if args.get("staged") else []
+    ref = str(args.get("ref") or "").strip()
+    files = _split_list(args.get("files"))
+    files_args = ["--"] + files if files else []
+    stat = args.get("stat") is not False
+    try:
+        max_lines = max(10, min(int(args.get("max_lines") or 800), 5000))
+    except ValueError:
+        return "错误：max_lines 需为数字"
+    parts = []
+    if stat:
+        r1, e1 = _git_run(root, ["diff"] + base + ([ref] if ref else [])
+                          + ["--stat"] + files_args)
+        if r1 is None or r1.returncode != 0:
+            return f"git diff --stat 失败：{_git_err(r1, e1)}"
+        if r1.stdout.strip():
+            parts.append(r1.stdout.strip())
+    r2, e2 = _git_run(root, ["diff"] + base + ([ref] if ref else []) + files_args)
+    if r2 is None or r2.returncode != 0:
+        return f"git diff 失败：{_git_err(r2, e2)}"
+    body = r2.stdout.strip()
+    if not body and not parts:
+        return "没有差异（改动为空，或改动已被提交）。"
+    if body:
+        parts.append(body)
+    out = "\n\n".join(parts)
+    lines = out.splitlines()
+    if len(lines) > max_lines:
+        out = ("\n".join(lines[:max_lines])
+               + f"\n…（diff 已截断，共 {len(lines)} 行；"
+                 f"可用 max_lines 调大，或加 files= 只看单个文件）")
+    return _trim(out)
+
+
+def code_git_log(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    bad = _require_git_repo(root)
+    if bad:
+        return bad
+    try:
+        limit = max(1, min(int(args.get("limit") or 20), 100))
+    except ValueError:
+        return "错误：limit 需为数字"
+    file = str(args.get("file") or "").strip()
+    args_list = ["log", "--date=short",
+                 "--pretty=format:%h %ad %an %s", "-n", str(limit)]
+    if file:
+        args_list += ["--", file]
+    r, err = _git_run(root, args_list)
+    if r is None or r.returncode != 0:
+        return f"git log 失败：{_git_err(r, err)}"
+    out = r.stdout.strip()
+    if not out:
+        return "仓库还没有提交记录。"
+    return _trim(f"最近 {limit} 条提交：\n" + out)
+
+
+def code_git_blame(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    bad = _require_git_repo(root)
+    if bad:
+        return bad
+    file = str(args.get("file") or "").strip()
+    if not file:
+        return "错误：file（要 blame 的文件路径）不能为空"
+    lines_spec = str(args.get("lines") or args.get("line") or "").strip()
+    if not re.match(r"^\d+(-\d+)?$", lines_spec):
+        return "错误：lines 需为行号或行区间，如 10 或 10-40"
+    r, err = _git_run(root, ["blame", "-L", lines_spec, "--", file])
+    if r is None or r.returncode != 0:
+        return f"git blame 失败：{_git_err(r, err)}"
+    lines = []
+    for l in r.stdout.splitlines():
+        if len(l) > 130:
+            l = l[:130] + "…"
+        lines.append(l)
+    return _trim(f"{file} 第 {lines_spec} 行归属：\n" + "\n".join(lines))
+
+
+def _parse_unified_patch(patch_text: str):
+    """解析 unified diff，返回 [{"path","old_path","hunks":[{...}]}]。"""
+    files, cur, hunk = [], None, None
+    for raw in patch_text.splitlines():
+        line = raw.rstrip("\r")
+        # 跳过 git 元信息行（不会进入任何 hunk，也不该被当成补丁内容）
+        if (line.startswith(("index ", "new file mode ", "deleted file mode ",
+                             "old mode ", "new mode ", "similarity index ",
+                             "dissimilarity index ", "rename from ", "rename to ",
+                             "copy from ", "copy to ", "Binary files ",
+                             "GIT binary patch", "\\ No newline at end of file"))
+                or line == "--"):
+            continue
+        if line.startswith("diff --git "):
+            if cur and cur["hunks"]:
+                files.append(cur)
+            cur = {"path": None, "old_path": None, "hunks": []}
+            hunk = None
+        elif line.startswith("--- "):
+            if cur is None:
+                cur = {"path": None, "old_path": None, "hunks": []}
+            p = line[4:]
+            if p.startswith("a/"):
+                p = p[2:]
+            cur["old_path"] = p
+            hunk = None
+        elif line.startswith("+++ "):
+            if cur is None:
+                cur = {"path": None, "old_path": None, "hunks": []}
+            p = line[4:]
+            if p.startswith("b/"):
+                p = p[2:]
+            cur["path"] = p
+            hunk = None
+        elif line.startswith("@@"):
+            m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if not m or cur is None:
+                continue
+            hunk = {
+                "old_start": int(m.group(1)),
+                "old_count": int(m.group(2) or 1),
+                "new_start": int(m.group(3)),
+                "new_count": int(m.group(4) or 1),
+                "lines": [],
+            }
+            cur["hunks"].append(hunk)
+        elif cur is not None and hunk is not None and line:
+            op = line[0]
+            if op in "+- ":
+                hunk["lines"].append((op, line[1:]))
+    if cur and cur["hunks"]:
+        files.append(cur)
+    return files
+
+
+def _locate_hunk(lines: list, hunk: dict, window: int = 160,
+                 ratio_min: float = 0.82):
+    """定位 hunk 在文件中的插入位置。
+
+    先按行号精确匹配；失败后在同一位置的 ±window 行窗口内做模糊匹配
+    （stripped 行序列相似度 ≥ ratio_min 才接受，避免误伤）。
+    返回 (位置, 是否模糊) 或 (None, False)。
+    """
+    old_start, old_count = hunk["old_start"], hunk["old_count"]
+    exp_old = [t for op, t in hunk["lines"] if op in "- "]
+    idx = old_start - 1
+    if old_count > 0:
+        region = lines[idx:idx + old_count]
+        if len(region) >= len(exp_old) and \
+                all(a == b for a, b in zip(region, exp_old)):
+            return idx, False
+    if not exp_old:
+        # 纯新增 hunk：无上下文可校验，按行号（越界则追加到末尾）
+        return min(idx, len(lines)), False
+    n = len(exp_old)
+    lo = max(0, idx - window)
+    hi = min(len(lines) - n + 1, idx + window + 1)
+    if hi <= lo:
+        return None, False
+    target = [l.strip() for l in exp_old]
+    best, best_ratio = lo, 0.0
+    for i in range(lo, hi):
+        cand = [l.strip() for l in lines[i:i + n]]
+        if len(cand) < n:
+            continue
+        r = difflib.SequenceMatcher(None, target, cand).ratio()
+        if r > best_ratio:
+            best, best_ratio = i, r
+    if best_ratio >= ratio_min:
+        return best, True
+    return None, False
+
+
+def _apply_patch_file(fp: Path, old_path: str, hunks: list, is_new: bool):
+    """应用补丁到单个文件（严格优先、模糊兜底），返回 (新文本, 说明) 或错误信息。
+
+    返回说明 dict：{"enc": 编码, "fuzzy": 是否用过模糊匹配, "notes": [提示]}。
+    """
+    if str(fp.name).lower() == "dev/null":
+        return None, "不支持删除文件（/dev/null），已跳过。"
+    if fp.exists():
+        try:
+            text, enc = _read_text(fp)
+        except OSError as e:
+            return None, f"读取失败 {fp.name}: {e}"
+        norm = text.replace("\r\n", "\n")
+        nl = "\r\n" if "\r\n" in text else "\n"
+        had_trailing = norm.endswith("\n")
+        lines = norm.split("\n")
+        if had_trailing and lines and lines[-1] == "":
+            lines.pop()
+    else:
+        if not is_new:
+            return None, f"文件不存在且补丁未标记为新建：{fp.name}"
+        lines, had_trailing, enc, nl = [], False, "utf-8", "\n"
+    fuzzy_used, notes = False, []
+    for hi, hunk in enumerate(reversed(hunks), 1):
+        old_count = hunk["old_count"]
+        exp_old = [t for op, t in hunk["lines"] if op in "- "]
+        pos, fuzzy = _locate_hunk(lines, hunk)
+        if pos is None:
+            return None, (f"补丁第 {hi} 段上下文不匹配（{fp.name} 期望位置第 "
+                          f"{hunk['old_start']} 行起），且附近 {160} 行内无足够相似的"
+                          f"内容（期望首行：{exp_old[0]!r}）。请重新生成补丁。")
+        new_lines = [t for op, t in hunk["lines"] if op in "+ "]
+        if fuzzy:
+            fuzzy_used = True
+            notes.append(f"第 {hi} 段在偏离原行号的位置（{pos + 1} 行起）模糊匹配后应用")
+        if old_count == 0:
+            lines[pos:pos] = new_lines
+        else:
+            lines[pos:pos + old_count] = new_lines
+    out = nl.join(lines)
+    if had_trailing:
+        out += nl
+    return out, {"enc": enc, "fuzzy": fuzzy_used, "notes": notes}
+
+
+def code_patch(args: dict) -> str:
+    patch_text = str(args.get("patch") or "")
+    if not patch_text.strip():
+        return "错误：patch（unified diff 文本）不能为空"
+    root = _norm_root(args.get("root"))
+    preview = bool(args.get("preview"))
+    files = _parse_unified_patch(patch_text)
+    if not files:
+        return "错误：未能从补丁中解析出任何文件（需要 --- / +++ 和 @@ 段）。"
+    results, errors = [], []
+    for f in files:
+        path_s = f.get("path") or f.get("old_path") or ""
+        if not path_s or path_s == "/dev/null":
+            errors.append(f"跳过无效路径：{path_s!r}")
+            continue
+        try:
+            fp = _resolve(root, path_s)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        if not _within(root, fp):
+            errors.append(f"⛔ 越界路径（不在 root={root} 内）：{fp}")
+            continue
+        if _is_core(root, fp) and not args.get("allow_core"):
+            errors.append(f"⛔ {_rel(root, fp)} 是大白核心文件，已跳过"
+                          "（确需修改请 allow_core=true）")
+            continue
+        is_new = not fp.exists()
+        new_text, info = _apply_patch_file(fp, f.get("old_path") or "", f["hunks"], is_new)
+        if new_text is None:
+            errors.append(info or "补丁应用失败")
+            continue
+        enc = info.get("enc", "utf-8")
+        fnote = ""
+        if info.get("notes"):
+            fnote = "\n  ⚠ " + "；".join(info["notes"])
+        if preview:
+            results.append(f"🔍 预览 {_rel(root, fp)}：{fnote}\n" + new_text)
+            continue
+        try:
+            if not is_new:
+                bak = fp.with_name(fp.name + f".bak-{int(time.time())}")
+                bak.write_bytes(fp.read_bytes())
+                try:
+                    fp.write_bytes(new_text.encode(
+                        enc if enc != "utf-8-sig" else "utf-8-sig"))
+                except UnicodeEncodeError:
+                    fp.write_bytes(new_text.encode("utf-8"))
+                results.append(f"✅ 已应用：{_rel(root, fp)}（备份 {bak.name}）{fnote}")
+            else:
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_bytes(new_text.encode("utf-8"))
+                results.append(f"✅ 已创建：{_rel(root, fp)}（{len(new_text)} 字节）{fnote}")
+        except OSError as e:
+            errors.append(f"写入失败 {_rel(root, fp)}: {e}")
+    out = "\n".join(results)
+    if errors:
+        out += "\n\n⚠ 部分文件未应用：\n" + "\n".join(f"  - {e}" for e in errors)
+    if not results:
+        return _trim("❌ 补丁未能应用：\n" + "\n".join(f"  - {e}" for e in errors))
+    return _trim(out)
+
+
+# ---------- 5. 测试与自审 ----------
+
+def code_test(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    try:
+        timeout = max(10, min(int(args.get("timeout") or 300), 600))
+    except ValueError:
+        return "错误：timeout 需为数字"
+    files = _split_list(args.get("files")) or _split_list(args.get("paths"))
+    pattern = str(args.get("pattern") or "").strip()
+    verbose = bool(args.get("verbose"))
+    cmd = [sys.executable, "-m", "pytest", "-q", "--no-header",
+           "-p", "no:cacheprovider"]
+    if verbose:
+        cmd.append("-v")
+    if pattern:
+        cmd += ["-k", pattern]
+    if files:
+        cmd += files
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=str(root), creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return f"⚠ 测试运行超时（>{timeout}s）已终止"
+    out, err = r.stdout or "", r.stderr or ""
+    if "No module named 'pytest'" in err or "No module named pytest" in err:
+        return ("⚠ 当前 python 环境没有安装 pytest。可改用 code_verify(mode=test) "
+                "逐文件运行，或先安装：python -m pip install pytest")
+    failed = [l.strip() for l in out.splitlines() if l.strip().startswith("FAILED")]
+    summary = ""
+    for l in reversed(out.splitlines()):
+        l = l.strip()
+        if "passed" in l or "failed" in l or "error" in l:
+            summary = l
+            break
+    mark = "✔" if r.returncode == 0 else "✘"
+    parts = [f"{mark} 测试结果：{summary or f'退出码 {r.returncode}'}"]
+    if failed:
+        shown = failed[:30]
+        parts.append(f"失败用例（{len(failed)} 个，显示前 {len(shown)}）：")
+        parts += [f"  {f}" for f in shown]
+    tail = (out + "\n" + err).strip()
+    if len(tail) > 2000:
+        tail = tail[-2000:] + "\n…（输出截断，只显示末尾）"
+    parts.append("输出末尾：\n" + tail)
+    return _trim("\n".join(parts))
+
+
+def code_review(args: dict) -> str:
+    root = _norm_root(args.get("root"))
+    ref = str(args.get("ref") or "").strip()
+    name_args = ["diff", "--name-status", "-M"] + ([ref] if ref else ["HEAD"])
+    r, err = _git_run(root, name_args)
+    if r is None or (r.returncode != 0 and not ref):
+        # 无 HEAD（全新仓库）或非仓库：回退到 git status 清单
+        r2, err2 = _git_run(root, ["status", "--porcelain=v1"])
+        if r2 is None or r2.returncode != 0:
+            return f"⚠ 无法读取改动（{_git_err(r or r2, err or err2)}）。" \
+                   "请确认该目录是 git 仓库。"
+        changed = [(l[:2].strip() or "??", l[3:].strip())
+                   for l in r2.stdout.splitlines() if l.strip()]
+    else:
+        if r.returncode != 0:
+            return f"git diff 失败：{_git_err(r, err)}"
+        changed = []
+        for l in r.stdout.splitlines():
+            parts = l.split("\t")
+            if len(parts) >= 2:
+                changed.append((parts[0], parts[1]))
+    if not changed:
+        return "改动审查：没有发现改动（工作区与提交一致）。"
+    # 补充未跟踪文件（git diff 不显示 ?? 文件）
+    r3, _ = _git_run(root, ["status", "--porcelain=v1"])
+    if r3 and r3.returncode == 0:
+        untracked = [l[3:].strip() for l in r3.stdout.splitlines()
+                     if l[:2].strip() == "??"]
+        changed += [("??", f) for f in untracked]
+    stat_args = ["diff", "--stat"] + ([ref] if ref else ["HEAD"])
+    rs, _ = _git_run(root, stat_args)
+    out = [f"改动审查（{ref or '未提交改动 vs HEAD'}）：",
+           f"变更文件 {len(changed)} 个："]
+    out += [f"  {st}  {f}" for st, f in changed[:80]]
+    if rs and rs.returncode == 0 and rs.stdout.strip():
+        out.append("\n" + rs.stdout.strip())
+    checks = []
+    for st, f in changed:
+        if st.startswith("D"):
+            continue
+        fp = root / f
+        if fp.is_file() and fp.suffix.lower() in (
+                ".py", ".json", ".js", ".mjs", ".cjs"):
+            checks.append(_syntax_check(fp))
+    if checks:
+        out.append("\n语法检查：")
+        out += checks
+    out.append("\n建议：code_git_diff 看详细 diff；code_smoke 做 import 冒烟；"
+               "code_test 跑相关测试；确认无误后交给用户提交。")
+    return _trim("\n".join(out))
+
+
+def _syntax_check(fp: Path) -> str:
+    suffix = fp.suffix.lower()
+    try:
+        text, _ = _read_text(fp)
+    except OSError as e:
+        return f"✘ {fp.name}：读取失败 {e}"
+    if suffix == ".py":
+        try:
+            compile(text, str(fp), "exec")
+            return f"✔ {fp.name}：Python 语法正确"
+        except SyntaxError as e:
+            snippet = (e.text or "").strip()[:60]
+            return f"✘ {fp.name}：Python 语法错误 第 {e.lineno} 行 {e.msg}" \
+                   + (f"（{snippet}）" if snippet else "")
+    if suffix == ".json":
+        try:
+            json.loads(text)
+            return f"✔ {fp.name}：JSON 解析正确"
+        except json.JSONDecodeError as e:
+            return f"✘ {fp.name}：JSON 解析错误 第 {e.lineno} 行 {e.msg}"
+    if suffix in (".js", ".mjs", ".cjs"):
+        node = shutil.which("node")
+        if not node:
+            return f"⚠ {fp.name}：未找到 node，跳过 JS 语法检查"
+        try:
+            r = subprocess.run(
+                [node, "--check", str(fp)], capture_output=True, text=True,
+                timeout=60, creationflags=_CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return f"⚠ {fp.name}：node --check 超时"
+        if r.returncode == 0:
+            return f"✔ {fp.name}：node --check 通过"
+        return f"✘ {fp.name}：node --check 失败\n{(r.stderr or r.stdout).strip()[:500]}"
+    return f"✔ {fp.name}：无内置语法检查（{suffix or '无扩展名'}）"
+
+
+def code_create_file(args: dict) -> str:
+    path_s = str(args.get("path") or "").strip()
+    content = str(args.get("content") or "")
+    if not path_s:
+        return "错误：path 不能为空"
+    root = _norm_root(args.get("root"))
+    try:
+        fp = _resolve(root, path_s)
+    except ValueError as e:
+        return f"错误：{e}"
+    if not _within(root, fp):
+        return f"⛔ 越界路径（不在 root={root} 内）：{fp}"
+    if _is_core(root, fp) and not args.get("allow_core"):
+        return ("⛔ 这是大白核心文件（harness/*.py 或项目根目录 *.py），"
+                "直接写入会触发整进程自动重启。如确有需要，请先向用户说明，"
+                "再显式传 allow_core=true。")
+    if fp.exists() and not args.get("overwrite"):
+        return f"文件已存在：{_rel(root, fp)}（传 overwrite=true 才会覆盖）"
+    try:
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_bytes(content.encode("utf-8"))
+    except OSError as e:
+        return f"创建失败：{e}"
+    warn = ""
+    if args.get("check_syntax") is not False:
+        warn = _syntax_check(fp)
+    return (f"✅ 已创建：{_rel(root, fp)}"
+            f"（{len(content.encode('utf-8'))} 字节）"
+            + (f"\n{warn}" if warn else ""))
+
+
+def _run_test(fp: Path, root: Path, timeout: int) -> str:
+    rel = _rel(root, fp)
+    if fp.suffix.lower() != ".py":
+        return f"⚠ {rel}：目前只支持运行 .py 测试文件"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(fp)], capture_output=True, text=True,
+            timeout=timeout, cwd=str(root), errors="replace",
+            creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return f"⚠ {rel}：测试运行超时（>{timeout}s）已终止"
+    tail = (r.stdout + "\n" + r.stderr).strip()
+    if len(tail) > 1500:
+        tail = tail[-1500:] + "\n…（输出截断，只显示末尾）"
+    mark = "✔" if r.returncode == 0 else "✘"
+    return f"{mark} {rel}：python 运行结束，退出码 {r.returncode}\n{tail}"
+
+
+def _import_smoke(fp: Path, root: Path, timeout: int) -> str:
+    """在子进程里以模块方式导入 .py 文件，捕获导入期错误（最常用的冒烟）。
+
+    语法正确但 import 就炸（缺依赖/循环导入/顶层代码报错）是改代码后最常见的坑，
+    这一步专门把它暴露出来；不执行 __main__，只验证模块能完整加载。
+    """
+    rel = _rel(root, fp)
+    code = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('_smoke', %r)\n"
+        "if spec is None or spec.loader is None:\n"
+        "    print('LOADER_NONE'); sys.exit(2)\n"
+        "m = importlib.util.module_from_spec(spec)\n"
+        "try:\n"
+        "    spec.loader.exec_module(m)\n"
+        "except SystemExit as e:\n"
+        "    print('SYSTEM_EXIT', getattr(e, 'code', None)); sys.exit(0)\n"
+        "except Exception as e:\n"
+        "    print('IMPORT_FAIL', type(e).__name__, str(e)[:400]); sys.exit(1)\n"
+        "print('IMPORT_OK')\n" % (str(fp),)
+    )
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            timeout=timeout, cwd=str(root), errors="replace",
+            creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return f"✘ {rel}：import 冒烟超时（>{timeout}s）"
+    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+    if r.returncode == 0 and "IMPORT_OK" in out:
+        return f"✔ {rel}：import 冒烟通过"
+    tail = "\n".join(out.splitlines()[-8:])[:500]
+    return f"✘ {rel}：import 冒烟失败（exit={r.returncode}）\n{tail}"
+
+
+def _run_smoke_command(command: str, root: Path, timeout: int) -> str:
+    try:
+        r = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=str(root), errors="replace",
+            creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return f"✘ 冒烟命令超时（>{timeout}s）：{command}"
+    out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+    tail = "\n".join(x for x in out.splitlines() if x.strip())[-1500:]
+    mark = "✔" if r.returncode == 0 else "✘"
+    return f"{mark} 冒烟命令 exit={r.returncode}：{command}\n输出末尾：\n{tail}"
+
+
+def code_smoke(args: dict) -> str:
+    """改完代码后的冒烟关卡：语法 + import（模块能加载）+ 可选冒烟命令。
+
+    - syntax：py_compile / JSON 解析 / node --check（不执行代码）
+    - import（默认）：只以模块方式导入 .py，暴露缺依赖/循环导入/顶层代码报错；
+      语法检查交给 code_verify，避免重复
+    - all：语法 + import 一次性全查（单独用 code_smoke 时选它）
+    - command：最后再跑一条冒烟命令
+    """
+    files = _split_list(args.get("files"))
+    if not files:
+        return "错误：files 不能为空（要冒烟的文件，逗号/换行分隔）"
+    root = _norm_root(args.get("root"))
+    mode = str(args.get("mode") or "import").lower()
+    if mode not in ("syntax", "import", "all"):
+        return "错误：mode 只能是 syntax / import / all"
+    try:
+        timeout = max(5, min(int(args.get("timeout") or 120), 600))
+    except ValueError:
+        return "错误：timeout 需为数字"
+    results, failed = [], 0
+    for f in files:
+        try:
+            fp = _resolve(root, f)
+        except ValueError as e:
+            results.append(f"✘ {f}：{e}")
+            failed += 1
+            continue
+        if not _within(root, fp):
+            results.append(f"✘ {f}：越界路径（不在 root={root} 内）")
+            failed += 1
+            continue
+        if not fp.is_file():
+            results.append(f"✘ {f}：文件不存在")
+            failed += 1
+            continue
+        if mode in ("syntax", "all"):
+            r = _syntax_check(fp)
+            results.append(r)
+            if r.startswith("✘"):
+                failed += 1
+                continue  # 语法不过就先修，不做 import
+        if mode in ("import", "all") and fp.suffix.lower() == ".py":
+            r = _import_smoke(fp, root, timeout)
+            results.append(r)
+            if r.startswith("✘"):
+                failed += 1
+    command = str(args.get("command") or "").strip()
+    if command:
+        r = _run_smoke_command(command, root, timeout)
+        results.append(r)
+        if r.startswith("✘"):
+            failed += 1
+    head = "冒烟结果：" + ("✔ 全部通过" if failed == 0 else f"✘ {failed} 项未通过，先修复再继续")
+    return _trim(head + "\n\n" + "\n\n".join(results))
+
+
+def code_verify(args: dict) -> str:
+    files = _split_list(args.get("files"))
+    if not files:
+        return "错误：files 不能为空"
+    root = _norm_root(args.get("root"))
+    mode = str(args.get("mode") or "syntax").lower()
+    try:
+        timeout = max(5, min(int(args.get("timeout") or 120), 600))
+    except ValueError:
+        return "错误：timeout 需为数字"
+    results = []
+    for f in files:
+        try:
+            fp = _resolve(root, f)
+        except ValueError as e:
+            results.append(f"✘ {f}：{e}")
+            continue
+        if not _within(root, fp):
+            results.append(f"✘ {f}：越界路径（不在 root={root} 内）")
+            continue
+        if not fp.is_file():
+            results.append(f"✘ {f}：文件不存在")
+            continue
+        if mode in ("syntax", "all"):
+            results.append(_syntax_check(fp))
+        if mode in ("test", "all"):
+            results.append(_run_test(fp, root, timeout))
+    return _trim("\n\n".join(results))
+
+
+HANDLERS = {
+    "code_search": code_search,
+    "code_list_files": code_list_files,
+    "code_read": code_read,
+    "code_locate": code_locate,
+    "code_analyze": code_analyze,
+    "code_deps": code_deps,
+    "code_edit": code_edit,
+    "code_create_file": code_create_file,
+    "code_verify": code_verify,
+    "code_smoke": code_smoke,
+    "code_git_status": code_git_status,
+    "code_git_diff": code_git_diff,
+    "code_git_log": code_git_log,
+    "code_git_blame": code_git_blame,
+    "code_patch": code_patch,
+    "code_test": code_test,
+    "code_review": code_review,
+}

@@ -1,0 +1,172 @@
+{
+  "name": "shell",
+  "title": "本机命令行",
+  "version": "1.0.0",
+  "description": "在用户 Windows 电脑上执行命令行操作（打开程序/文件、查文件、看状态等），带危险命令拦截与超时保护；也可按名字搜索真实文件位置。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "full",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "shell_run",
+        "description": "执行一条 Windows 命令并返回输出。适合快速本机操作：打开程序/文件、dir 查目录、tasklist 看进程、type 读小文件等。危险命令会被拦截；引用用户文件时必须使用真实存在的完整路径，不确定先用 find_file 查找。大型编码/项目任务不要用本工具，改用 delegate_agent_task 委派。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {"type": "string", "description": "要执行的 Windows cmd 命令"},
+            "timeout": {"type": "integer", "description": "超时秒数（默认 60，最大 300）"}
+          },
+          "required": ["command"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find_file",
+        "description": "按文件名关键词在本机常见位置（桌面/下载/视频/音乐/文档/项目目录/各盘符浅层）搜索真实文件的完整路径。打开或播放用户文件前，若不知道确切路径，必须先调用本工具查找，绝不要猜测路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "文件名或关键词（如 蜘蛛侠1.mp4 或 蜘蛛侠）"}
+          },
+          "required": ["name"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_text",
+        "description": "按关键词搜索文件内容（类 grep，优先 ripgrep，缺失时回退 findstr），只读不修改文件。适合：查某个函数/变量/配置在哪里定义或引用、在日志里统计某报错出现几次、跨文件定位代码。结果返回 文件:行号:内容。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "要搜索的关键词（不区分大小写）"},
+            "root": {"type": "string", "description": "搜索目录（默认当前工作目录，如 D:\\AI\\dabai）"},
+            "glob": {"type": "string", "description": "文件类型过滤，逗号分隔（如 *.py,*.ts；留空搜全部）"},
+            "max_results": {"type": "integer", "description": "最多显示多少条（默认 40，最大 200）"},
+            "timeout": {"type": "integer", "description": "超时秒数（默认 30，最大 120）"}
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_files",
+        "description": "列出目录结构与文件清单（只读，优先 ripgrep 尊重 .gitignore）。适合动手前先看项目结构、找文件在哪。可指定深度 depth 和文件类型 glob。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "要列出的目录（默认当前工作目录）"},
+            "depth": {"type": "integer", "description": "目录深度（默认 2，最大 6）"},
+            "glob": {"type": "string", "description": "文件类型过滤，逗号分隔（如 *.py,*.ts）"},
+            "max_entries": {"type": "integer", "description": "最多显示多少条（默认 120，最大 500）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_lines",
+        "description": "按行区间读取文件（只读，自动识别 UTF-8/GBK，避免整读大文件）。配合 search_text 定位到 文件:行号 后，读该处附近的上下文。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "要读取的文件完整路径（用 find_file / search_text 先定位，不要臆造）"},
+            "start": {"type": "integer", "description": "起始行号（1 开始，默认 1）"},
+            "max_lines": {"type": "integer", "description": "最多读多少行（默认 100，最大 1000）"}
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "git_status",
+        "description": "查看 git 工作区状态（只读）：当前分支 + 有哪些文件改动/新增/删除。适合续接任务前确认改动面、自查是否误改。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "仓库或子目录（默认当前工作目录）"},
+            "max_lines": {"type": "integer", "description": "最多显示多少条（默认 300，最大 1000）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "git_diff",
+        "description": "查看 git 改动差异（只读）：默认看未暂存改动，staged=true 看暂存区；可指定 path 只看单个文件。适合确认改动内容、出问题定位回滚点。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "仓库或子目录（默认当前工作目录）"},
+            "path": {"type": "string", "description": "只看某个文件的差异（相对仓库根或完整路径）"},
+            "staged": {"type": "boolean", "description": "true 看暂存区差异，默认 false 看未暂存"},
+            "max_lines": {"type": "integer", "description": "最多显示多少行 diff（默认 400，最大 2000）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "system_check",
+        "description": "系统只读体检：进程（tasklist，可按关键词过滤）、监听端口（netstat，可按端口过滤）、磁盘剩余空间。适合排查服务没起来、端口被占用、推流进程卡住等问题。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "what": {"type": "string", "description": "检查项：all（默认）/ process / port / disk"},
+            "keyword": {"type": "string", "description": "进程名关键词过滤（如 ffmpeg、python、codex）"},
+            "port": {"type": "string", "description": "只看某个监听端口（如 3080、8080）"},
+            "max_lines": {"type": "integer", "description": "每项最多显示多少条（默认 40，最大 200）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "symbols",
+        "description": "列出代码文件的符号表（只读）：Python 用标准库 ast；JS/TS/C/C++/C#/Java/Go/Rust/Bash/Lua/PHP/Ruby/Kotlin/Swift 用 tree-sitter 真实语法树（已内置语法库），语法包缺失时自动回退正则规则。返回类/函数/方法名 + 行号 + 签名/首行。适合快速了解任意代码文件有哪些入口，不用整读文件。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "代码文件完整路径（支持 .py/.js/.ts/.c/.cpp/.cs/.java/.go/.rs/.sh/.lua/.php/.rb/.kt/.swift 等）"},
+            "max_results": {"type": "integer", "description": "最多显示多少条（默认 80，最大 300）"}
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_json",
+        "description": "读取并校验 JSON 配置文件（只读，自动识别 UTF-8/GBK）：校验是否损坏（报错行列）、美化打印、支持点路径取子字段（如 agent.tools.cx）。适合查 settings.json / codex_runtime.json / character_cards.json 等配置。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "JSON 文件完整路径"},
+            "key": {"type": "string", "description": "点路径取子字段（如 agent 或 agent.tools.cx），留空显示整个文件"},
+            "max_chars": {"type": "integer", "description": "最多显示多少字符（默认 3000，最大 8000）"}
+          },
+          "required": ["path"]
+        }
+      }
+    }
+  ],
+  "prompt": "【技能 本机命令行】shell_run 执行 Windows 命令（打开程序/文件、查目录、看进程），find_file 按名字搜索真实文件路径，search_text 按关键词搜索文件内容（查函数/变量/配置定义与引用、统计日志报错等，优先用 rg，禁止整读大文件），list_files 看项目结构，read_lines 按行区间读文件（搜索定位后读上下文），git_status/git_diff 看改动面与差异（只读，自查/续接/回滚用），system_check 查进程/端口/磁盘（排查服务与推流），symbols 列 Python 文件的类/函数符号表（零依赖），read_json 读并校验 JSON 配置（查损坏、点路径取子字段）。规则：引用用户文件前必须先 find_file 拿到真实完整路径，绝不臆造路径；破坏性命令会被拦截；删除/清理类命令只允许操作白名单临时文件（*.pyc-check、*.tmp、*.bak-*、_check*.txt、codex_logs/ 运行日志、%TEMP% 临时文件），其余删除一律被拦截，git 已跟踪的项目文件禁止删除；编写完整项目/游戏等大型任务改用 delegate_agent_task 委派给编程智能体。"
+}

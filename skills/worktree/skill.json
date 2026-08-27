@@ -1,0 +1,122 @@
+{
+  "name": "worktree",
+  "title": "代码任务隔离（git 工作树）",
+  "version": "1.0.0",
+  "description": "复杂/重构/核心大改先在独立 git 工作树里做：不污染主工作区，改完审查无误再合并回主分支，出问题直接丢弃，回滚成本趋近于零。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【代码任务隔离】接到复杂/重构/涉及核心文件/大改动/没把握的任务时，先用本技能在工作树隔离区动手，不要在主线工作区直接改。工作流：wt_create 建隔离工作树 → 用 code_ops 的 code_read/code_edit/code_patch/code_smoke（root 传工作树路径）在隔离区改和验证 → wt_status/wt_diff 审查改动面 → 确认无误 wt_merge 合并回主分支（改坏了就 wt_discard 丢弃，主工作区毫发无损）。规则：①任务名要简短，自动生成 codex/<名> 分支，工作树放在隔离区目录（默认 D:\\AI\\dabai_worktrees\\，settings.json 的 agent.worktree_dir 可改）；②隔离区不触发大白核心热重载，合并回主分支后由 hot_reload 正常接管；③合并前先 wt_status 确认隔离区没有未提交的临时文件；④主工作区有未提交改动时合并可能冲突，先向用户说明；⑤wt_discard 是破坏性操作，必须 confirm=true。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_create",
+        "description": "创建隔离工作树：在独立目录检出分支 codex/<名>，后续改动都在这里做，不碰主工作区。返回工作树路径、分支名与主工作区脏状态提醒。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "任务名（简短英文/数字/中文均可，自动转安全目录名），如 fix-server-restart"},
+            "root": {"type": "string", "description": "仓库路径（默认当前工作目录 D:\\AI\\dabai）"},
+            "base": {"type": "string", "description": "可选：基于哪个提交/分支创建（默认 HEAD）"}
+          },
+          "required": ["name"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_list",
+        "description": "列出全部工作树：路径、分支、是否有改动。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "仓库路径（默认当前工作目录）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_status",
+        "description": "查看某个工作树的状态：分支、改动文件清单、diff 统计。合并前必须调用确认没有遗漏。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "工作树路径（wt_create 返回的）"},
+            "root": {"type": "string", "description": "仓库路径（默认当前工作目录）"}
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_diff",
+        "description": "查看工作树相对主分支的完整差异（含未提交改动与已提交 commit），审查改了什么、是不是改多了。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "工作树路径"},
+            "root": {"type": "string", "description": "仓库路径（默认当前工作目录）"},
+            "max_lines": {"type": "integer", "description": "最多显示多少行 diff（默认 400，最大 5000）"}
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_run",
+        "description": "在工作树里执行一条命令（如运行测试、语法检查），工作目录为工作树路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "工作树路径"},
+            "command": {"type": "string", "description": "要执行的命令"},
+            "timeout": {"type": "integer", "description": "超时秒数（默认 120，最大 600）"}
+          },
+          "required": ["path", "command"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_merge",
+        "description": "把工作树分支合并回主分支：先确认工作树无未提交改动，再 merge（默认 --no-ff），成功后自动移除工作树并删除已合并分支。冲突时返回错误并保留现场。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "工作树路径"},
+            "root": {"type": "string", "description": "主仓库路径（默认当前工作目录）"},
+            "keep": {"type": "boolean", "description": "true 时合并后保留工作树（默认 false 移除）"},
+            "keep_branch": {"type": "boolean", "description": "true 时合并后保留分支（默认 false 删除已合并分支）"}
+          },
+          "required": ["path"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "wt_discard",
+        "description": "丢弃工作树：删除目录并删除其分支（破坏性操作，隔离区所有改动丢失，必须 confirm=true）。改坏了用这个一键回到原点。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "工作树路径"},
+            "root": {"type": "string", "description": "仓库路径（默认当前工作目录）"},
+            "confirm": {"type": "boolean", "description": "确认丢弃，必须为 true"}
+          },
+          "required": ["path", "confirm"]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,313 @@
+{
+  "name": "code_ops",
+  "title": "代码工程（检索/分析/修改）",
+  "version": "1.0.0",
+  "description": "批量检索、分析、修改代码：搜代码、定位符号、读文件、分析结构与依赖、精准编辑与语法验证，让大白成为顶级编程智能体。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【代码工程】用户要求检索/查找代码、分析代码、修改代码、重构、排错、批量改动、看代码结构/依赖时，用本技能自己做，不需要委派给其它智能体。工作闭环：code_list_files/code_search 定位 → code_read 读上下文 → code_locate 找定义与引用 → code_analyze/code_deps 分析结构依赖 → code_edit/code_create_file 精准修改 → code_verify 验证 → code_smoke 冒烟。规则：①引用文件前先用检索/列文件确认真实路径，绝不臆造路径；②默认 root 是当前工作目录（大白项目），分析其它项目时显式传 root；③code_edit 必须用唯一锚点（出现 0 次或多次都只报告不擅改），改完返回 diff 预览；锚点没匹配到时会给出最相近的真实行，据此修正锚点重试；④默认禁止修改大白核心（harness/*.py 与项目根目录 *.py，会触发整进程自动重启），确需修改须 allow_core=true 并先告知用户；⑤检索/分析默认跳过 node_modules/.git/__pycache__ 等噪音目录；⑥每次修改后必须 code_verify 验证语法/运行测试，再 code_smoke（默认 import 模式）做 import 冒烟——语法已由 code_verify 查过，code_smoke 不再重复；模块/库改动尤其必须，冒烟不过不允许收尾；⑦读长文件用 路径:起-止 分段读（工具会在结尾提示下一段范围），大改动/批量改动优先用 code_patch（git diff 格式，匹配失败自动模糊兜底并提示）。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "code_search",
+        "description": "批量检索代码：按正则或关键词搜索项目内多个文件，支持文件类型过滤、上下文行、大小写、限制数量。适合找报错关键字、某个函数被谁调用、配置项、魔法数字等。默认忽略 node_modules/.git/__pycache__ 等噪音目录。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "要检索的内容；regex=true（默认）时是正则表达式，regex=false 时按普通关键词匹配"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录 D:\\AI\\dabai；检索其它项目时必传，如 D:\\AI\\other-project）"},
+            "exts": {"type": "string", "description": "文件类型过滤，逗号分隔，如 py,js,ts；省略则搜索常见代码文件"},
+            "paths": {"type": "string", "description": "可选：限定检索的子路径，逗号/换行分隔，如 src,tests"},
+            "context": {"type": "integer", "description": "每条命中上下各显示几行（0-10，默认 0）"},
+            "case_sensitive": {"type": "boolean", "description": "是否区分大小写（默认 false）"},
+            "regex": {"type": "boolean", "description": "query 是否按正则处理（默认 true；普通关键词传 false）"},
+            "limit": {"type": "integer", "description": "最多返回多少处命中（默认 100，最大 500）"},
+            "include_noise": {"type": "boolean", "description": "是否包含 node_modules/.git/__pycache__ 等噪音目录（默认 false）"}
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_list_files",
+        "description": "列出项目/目录下的代码文件清单或按扩展名统计，支持类型与子目录过滤。适合动手前先摸清项目结构、确认文件真实路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "exts": {"type": "string", "description": "文件类型过滤，逗号分隔，如 py,js；省略则全部代码文件"},
+            "dirs": {"type": "string", "description": "可选：只看这些子目录，逗号/换行分隔，如 src,tests"},
+            "max_depth": {"type": "integer", "description": "最大递归深度（默认不限制）"},
+            "limit": {"type": "integer", "description": "最多列出多少文件（默认 300，最大 2000）"},
+            "summary_only": {"type": "boolean", "description": "true 时只返回按扩展名的统计，不列文件明细"},
+            "include_noise": {"type": "boolean", "description": "是否包含噪音目录（默认 false）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_read",
+        "description": "批量读取文件内容：一次读多个文件，支持 路径:行号 或 路径:起-止 指定区间，自动识别 UTF-8/GBK 编码并带行号。读代码上下文、看配置、查某段实现都用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {"type": "string", "description": "要读的文件，逗号/换行分隔；每项可为 路径、路径:行号、路径:起-止（如 src/a.py:10-40）。路径相对 root 或绝对路径"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "max_lines": {"type": "integer", "description": "每个文件最多读多少行（默认 500，最大 5000；长文件建议用 路径:起-止 分段读）"}
+          },
+          "required": ["files"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_locate",
+        "description": "定位符号：在项目里找某个函数/类/变量/接口的定义位置与引用位置，返回 文件:行号 清单。改代码前先定位定义、排查谁在调用，用它最高效。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "symbol": {"type": "string", "description": "要定位的标识符，如 fetch_data、UserModel"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "kind": {"type": "string", "enum": ["all", "def", "ref"], "description": "all=定义+引用（默认）；def=只看定义；ref=只看引用"},
+            "exts": {"type": "string", "description": "文件类型过滤，逗号分隔（默认 py,js,ts 等常见代码）"},
+            "paths": {"type": "string", "description": "可选：限定搜索的子路径，逗号/换行分隔"},
+            "limit": {"type": "integer", "description": "引用最多返回多少条（默认 80，最大 400）"}
+          },
+          "required": ["symbol"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_analyze",
+        "description": "分析代码：传 files 逐文件分析（类/函数/import/TODO/复杂度/空行占比），传 dir 或省略则分析整个目录（文件数/总行数/扩展名分布/最大文件/可疑大文件）。适合评估改动影响面、接手陌生项目、找重构切入点。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {"type": "string", "description": "要深入分析的文件，逗号/换行分隔（也可以传目录路径）；省略则做目录级统计"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "dir": {"type": "string", "description": "可选：指定要统计的子目录，省略则统计整个 root"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_deps",
+        "description": "依赖分析：分析项目内文件之间的 import/require 依赖关系，列出每个文件依赖了哪些项目内文件、哪些文件没人引用（孤立）、是否存在循环依赖。改模块前先看依赖图，避免改坏调用方。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {"type": "string", "description": "可选：只分析这些文件，逗号/换行分隔；省略则分析全部 py/js/ts 代码文件"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "limit": {"type": "integer", "description": "最多列出多少文件的依赖明细（默认 60，最大 300）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_edit",
+        "description": "精准修改代码：基于唯一锚点替换或插入内容，支持批量替换（replace_all）、修改前自动备份、返回 diff 预览。锚点出现 0 次或多于 1 次时只报告不擅改，杜绝误伤。默认拒绝修改大白核心文件（harness/*.py 与项目根目录 *.py），确需修改须 allow_core=true。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file": {"type": "string", "description": "要修改的文件路径（相对 root 或绝对路径）"},
+            "mode": {"type": "string", "enum": ["replace", "insert"], "description": "replace=替换 old（默认）；insert=在 anchor 所在行之前/之后插入 new"},
+            "old": {"type": "string", "description": "replace 模式：要被替换的原文，必须与文件内容逐字符一致（注意缩进/引号）；insert 模式下作为锚点文本"},
+            "new": {"type": "string", "description": "新内容；replace 模式留空=删除原文，insert 模式为要插入的行"},
+            "anchor": {"type": "string", "description": "insert 模式的锚点文本（与 old 二选一）"},
+            "position": {"type": "string", "enum": ["after", "before"], "description": "insert 模式插入位置：after=锚点行之后（默认），before=之前"},
+            "replace_all": {"type": "boolean", "description": "true 时替换所有出现位置（默认 false，只替换唯一出现）"},
+            "preview": {"type": "boolean", "description": "true 时只返回 diff 预览，不写入文件（先预览后应用）"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "allow_core": {"type": "boolean", "description": "是否允许修改大白核心文件（默认 false；改 harness/*.py 与项目根目录 *.py 会触发整进程重启）"}
+          },
+          "required": ["file", "mode", "new"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_create_file",
+        "description": "创建新代码文件：自动创建父目录、拒绝覆盖已有文件（overwrite=true 才覆盖）、可选语法预检（.py 编译/.json 解析）。新建脚本、模块、配置文件用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string", "description": "新文件路径（相对 root 或绝对路径）"},
+            "content": {"type": "string", "description": "文件完整内容"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "overwrite": {"type": "boolean", "description": "是否覆盖已存在文件（默认 false 拒绝）"},
+            "check_syntax": {"type": "boolean", "description": "创建后是否做语法预检（默认 true）"}
+          },
+          "required": ["path", "content"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_verify",
+        "description": "验证代码改动：syntax 模式做 Python 编译检查/JSON 解析检查/JS node --check；test 模式运行指定 .py 测试文件并返回结果；all 两种都做。每次修改后必须调用，确认改完没改坏。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {"type": "string", "description": "要验证的文件，逗号/换行分隔"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "mode": {"type": "string", "enum": ["syntax", "test", "all"], "description": "syntax=语法检查（默认）；test=运行 .py 测试文件；all=两者都做"},
+            "timeout": {"type": "integer", "description": "test 模式运行超时秒数（默认 120，最大 600）"}
+          },
+          "required": ["files"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_smoke",
+        "description": "改完代码后的冒烟关卡：import 模式（默认）以模块方式导入 .py 文件，当场暴露缺依赖/循环导入/顶层代码报错（改库/模块后最容易踩的坑）；syntax 模式做语法检查、all 模式语法+import 一次全查（单独用本工具时选 all）；可传 command 再跑一条冒烟命令（如启动入口/关键脚本）。接在 code_verify 之后用默认 import 模式，不重复语法检查。每次修改后必须调用，冒烟不过不允许收尾。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {"type": "string", "description": "要冒烟的文件，逗号/换行分隔（改库/模块后必须包含改动文件）"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "mode": {"type": "string", "enum": ["syntax", "import", "all"], "description": "import=只做 import 冒烟（默认，接在 code_verify 之后不重复语法）；syntax=只做语法检查；all=语法+import 一次性全查"},
+            "command": {"type": "string", "description": "可选：额外跑一条冒烟命令，如 python -m xxx 或启动入口，返回输出末尾"},
+            "timeout": {"type": "integer", "description": "超时秒数（默认 120，最大 600）"}
+          },
+          "required": ["files"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_git_status",
+        "description": "查看 git 工作区状态：哪些文件改了/新增/删除、当前分支，附带统计。改代码前先看状态，确认自己改了什么。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "short": {"type": "boolean", "description": "简洁模式（默认 true，显示改动清单+分支）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_git_diff",
+        "description": "查看 git 差异：未提交改动（或指定 ref 对比）、暂存区改动，支持按文件过滤、带 --stat 统计。修改后审查自己的改动、排查是不是改多了，用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "staged": {"type": "boolean", "description": "true 时看暂存区（git diff --staged）；默认看工作区未暂存改动"},
+            "ref": {"type": "string", "description": "可选：与某个提交对比，如 HEAD~1 或分支名；省略则对比暂存区/工作区"},
+            "files": {"type": "string", "description": "可选：只看这些文件的差异，逗号/换行分隔"},
+            "stat": {"type": "boolean", "description": "是否先显示改动统计（默认 true）"},
+            "max_lines": {"type": "integer", "description": "最多显示多少行 diff（默认 800，最大 5000；大改动建议加 files= 分文件看）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_git_log",
+        "description": "查看 git 提交历史：最近 N 条提交的 hash/日期/作者/说明，可按文件过滤。了解项目演进、查某文件什么时候被改过，用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "limit": {"type": "integer", "description": "显示多少条（默认 20，最大 100）"},
+            "file": {"type": "string", "description": "可选：只看该文件的提交历史"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_git_blame",
+        "description": "查看某文件指定行是谁、哪个提交改的（git blame）。排查某行代码的来历、找责任提交，用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "file": {"type": "string", "description": "要查看的文件路径"},
+            "lines": {"type": "string", "description": "行号或行区间，如 10 或 10-40"}
+          },
+          "required": ["file", "lines"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_patch",
+        "description": "补丁式编辑：把 unified diff 文本应用到项目（支持多文件、git 输出格式），严格校验上下文、匹配失败自动在同位置附近做模糊匹配兜底（有提示），可先 preview 预览再应用；自动备份、保护大白核心文件。适合复杂/批量改动或应用外部生成的补丁。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "patch": {"type": "string", "description": "unified diff 文本（--- / +++ / @@ 格式，支持 git diff 输出）"},
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "preview": {"type": "boolean", "description": "true 时只预览应用后的结果，不写入文件"},
+            "allow_core": {"type": "boolean", "description": "是否允许修改大白核心文件（默认 false）"}
+          },
+          "required": ["patch"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_test",
+        "description": "运行完整测试套件（pytest）：自动发现 tests/ 与 test_*.py/*_test.py，返回通过/失败统计与失败用例清单。修改后验证是否改坏东西，用它；比 code_verify 的语法检查更进一步。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "files": {"type": "string", "description": "可选：只跑这些测试文件/目录，逗号/换行分隔；省略则自动发现全部测试"},
+            "pattern": {"type": "string", "description": "可选：-k 表达式，只跑匹配的用例，如 \"api or model\""},
+            "timeout": {"type": "integer", "description": "超时秒数（默认 300，最大 600）"},
+            "verbose": {"type": "boolean", "description": "true 时显示每个用例明细（-v）"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "code_review",
+        "description": "审查自己的改动：列出变更文件、diff 统计、逐个做语法检查，一键打包成改动审查报告。交付前必须自查一遍，用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "root": {"type": "string", "description": "项目根目录（默认当前工作目录）"},
+            "ref": {"type": "string", "description": "可选：审查某个提交/分支以来的改动；省略则审查未提交改动（vs HEAD）"}
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "name": "scheduler",
+  "title": "定时任务（长任务自动化）",
+  "version": "1.0.0",
+  "description": "创建/管理定时任务：按固定间隔自动执行某件事（盯服务、定期检查、周期性汇报），无人值守也照跑，干完自动汇报；也可立即触发一次。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【定时任务】当用户要求「定期/定时/每隔一段时间/每天/每小时/帮我盯着/到时候提醒/自动检查」做某件事时使用本技能。工作流：sched_add 创建（任务描述要自包含：明确要查什么、用什么工具、结果怎么汇报）→ sched_list 查看下次执行时间 → 需要改间隔或暂停用 sched_toggle → 不再需要 sched_remove(confirm=true)。规则：①任务由子智能体后台执行，无人值守也照跑，完成后自动向主智能体汇报；②interval 支持秒数或中文（如 5分钟/1小时/1天），最短 30 秒；③任务描述写清验收标准，别写「看看情况」这种模糊要求；④同一个任务不要重复创建（同名会拒绝）；⑤删除是破坏性操作，必须 confirm=true。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_add",
+        "description": "创建定时任务：每隔 interval 自动执行一次 task（由子智能体后台完成，完成后自动汇报）。创建后立即触发第一次。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string", "description": "任务名（简短，如 服务器健康检查）"},
+            "task": {"type": "string", "description": "自包含的任务描述：要查什么/用什么工具/结果怎么汇报，写清验收标准"},
+            "interval": {"type": "string", "description": "执行间隔：秒数（如 60）或中文（如 30秒/5分钟/1小时/1天），最短 30 秒"},
+            "enabled": {"type": "boolean", "description": "是否立即启用（默认 true）"}
+          },
+          "required": ["name", "task", "interval"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_list",
+        "description": "列出全部定时任务：下次执行时间、执行次数、最近一次结果、启停状态。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_run_now",
+        "description": "立即触发某个定时任务一次（不等下一个周期；执行中则忽略）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {"type": "string", "description": "任务 id（sched_list 可查）"}
+          },
+          "required": ["job_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_toggle",
+        "description": "启用/暂停某个定时任务（暂停后不再自动执行，已登记的任务保留）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {"type": "string", "description": "任务 id"},
+            "enabled": {"type": "boolean", "description": "true=启用，false=暂停"}
+          },
+          "required": ["job_id", "enabled"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_remove",
+        "description": "删除定时任务（破坏性操作，无回收站，必须 confirm=true）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {"type": "string", "description": "任务 id"},
+            "confirm": {"type": "boolean", "description": "确认删除，必须为 true"}
+          },
+          "required": ["job_id", "confirm"]
+        }
+      }
+    }
+  ]
+}

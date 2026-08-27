@@ -1,0 +1,44 @@
+{
+  "name": "interface",
+  "title": "界面模式",
+  "version": "1.0.0",
+  "description": "切换应用交互模式、在屏幕上显示提示消息。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【界面模式技能】用户要求切换交互方式（自动对话/按住说话/锁屏防误触/普通模式）时用 switch_app_mode；想给用户即时反馈/提示时用 show_screen_toast（消息简短有趣，不超过30字）。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_app_mode",
+        "description": "切换应用的运行模式，根据对话情境自主调整交互方式。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["auto_voice", "press_voice", "lock_screen", "normal"],
+              "description": "目标模式：'auto_voice'=自动对话（边说边录自动发送），'press_voice'=按住说话，'lock_screen'=锁屏防误触（锁定操作仅语音对话，角色照常活动），'normal'=普通模式（解锁）。"
+            }
+          },
+          "required": ["mode"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "show_screen_toast",
+        "description": "在屏幕上显示一条短暂的提示消息（Toast），增强互动感和反馈感。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {"type": "string", "description": "要显示的提示文字，简短有趣为宜（不超过30字）。"}
+          },
+          "required": ["message"]
+        }
+      }
+    }
+  ]
+}

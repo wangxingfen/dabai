@@ -1,0 +1,12 @@
+{
+  "name": "github-fix-issue",
+  "title": "github-fix-issue",
+  "version": "1.0.0",
+  "description": "从 feiskyer/claude-code-settings 拉取的 Agent Skill。",
+  "author": "feiskyer",
+  "enabled": true,
+  "prompt": "【技能 github-fix-issue】已就绪：使用说明见本目录 SKILL.md；涉及 从 feiskyer/claude-code-settings 拉取的 Agen 等需求时，先调用 skill_help('github-fix-issue') 读取说明书再执行。",
+  "tools": [],
+  "_pulled_from": "feiskyer/claude-code-settings",
+  "_pulled_path": "skills/github-fix-issue"
+}

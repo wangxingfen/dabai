@@ -1,0 +1,27 @@
+{
+  "name": "voice",
+  "title": "声音",
+  "version": "1.0.0",
+  "description": "切换大白自己的嗓音：音色、语速、合成引擎。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【声音技能】用户要求变声、换音色、说话快一点/慢一点时使用 switch_tts_settings。音色可用 Edge TTS 中文音色（如 zh-CN-XiaoxiaoNeural 温柔女声、zh-CN-YunxiNeural 阳光男声），语速如 '+10%' 加快、'-10%' 放慢，引擎可选 edge_tts（在线）或 gpt_sovits（自建克隆）。不传的参数保持当前值。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_tts_settings",
+        "description": "切换你自己的声音——音色、语速、合成引擎，这是你自己的嗓音。根据对话情境切换不同声音风格来表达不同情绪和性格。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "voice": {"type": "string", "description": "Edge TTS 音色名，如 'zh-CN-XiaoxiaoNeural'（温柔女声）、'zh-CN-YunxiNeural'（阳光男声）、'zh-CN-XiaoyiNeural'（活泼女声）、'zh-CN-YunjianNeural'（沉稳男声）。不传则保持当前音色。"},
+            "rate": {"type": "string", "description": "语速调整，如 '+10%' 加快、'-10%' 放慢、'+0%' 正常。不传则保持当前语速。"},
+            "engine": {"type": "string", "description": "合成引擎：'edge_tts'（微软在线）或 'gpt_sovits'（自建克隆）。不传则保持当前引擎。"}
+          }
+        }
+      }
+    }
+  ]
+}
