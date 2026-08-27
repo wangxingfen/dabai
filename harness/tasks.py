@@ -643,7 +643,7 @@ class TaskSystem:
         global TEMPLATE_RE
         if TEMPLATE_RE is None:
             import re
-            TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\.result\s*\}\}")
+            TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-\u4e00-\u9fff]+)\.result\s*\}\}")
         if not isinstance(steps, list) or not steps:
             raise TaskSystemError("steps 必须是非空列表")
         seen: set = set()
