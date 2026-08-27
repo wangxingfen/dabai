@@ -53,3 +53,9 @@ web/generated/
 %TEMP%/
 undefined/
 web/vendor/
+
+# 一次性调试/输出残留
+temp_vh*.txt
+out.txt
+%TEMP%app_ts_probe.txt
+.trae-html-share-packages/
