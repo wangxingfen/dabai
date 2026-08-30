@@ -77,6 +77,7 @@ export interface AudioQueueItem {
   text?: string | null;
   audio_b64?: string | null;
   audio_mime?: string | null;
+  thinking?: boolean;
   end?: boolean;
 }
 
@@ -91,11 +92,20 @@ export interface BackgroundInfo {
 
 /** Token 用量统计（localStorage 持久化累计） */
 export interface TokenStats {
+  /** 累计实际输入（prompt_tokens 逐轮累加，不再覆盖） */
   context: number;
+  /** 累计实际输出（completion_tokens 逐轮累加） */
   completion: number;
+  /** 累计总 tokens（输入+输出） */
   total: number;
+  /** 累计轮数 */
   rounds: number;
+  /** 累计回复条数 */
   msgs: number;
+  /** 累计缓存命中 tokens */
+  cache_hit: number;
+  /** 累计缓存未命中 tokens */
+  cache_miss: number;
 }
 
 /** 在线音乐歌曲（/api/music/* 返回项） */
@@ -322,6 +332,7 @@ export interface TaskItem {
   error?: string;
   agent?: Partial<AgentInfo>;
   updated_at?: number;
+  progress?: number;
 }
 
 /** task_event 增量事件（09_websocket 推送） */
@@ -929,11 +940,15 @@ export interface AppKernel {
   _interruptedSession: string | null;
   currentReplyText: string;
   currentReplySeg: string;
+  _streamTextOn: boolean;
   audioQueue: AudioQueueItem[];
   currentAudioSource: MediaElementAudioSourceNode | null;
   ensureAudioCtx: () => void;
   playNextAudio: () => void;
   handleAudioChunk: (msg: AudioChunkMessage) => void;
+  handleStreamText: (text: string) => void;
+  handleRetractText: (length: number) => void;
+  mdToHtml?: (src: string) => string;
   handleAudioEnd: (msg: AudioChunkMessage) => void;
   handleInterrupted: (msg?: InterruptedMessage) => void;
   clearAudioQueue: () => void;
@@ -947,10 +962,20 @@ export interface AppKernel {
   showSubtitle: (text: string) => void;
   showTyping: () => void;
   removeTyping: () => void;
-  /* 回合气泡：思考 → 工具调用 → 回复 内联成一条 AI 气泡 */
+  /* 回合气泡：正文分段 + 内联工具块（推理只作底部「思考中」实时指示，不进正文） */
   _turnMsgEl: HTMLElement | null;
   beginTurnBubble: (sessionId?: string | null) => HTMLElement | null;
+  ensureTurnSeg: () => HTMLElement | null;
+  sealTurnSeg: () => void;
   appendTurnThinking: (text: string) => void;
+  handleReasoning: (text: string, sessionId?: string | null) => void;
+  clearReasoningLine: () => void;
+  /* 长时间无响应看门狗：工具/思考期间无实时事件时的卡死提示 + 一键中断 */
+  _lastTurnActivity: number;
+  _toolRunningSince: number;
+  noteTurnActivity: () => void;
+  clearStuckHint: () => void;
+  maybeWarnStuck: () => void;
   finishTurn: (interrupted?: boolean) => void;
   turnTextContainer: () => HTMLElement | null;
   setTurnStreamText: (text: string) => void;
@@ -1198,7 +1223,15 @@ export interface AppKernel {
   _mixamoActiveClipLoop: boolean;
   _mixamoActiveClipStart: number;
   _mixamoSwitchTimer: number | null;
+  /* 自然化播放参数（09c 挂载）：起始/交叠/尾部收敛 全链路一致 */
+  ANIM_PLAY_PARAMS?: { blend: number; start: number; tail: number; stopFade: number };
+  /* 尾收回落（单次动作自然收尾,末姿态缓收至静息后再交还程序微动作） */
+  _mixamoTailActive?: boolean;
+  _mixamoTailName?: string | null;
+  _mixamoTailRem?: number;
+  _mixamoTailTotal?: number;
   loadMixamoAnimation: (fbxUrl: string, clipName?: string) => Promise<any>;
+  loadBakedMixamoClip: (name: string, bakedUrl: string) => Promise<any>;
   playMixamoClip: (name: string, opts?: any) => void;
   stopMixamoClip: (fadeMs?: number) => void;
   updateMixamoMixer: (dt: number) => void;

@@ -209,6 +209,7 @@ export default (function init(App: AppKernel) {
       // 默认视为手动开启；由 onWakeOk 在切换完成后标记为「唤醒开启」
       App._enteredViaWake = false;
       if (wakeBtn) wakeBtn.classList.remove('active');
+      App.voiceBtn!.classList.remove('wake'); // 从唤醒待机切回自动对话，去掉琥珀标记
       App.startVADMode().then(ok => {
         if (!ok) {
           App.voiceMode = 'press';
@@ -244,6 +245,7 @@ export default (function init(App: AppKernel) {
         App.vadState = 'idle';
         App.vadLoop();
         App.voiceBtn!.classList.add('auto'); // 复用聆听高亮样式，提示正在监听
+        App.voiceBtn!.classList.add('wake'); // 额外标记唤醒待机，用琥珀色区分自动对话
         App.voiceBtn!.title = '唤醒词待机中（说唤醒词开始对话）';
         if (wakeBtn) wakeBtn.classList.add('active');
         const words = (App.wakeWords && App.wakeWords.length ? App.wakeWords : ['大白']).join(' / ');
@@ -253,6 +255,7 @@ export default (function init(App: AppKernel) {
       if (wakeBtn) wakeBtn.classList.remove('active');
       App.stopVADMode();
       App.voiceBtn!.classList.remove('auto');
+      App.voiceBtn!.classList.remove('wake'); // 退出唤醒待机，去掉琥珀标记
       App.voiceBtn!.title = '按住说话';
       if (modeBtn) modeBtn.classList.remove('active');
       App.showToast('已切换为按住说话');

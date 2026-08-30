@@ -44,6 +44,10 @@ export default (function init(App: AppKernel) {
       App.mixamoMixer = null;
     }
     App._mixamoActiveClip = null;
+    App._mixamoTailActive = false;
+    App._mixamoTailName = null;
+    App._mixamoTailRem = 0;
+    App._mixamoTailTotal = 0;
     App._animLibraryConfig = null;
     App._animLibraryLoaded = false;
     App._animLibraryLoading = false;
@@ -145,6 +149,16 @@ export default (function init(App: AppKernel) {
 
   // ==================== 批量加载 ====================
   /**
+   * 加载单个动作：优先烘焙缓存（/anim/baked/<name>.json，秒开零重定向），
+   * 无烘焙缓存或加载失败时回退 FBX 实时重定向。
+   */
+  async function loadClip(anim: { name: string; file: string }, fbxUrl: string) {
+    const bakedUrl = '/anim/baked/' + anim.name + '.json';
+    const baked = await App.loadBakedMixamoClip(anim.name, bakedUrl);
+    if (baked) return baked;
+    return App.loadMixamoAnimation(fbxUrl, anim.name);
+  }
+  /**
    * 加载整个动作库（VRM 加载完成后调用）
    * @param lazy  是否懒加载（false=全部预加载，true=只加载待机类）
    */
@@ -202,7 +216,8 @@ export default (function init(App: AppKernel) {
       }
       const url = baseUrl + anim.file;
       try {
-        const clip = await App.loadMixamoAnimation(url, anim.name);
+        // 优先烘焙缓存（秒开零重定向），无缓存/失败回退 FBX 实时重定向
+        let clip = await loadClip(anim, url);
         if (clip && App.mixamoClips[anim.name]) {
           // 补充元数据
           App.mixamoClips[anim.name].emotion = anim.emotion;
@@ -257,7 +272,8 @@ export default (function init(App: AppKernel) {
       const anim = anims[idx++];
       const url = baseUrl + anim.file;
       try {
-        const clip = await App.loadMixamoAnimation(url, anim.name);
+        // 优先烘焙缓存（秒开零重定向），无缓存/失败回退 FBX 实时重定向
+        let clip = await loadClip(anim, url);
         if (clip && App.mixamoClips[anim.name]) {
           App.mixamoClips[anim.name].emotion = anim.emotion;
           App.mixamoClips[anim.name].loop = anim.loop ?? false;
@@ -313,7 +329,19 @@ export default (function init(App: AppKernel) {
       return null;
     }
 
-    const name = available[Math.floor(Math.random() * available.length)];
+    // 强度分层：emotionMap 数组按 [爆发 → 手势 → 待机] 排序，
+    // 按当前唤醒度选段——高唤醒偏爆发动作，低唤醒偏安静待机，中段偏手势表达。
+    const arousal = (App.pad && App.pad.arousal) || 0.5;
+    const n = available.length;
+    let slice;
+    if (arousal > 0.6) {
+      slice = available.slice(0, Math.max(1, Math.ceil(n * 0.4)));
+    } else if (arousal > 0.3) {
+      slice = available.slice(Math.floor(n * 0.3), Math.max(1, Math.ceil(n * 0.7)));
+    } else {
+      slice = available.slice(Math.floor(n * 0.6));
+    }
+    const name = slice[Math.floor(Math.random() * slice.length)];
     App.playLibraryClip(name, opts);
     return name;
   };
@@ -427,19 +455,19 @@ export default (function init(App: AppKernel) {
 
   // 情绪 → 应景场景分类候选（越靠前越应景；不指定场景时按当前情绪在此随机选一个）
   App.LIBRARY_EMOTION_SCENES = {
-    happy:      ['emotion', 'dance', 'gesture', 'idle'],
-    excited:    ['dance', 'emotion', 'gesture'],
+    happy:      ['idle', 'gesture', 'emotion', 'dance'],
+    excited:    ['gesture', 'emotion', 'dance'],
     sad:        ['idle', 'pose', 'emotion'],
-    angry:      ['gesture', 'idle'],
-    surprised:  ['emotion', 'gesture'],
+    angry:      ['idle', 'gesture'],
+    surprised:  ['gesture', 'emotion'],
     shy:        ['idle', 'pose', 'gesture', 'emotion'],
-    thoughtful: ['gesture', 'idle'],
-    tired:      ['pose', 'emotion', 'idle'],
+    thoughtful: ['idle', 'gesture'],
+    tired:      ['pose', 'idle', 'emotion'],
     calm:       ['pose', 'idle'],
     proud:      ['pose', 'gesture'],
-    playful:    ['dance', 'gesture', 'emotion'],
-    love:       ['emotion', 'gesture'],
-    neutral:    ['idle', 'gesture', 'emotion', 'pose', 'dance']
+    playful:    ['gesture', 'dance', 'emotion'],
+    love:       ['gesture', 'emotion'],
+    neutral:    ['idle', 'pose', 'gesture', 'emotion', 'dance']
   };
 
   // 各场景循环动作的播放时长上限（秒区间）：循环动作播够时间就释放回程序式动作，
@@ -502,7 +530,11 @@ export default (function init(App: AppKernel) {
    */
   // 场景“动态感”权重：视觉幅度小的分类适当压低，动作感强的分类提高——
   // 避免轮换来轮换去都是小幅待机/姿势（看起来“一直没动”）
-  const SCENE_VIVIDNESS = { idle: 0.55, pose: 0.6, gesture: 1.3, emotion: 1.25, dance: 1.1 };
+  // 2026-08-28 修正：gesture 分类（wave/salute/praying/point/thumbs_up/
+  // come_here/stop_gesture/phone_call 等）几乎全是举手动作，权重过高导致
+  // 角色频繁举手（“总是举起手”）。大幅压低 gesture，提高 idle/pose，
+  // 让角色以自然待机为主、偶尔才做手势。
+  const SCENE_VIVIDNESS = { idle: 1.2, pose: 1.1, gesture: 0.45, emotion: 0.8, dance: 0.7 };
   let _lastSceneUsed = ''; // 上次实际播放的场景：避免连续两次同场景（尤其是小幅动作）
 
   App.tryStartLibraryAction = function tryStartLibraryAction(scene, opts) {

@@ -60,6 +60,48 @@ def _load_code_module(mod_path: Path, name: str):
         raise SkillError(f"技能 {name} 代码执行失败: {e}\n{traceback.format_exc()}") from e
 
 
+# 热重载时不能从 sys.modules 清除的共享模块：server 与技能共用同一模块实例
+# （如 video_lib 的 STREAMS/队列状态互通），清除会让两者状态分裂。
+# 其余技能目录内的子模块（*_impl 等）必须清除——否则改 impl 文件后热重载
+# 仍读到 sys.modules 里缓存的旧代码，"修改工具清单不生效"。
+_SHARED_SKILL_MODULES = frozenset({"video_lib"})
+
+
+def _evict_skill_submodules(entry: dict, skill_dir: Path) -> None:
+    """卸载技能前清除它自己导入的子模块缓存（仅限技能目录内、非共享模块）。"""
+    try:
+        root = Path(skill_dir).resolve()
+        for mod_name in list(entry.get("_mods_added") or []):
+            if mod_name in _SHARED_SKILL_MODULES:
+                continue
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue
+            try:
+                f = getattr(mod, "__file__", None)
+            except Exception:
+                f = None
+            if not f:
+                continue
+            try:
+                p = Path(f).resolve()
+            except Exception:
+                continue
+            if root == p or root in p.parents:
+                sys.modules.pop(mod_name, None)
+        # 字节码缓存可能残留旧 pyc（同秒/同长度编辑时 pyc 校验会误判为未变），
+        # 连同技能目录的 __pycache__ 一起清掉，保证热重载一定读到新代码
+        pycache = root / "__pycache__"
+        if pycache.is_dir():
+            for pyc in list(pycache.glob("*.pyc")):
+                try:
+                    pyc.unlink()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("清除技能子模块缓存失败: %s", e)
+
+
 class Skill:
     """技能描述对象（向技能代码注入的上下文，作者也可以直接继承它）。"""
 
@@ -172,9 +214,11 @@ class SkillRegistry:
 
         mod_path = skill_dir / "skill.py"
         if mod_path.exists():
+            _mods_before = set(sys.modules)
             try:
                 module = _load_code_module(mod_path, name)
                 entry["module"] = module
+                entry["_mods_added"] = sorted(set(sys.modules) - _mods_before)
                 # 代码里的 PROMPT 优先于清单 prompt
                 code_prompt = getattr(module, "PROMPT", "") or ""
                 if code_prompt:
@@ -267,6 +311,11 @@ class SkillRegistry:
                     on_unload(Skill(name=name))
             except Exception as e:
                 logger.warning("技能 %s on_unload 钩子失败: %s", name, e)
+            # 热重载生效的关键：清掉该技能自己导入的子模块缓存
+            try:
+                _evict_skill_submodules(entry, Path(entry["info"].get("path") or ""))
+            except Exception:
+                pass
 
     # ---------- 查询 ----------
 
@@ -291,6 +340,36 @@ class SkillRegistry:
                 continue
             out.extend(list(entry.get("tools", {}).values()))
         return out
+
+    def tool_specs_progressive(self) -> list:
+        """渐进披露模式下的工具定义：只返回 full 技能的 OpenAI 工具。
+
+        on_demand 技能的工具不注入（其用法经 skill_help 按需拉取），
+        从而大幅削减每轮固定注入的工具 schema 体积。"""
+        self.ensure_loaded()
+        out = []
+        for name, entry in self._loaded.items():
+            if entry.get("broken"):
+                continue
+            if not self.is_enabled(name):
+                continue
+            if entry.get("disclosure") == "on_demand":
+                continue
+            out.extend(list(entry.get("tools", {}).values()))
+        return out
+
+    def tool_specs_for(self, name: str) -> list:
+        """返回单个技能的全部 OpenAI 工具定义（无论披露级别）。
+
+        供 skill_help 按需注册：模型读完某技能说明书后，把它的工具动态加入
+        可调用列表。技能不存在 / 加载失败 / 被禁用时返回空列表。"""
+        self.ensure_loaded()
+        entry = self._loaded.get(name)
+        if entry is None or entry.get("broken"):
+            return []
+        if not self.is_enabled(name):
+            return []
+        return list(entry.get("tools", {}).values())
 
     def prompt_extras(self) -> str:
         """返回全部启用技能注入 system prompt 的片段（拼接）。"""
@@ -317,7 +396,10 @@ class SkillRegistry:
         if len(desc) > 88:
             desc = desc[:85] + "…"
         tools = sorted(entry.get("tools", {}).keys())
-        tool_txt = "、".join(tools) if tools else "（无工具）"
+        if len(tools) > 4:
+            tool_txt = "、".join(tools[:4]) + f" 等{len(tools)}个"
+        else:
+            tool_txt = "、".join(tools) if tools else "（无工具）"
         return (f"【技能 {title}】{desc} 工具：{tool_txt}。"
                 f"需要完整用法时调用 skill_help(\"{name}\") 查看说明书。")
 
@@ -392,9 +474,15 @@ class SkillRegistry:
         dispatch = entry.get("dispatch")
         if callable(dispatch):
             try:
-                result = dispatch(tool_name, arguments)
-                if asyncio.iscoroutine(result):
-                    result = await result
+                # 同步处理器一律进线程池执行，绝不阻塞事件循环——
+                # 否则工具里的 subprocess/网络/大文件读写会冻结整个服务
+                # （心跳/推理指示/超时全部失效，表现为"莫名其妙卡死无显示"）。
+                # 用工具专用线程池，避免长工具占满默认池拖死记忆库写入。
+                if asyncio.iscoroutinefunction(dispatch):
+                    result = await dispatch(tool_name, arguments)
+                else:
+                    from .tool_thread import run_in_tool_thread
+                    result = await run_in_tool_thread(dispatch, tool_name, arguments)
                 return str(result), "skill"
             except Exception as e:
                 return f"技能 {skill_name} 执行工具 {tool_name} 失败: {e}", "skill"
@@ -403,9 +491,11 @@ class SkillRegistry:
         if handler is None:
             return None, ""
         try:
-            result = handler(arguments)
-            if asyncio.iscoroutine(result):
-                result = await result
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(arguments)
+            else:
+                from .tool_thread import run_in_tool_thread
+                result = await run_in_tool_thread(handler, arguments)
             return str(result), "skill"
         except Exception as e:
             return f"技能 {skill_name} 执行工具 {tool_name} 失败: {e}", "skill"

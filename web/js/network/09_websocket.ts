@@ -17,6 +17,11 @@ export default (function init(App: AppKernel) {
   /* ============================================================
    *  WebSocket
    * ============================================================ */
+  // 首次连接是否已渲染历史（热重载重连时不重复清空/重建消息区）
+  let historyLoaded = false;
+  // 是否已建立过连接：热重载/重启后的自动重连不再弹『已连接到 AI』，
+  // 避免打断进行中的回合气泡与执行链路观感
+  let wsEverConnected = false;
   /* ============================================================
    *  场景状态持久化（相机/模型位置/缩放）
    * ============================================================ */
@@ -213,7 +218,11 @@ export default (function init(App: AppKernel) {
       App.wsConnTimeout = null;
       App.statusBadge.textContent = '已连接';
       App.setState(App.State.IDLE);
-      App.addSystemMsg('已连接到 AI');
+      // 只在首次连接提示；热重载/重启后的自动重连不刷屏
+      if (!wsEverConnected) {
+        wsEverConnected = true;
+        App.addSystemMsg('已连接到 AI');
+      }
       // 发送用户标识以恢复历史
       const uid = localStorage.getItem('dabai.userId') || 'u_' + Date.now().toString(36);
       localStorage.setItem('dabai.userId', uid);
@@ -317,20 +326,27 @@ export default (function init(App: AppKernel) {
         break;
       case 'user_set':
         console.log('[WS] 用户已设置:', msg.user_id);
-        // 恢复聊天历史：先复位回合气泡与工具链（旧格式消息仍走 addUserMsg/addAIMsg 渲染）
-        App._turnMsgEl = null;
-        if (App.toolChainReset) App.toolChainReset();
         App.removeTyping();
-        if (msg.history && msg.history.length > 0) {
-          App.messagesEl.innerHTML = '';
-          App.addSystemMsg('已连接');
-          for (const h of msg.history) {
-            if (h.user) App.addUserMsg(h.user);
-            if (h.ai) App.addAIMsg(h.ai);
+        if (!historyLoaded) {
+          // 首次连接（页面加载/刷新）：复位回合气泡与工具链，渲染完整历史
+          historyLoaded = true;
+          App._turnMsgEl = null;
+          if (App.toolChainReset) App.toolChainReset();
+          if (msg.history && msg.history.length > 0) {
+            App.messagesEl.innerHTML = '';
+            App.addSystemMsg('已连接');
+            for (const h of msg.history) {
+              if (h.user) App.addUserMsg(h.user);
+              if (h.ai) App.addAIMsg(h.ai);
+            }
+            // 历史恢复：强制定位到最新一条（绕过"上滑暂停跟随"）
+            requestAnimationFrame(() => App.scrollToBottom(true));
+          } else {
+            App.addSystemMsg('已连接');
           }
-          // 历史恢复：强制定位到最新一条（绕过"上滑暂停跟随"）
-          requestAnimationFrame(() => App.scrollToBottom(true));
         }
+        // 热重载/重启重连：保留当前消息区与进行中的回合气泡、工具块，
+        // 断点续跑事件（resume）继续在现有回合上展示，不清空不重刷
         break;
       case 'thinking':
         // 独立系统游戏（赛博公司）：吞掉后端 AI 回复启动信号。
@@ -338,20 +354,53 @@ export default (function init(App: AppKernel) {
         // 并显示大厅 AI 回复气泡（乱入）。游戏内回复由蜂群 addAIMsg 独立渲染，
         // 不经过后端回复链路。
         if (App.gameModeManager && App.gameModeManager.currentGame && App.gameModeManager.currentGame.isIsolated) break;
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        App._toolRunningSince = 0;
         // 新一轮回复开始：清空旧队列与文本
         App.currentReplySession = msg.session_id || null;
         App._interruptedSession = null; // 新 session 开启，解除旧会话栅栏
         App.currentReplyText = '';
         App.currentReplySeg = '';
         App.audioQueue = [];
+        App._streamTextOn = false; // 本轮是否走"即时文本流"（stream_text）
         App.removeTyping();
         // 若分片已先于 thinking 到达并开始播放，不再切回思考态（避免"只显示省略号"）
         if (App.currentState !== App.State.SPEAKING) App.setState(App.State.THINKING);
-        // 思考 → 工具 → 回复 内联成一条回合气泡：thinking 一到就建气泡（默认折叠可展开）
-        if (App.beginTurnBubble) App.beginTurnBubble(msg.session_id);
-        if (App.appendTurnThinking && msg.text) App.appendTurnThinking(msg.text);
-        // 工具链模块换新（上一轮自动收尾）
-        if (App.toolChainBeginTurn) App.toolChainBeginTurn();
+        if (msg.resume && App._turnMsgEl && document.body.contains(App._turnMsgEl)) {
+          // 断点续跑（热重载/重启后）：复用当前回合气泡继续展示，
+          // 先静态收尾旧工具状态，再让后续 stream_text / tool_call 续上
+          if (App.toolChainEndTurn) App.toolChainEndTurn();
+        } else {
+          // 普通新轮：思考 → 工具 → 回复 内联成一条回合气泡
+          if (App.beginTurnBubble) App.beginTurnBubble(msg.session_id);
+          if (App.appendTurnThinking && msg.text) App.appendTurnThinking(msg.text);
+          // 工具链模块换新（上一轮自动收尾）
+          if (App.toolChainBeginTurn) App.toolChainBeginTurn();
+        }
+        break;
+      case 'thinking_text':
+        // 思维链增量：追加进当前回合「思考段」（自动展开，可随时收起）
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        if (App.appendTurnThinking) App.appendTurnThinking(msg.text || '');
+        break;
+      case 'reasoning':
+        // 真实思维链增量（服务端节流后）：回复气泡底部「思考中」实时指示，
+        // 一行持续更新，用户可判断对话仍在推进而非卡住/失败。
+        // 独立系统游戏（赛博公司）同样吞掉，避免思考指示乱入游戏内界面。
+        if (App.gameModeManager && App.gameModeManager.currentGame && App.gameModeManager.currentGame.isIsolated) break;
+        // 过期 session 的思考指示不处理（防止旧轮次延迟事件覆盖当前气泡）
+        if (App.currentReplySession && msg.session_id && msg.session_id !== App.currentReplySession) break;
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        if (App.handleReasoning) App.handleReasoning(msg.text || '', msg.session_id);
+        break;
+      case 'stream_text':
+        // 回复正文即时流出：不等语音，文字先到先显示
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        if (App.handleStreamText) App.handleStreamText(msg.text || '');
+        break;
+      case 'retract_text':
+        // 工具轮过程话：从主消息撤回（服务端已同时转入思考段）
+        if (App.handleRetractText && msg.length) App.handleRetractText(msg.length);
         break;
       case 'listening':
         App.setState(App.State.LISTENING);
@@ -380,11 +429,13 @@ export default (function init(App: AppKernel) {
           if (App.clearAudioQueue) App.clearAudioQueue();
           break;
         }
+        if (App.noteTurnActivity) App.noteTurnActivity();
         App.handleAudioChunk(msg);
         break;
       case 'audio_end':
         // 独立系统游戏（赛博公司）：同样吞掉结束信号，阻止队列继续播放
         if (App.gameModeManager && App.gameModeManager.currentGame && App.gameModeManager.currentGame.isIsolated) break;
+        if (App.noteTurnActivity) App.noteTurnActivity();
         App.handleAudioEnd(msg);
         break;
       case 'usage':
@@ -392,20 +443,32 @@ export default (function init(App: AppKernel) {
         if (App.handleUsageMessage) App.handleUsageMessage(msg);
         break;
       case 'interrupted':
+        // 过期 session 的中断信号不处理：避免误清新一轮的队列/工具链
+        if (App.currentReplySession && msg.session_id &&
+            msg.session_id !== App.currentReplySession) break;
         App.handleInterrupted(msg);
         if (App.toolChainAbort) App.toolChainAbort();
         break;
+      case 'system_msg':
+        // 系统提示（如任务暂停后提示「说『继续』可以接着干」）
+        if (App.addSystemMsg && msg.text) App.addSystemMsg(msg.text);
+        break;
       case 'tool_call_start':
         // 工具调用开始：并入当前轮次的「工作流工具链」卡片
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        App._toolRunningSince = Date.now();
         App.removeTyping();
         if (App.toolChainStart) App.toolChainStart(msg.tool_name, msg.arguments);
         break;
       case 'tool_call_result':
         // 工具调用结果：回填到工具链对应步骤
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        App._toolRunningSince = 0;
         if (App.toolChainResult) App.toolChainResult(msg.tool_name, msg.result, msg.success);
         break;
       case 'tool_call_progress':
         // 工具执行心跳：更新当前运行步骤的已运行时长（长任务反馈）
+        if (App.noteTurnActivity) App.noteTurnActivity();
         if (App.toolChainProgress) App.toolChainProgress(msg.tool_name, msg.elapsed, msg.message);
         break;
       case 'session_list':

@@ -1,4 +1,6 @@
 import type { AppKernel } from '../types/app-kernel.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 export default (function init(App: AppKernel) {
   const {
     THREE: THREE,
@@ -1128,6 +1130,9 @@ export default (function init(App: AppKernel) {
     const LEG_SWING_AMP = 0.80;
     const FOOT_LIFT_AMP = 0.40;
     const BOB_AMP = 0.10;
+    // 腿/脚用较快的插值（原 0.08 对高频正弦目标衰减过大 → 摆腿只剩几度，腿僵硬不动）
+    const LEG_LERP = 0.45;
+    const FOOT_LERP = 0.45;
 
     // ramp
     if (isMoving) {
@@ -1210,17 +1215,17 @@ export default (function init(App: AppKernel) {
 
       // legs
       if (B.leftUpperLeg)
-        B.leftUpperLeg.rotation.x = App.lerp(B.leftUpperLeg.rotation.x || 0, walkActive ? Math.sin(phase) * LEG_SWING_AMP * sf : 0, 0.08);
+        B.leftUpperLeg.rotation.x = App.lerp(B.leftUpperLeg.rotation.x || 0, walkActive ? Math.sin(phase) * LEG_SWING_AMP * sf : 0, LEG_LERP);
       if (B.leftLowerLeg)
-        B.leftLowerLeg.rotation.x = App.lerp(B.leftLowerLeg.rotation.x || 0, 0, 0.08);
+        B.leftLowerLeg.rotation.x = App.lerp(B.leftLowerLeg.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase - 0.4)) * 0.22 * sf : 0, LEG_LERP);
       if (B.leftFoot)
-        B.leftFoot.rotation.x = App.lerp(B.leftFoot.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase)) * FOOT_LIFT_AMP * sf : 0, 0.08);
+        B.leftFoot.rotation.x = App.lerp(B.leftFoot.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase)) * FOOT_LIFT_AMP * sf : 0, FOOT_LERP);
       if (B.rightUpperLeg)
-        B.rightUpperLeg.rotation.x = App.lerp(B.rightUpperLeg.rotation.x || 0, walkActive ? Math.sin(phase + Math.PI) * LEG_SWING_AMP * sf : 0, 0.08);
+        B.rightUpperLeg.rotation.x = App.lerp(B.rightUpperLeg.rotation.x || 0, walkActive ? Math.sin(phase + Math.PI) * LEG_SWING_AMP * sf : 0, LEG_LERP);
       if (B.rightLowerLeg)
-        B.rightLowerLeg.rotation.x = App.lerp(B.rightLowerLeg.rotation.x || 0, 0, 0.08);
+        B.rightLowerLeg.rotation.x = App.lerp(B.rightLowerLeg.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase + Math.PI - 0.4)) * 0.22 * sf : 0, LEG_LERP);
       if (B.rightFoot)
-        B.rightFoot.rotation.x = App.lerp(B.rightFoot.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase + Math.PI)) * FOOT_LIFT_AMP * sf : 0, 0.08);
+        B.rightFoot.rotation.x = App.lerp(B.rightFoot.rotation.x || 0, walkActive ? Math.max(0, Math.sin(phase + Math.PI)) * FOOT_LIFT_AMP * sf : 0, FOOT_LERP);
 
       if (B.hips)
         B.hips.rotation.y = App.lerp(B.hips.rotation.y || 0, walkActive ? Math.sin(phase) * 0.03 * sf : 0, 0.06);
@@ -1757,8 +1762,9 @@ export default (function init(App: AppKernel) {
           App.nextActionTimer = App.ACTION_GAP_MIN + Math.random() * (App.ACTION_GAP_MAX - App.ACTION_GAP_MIN);
           App.stopMixamoClip(); // 释放当前循环动作 → 程序式微动作恢复
         }
-      } else if (playedMs >= 5000) {
+      } else if (playedMs >= 5000 && !App._mixamoTailActive) {
         // 单次动作 5s 硬上限（兜底：finished 丢失/超长 clip 都能释放）
+        // 注意放行尾收窗口：进入 soft-landing 后不再掐断，让末姿自然回落静息再交权
         App.nextActionTimer = 0.3;
         App.stopMixamoClip();
       }
@@ -1845,6 +1851,12 @@ export default (function init(App: AppKernel) {
   App.fpvLookLastY = 0;
   App.vrmBones = {};
   App.gltfLoader = new GLTFLoader();
+  // 注册 Draco 解码器：支持 KHR_draco_mesh_compression 压缩模型（如蔚蓝妖姬_draco3.vrm）
+  const dracoLoader = new DRACOLoader();
+  // 必须是绝对静态路径：/static 挂载 web/ 根 → /static/vendor/three/... 命中解码器
+  // 不要写成相对的，页面在根 URL '/' 时 resolve 成顶级 /vendor → 404，压缩模型直接加载失败
+  dracoLoader.setDecoderPath('/static/vendor/three/examples/jsm/libs/draco/gltf/');
+  App.gltfLoader.setDRACOLoader(dracoLoader);
   App.gltfLoader.register(parser => new VRMLoaderPlugin(parser));
   App.initThree = function initThree() {
     App.scene = new THREE.Scene();
@@ -1863,8 +1875,17 @@ export default (function init(App: AppKernel) {
     App.renderer.setSize(w, h, false);
     App.renderer.setPixelRatio(App._targetDPR);
     App.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    App.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    App.renderer.toneMappingExposure = 1.0;
     // WebXR 支持：启用渲染器的 XR 能力（无 WebXR 设备时无副作用）
     App.renderer.xr.enabled = true;
+
+    // 注册 KTX2 纹理解码器：支持 KHR_texture_basisu 压缩纹理（烘焙模型常用），
+    // 必须在 renderer 创建后 detectSupport（依赖 WebGL 压缩纹理能力探测）
+    const ktx2Loader = new KTX2Loader();
+    ktx2Loader.setTranscoderPath('/static/vendor/three/examples/jsm/libs/basis/');
+    ktx2Loader.detectSupport(App.renderer);
+    App.gltfLoader.setKTX2Loader(ktx2Loader);
 
     // 灯光 (增强三盏主光 + 顶部聚光)
     App.scene.add(new THREE.AmbientLight(0x4060a0, 0.5));

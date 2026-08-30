@@ -1,5 +1,7 @@
 """3D 虚拟 AI 角色陪聊 —— FastAPI 服务器
 
+# mixamo no-skin session 2026-08-26（本会话热重载已临时关闭，改代码不重启）
+
 特性：
 - WebSocket 实时双向通信（文本 + 语音）
 - 语音转文字 (SiliconFlow SenseVoiceSmall，API 失败自动降级 faster-whisper 本地模型)
@@ -7,11 +9,13 @@
 - 3D 模型导入与管理 (glb/gltf/vrm)
 - 静态前端托管 (web/)
 - 绑定 0.0.0.0 实现局域网手机访问
-- MCP 工具调用 + Function Calling
+- 技能工具调用（全部 skill 化）+ Function Calling
 - 长期记忆（SQLite 持久化）
 """
 import asyncio
 import base64
+import difflib
+import importlib
 import json
 import logging
 import os
@@ -23,24 +27,47 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
+
+# 拼音转换（近音字唤醒容错用）；缺失时自动降级为字符模糊匹配
+try:
+    from pypinyin import lazy_pinyin as _lazy_pinyin
+except Exception:
+    _lazy_pinyin = None
 
 import edge_tts
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Request
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.websockets import WebSocketState
-from fastapi.responses import FileResponse, JSONResponse
+
+import music_lib
+import video_fav_lib
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from agent import AIAgent, TextDelta, ToolCallStart, ToolCallResult, get_available_tools
+from agent import (AIAgent, TextDelta, ToolCallProgress, ToolCallResult,
+                   ToolCallStart, ThinkingDelta, StreamDelta, ReasoningDelta,
+                   FinalText, UsageEvent, get_available_tools)
 from game_engine import GameEngine
-from perception_dispatcher import PerceptionDispatcher
+from perception_dispatcher import PerceptionDispatcher, EventCategory
 from reward_memory import RewardMemory
 from rl_coordinator import get_coordinator, UnifiedMode, UnifiedState
+import codex_runner
+from harness_bridge import get_bridge, HarnessBridgeError
+from hot_reload import start_hot_reload
+from media_workers import get_media_workers as _get_media_workers
+from sub_agents import get_sub_agents as _get_sub_agents
 
 # 全局主动说话冷却（秒）：所有非用户消息驱动的主动说话（RL 调度 /
 # 感知派发 / 环境快照 / 前端召唤）共用此闸门，防止"自言自语"式高频说话
 ACTIVE_SPEAK_COOLDOWN = 40.0
+
+# 用户活跃窗口（秒）：用户 1 分钟内有主动对话/回复 → 禁止 AI 主动说话。
+# 只有用户超过 1 分钟未主动对话/回复，或有外部触发（游戏事件/游戏结束/
+# 用户召唤等）时，AI 才会开始主动对话 —— "不一直废话"原则。
+ACTIVE_USER_GUARD = 60.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("server")
@@ -50,14 +77,213 @@ WEB_DIR = BASE_DIR / "web"
 AUDIO_DIR = BASE_DIR / "audio_cache"
 MODELS_DIR = BASE_DIR / "models"
 BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
-BGM_DIR = BASE_DIR / "bgm"
+SERVER_PORT = 8000
 AUDIO_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 BACKGROUNDS_DIR.mkdir(exist_ok=True)
-BGM_DIR.mkdir(exist_ok=True)
 
 
-app = FastAPI(title="3D AI 陪聊")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- startup ----
+    orch = get_orchestrator()
+    await orch.start_runner()
+    # 基础能力：定期增量复盘执行日志（卡点聚类 → 策略沉淀），失败静默
+    asyncio.ensure_future(_daily_review_loop())
+    # 重启/热重载后：把仍在运行的 codex/opencode 独立进程接回任务中心（热重载杀不掉它们，进度不丢）
+    try:
+        _recovered_n = await _recover_codex_tasks()
+        if _recovered_n:
+            logger.info(f"[TaskCenter] 已恢复 {_recovered_n} 个 codex/opencode 独立进程任务（热重载后继续执行）")
+    except Exception as e:
+        logger.warning(f"[TaskCenter] codex 独立进程恢复失败: {e}")
+    logger.info("[TaskCenter] 任务中心已启动（DSH/Codex/后台任务统一调度）")
+    # 热重载/重启后：自主恢复被中断的角色对话轮（断点续跑，不依赖客户端在场）
+    try:
+        asyncio.ensure_future(_resume_pending_turns())
+        logger.info("[Resume] 对话轮断点恢复已启动（扫描未完成轮次）")
+    except Exception as e:
+        logger.warning(f"[Resume] 对话轮断点恢复任务启动失败: {e}")
+    # 把 FastAPI app 注入 harness，让插件（如 todo_list 的 /api/todo/*）挂载 REST 路由
+    try:
+        _harness().on_server_start(app)
+        logger.info("[Harness] 插件已接入 FastAPI（REST 路由挂载完成）")
+    except Exception as e:
+        logger.warning(f"[Harness] 插件接入 FastAPI 失败: {e}")
+    # harness 任务系统完成事件 → WebSocket 实时推送（前端 toast，任务完成即知）
+    try:
+        async def _harness_task_notifier(report: dict):
+            if not manager.active:
+                return
+            payload = {"type": "harness_task", "task": report}
+            for ws in list(manager.active):
+                await safe_send_json(ws, payload)
+        _harness().tasks.set_notifier(_harness_task_notifier)
+    except Exception as e:
+        logger.warning(f"[Harness] 任务完成推送注册失败: {e}")
+    # 媒体子智能体（media watch）：主智能体派出的「播放 + 盯到结束 + 汇报」子进程
+    try:
+        mw = _get_media_workers()
+        mw.set_report_handler(_deliver_media_worker_report)
+        mw.set_event_handler(_media_worker_event_push)
+        logger.info("[MediaWorker] 媒体子智能体系统已启动（watch 播放播完自动向主智能体汇报）")
+    except Exception as e:
+        logger.warning(f"[MediaWorker] 媒体子智能体初始化失败: {e}")
+    # 通用子智能体（sub-agents）：任意复杂任务后台并行执行，完成汇报主智能体
+    try:
+        sa = _get_sub_agents()
+        sa.set_report_handler(_deliver_sub_agent_report)
+        sa.set_event_handler(_sub_agent_event_push)
+        logger.info("[SubAgent] 通用子智能体系统已启动（任意任务可下发、并行分派、完成汇报）")
+    except Exception as e:
+        logger.warning(f"[SubAgent] 通用子智能体初始化失败: {e}")
+    # 定时任务调度器（长任务自动化）：到期任务派发为通用子智能体后台执行，
+    # 完成/出错自动记录到 data/scheduled_tasks.json 并沿子智能体汇报链路转述
+    try:
+        from scheduler import start_scheduler, record_result
+
+        async def _fire_scheduled_job(job: dict) -> None:
+            ws = _last_chat_conn.get("ws") if _last_chat_conn else None
+            state = _last_chat_conn.get("state") if _last_chat_conn else None
+            if ws is not None and ws not in manager.active:
+                ws, state = None, None
+            worker = await _get_sub_agents().spawn(
+                ws, state,
+                str(job.get("task") or job.get("name") or ""),
+                title=("定时·" + str(job.get("name") or "任务"))[:60],
+                extra={"job_id": job.get("id")},
+            )
+            logger.info("[Scheduler] 已派发定时任务《%s》[%s] → [%s]",
+                        job.get("name"), job.get("id"), worker.id)
+
+        asyncio.ensure_future(start_scheduler(_fire_scheduled_job))
+        logger.info("[Scheduler] 定时任务调度器已启动")
+    except Exception as e:
+        logger.warning(f"[Scheduler] 定时任务调度器启动失败: {e}")
+
+    yield
+
+    # ---- shutdown：通知插件清理已挂载的 REST 路由/资源 ----
+    try:
+        _harness().on_server_stop()
+    except Exception as e:
+        logger.warning(f"[Harness] 插件停止钩子执行失败: {e}")
+
+
+app = FastAPI(title="3D AI 陪聊", lifespan=lifespan)
+
+# 前端 js/css 模块不带版本号，浏览器启发式缓存会导致"改了代码但永远加载旧版"。
+# 对 /static 强制 no-store：每次刷新都拿到最新文件（模型/音频等大文件不在此列）
+class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/static"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+app.add_middleware(NoCacheStaticMiddleware)
+
+# 前端是原生可擦除语法 TS（现代浏览器 2025+ 原生支持），但浏览器对 module 脚本
+# 强制执行 MIME 类型校验：.ts 若按 text/plain 返回会被拒绝执行，页面就会永远
+# 卡在"连接中… / 加载模型中…"。这里把 .ts 注册为 text/javascript，
+# 模块脚本才可通过校验并触发 TS 类型擦除。
+import mimetypes as _mimetypes
+_mimetypes.add_type("text/javascript", ".ts")
+
+# ---- 前端 TS 源码实时转译 ----
+# 前端是 TypeScript 源码直服：入口 /static/app.ts 以 module 方式引用大量 .ts
+# 文件，并且代码普遍用 tsc 风格的 '.js' 后缀 import 指向同名 .ts 文件（如
+# '../types/app-kernel.js' 实际只有 .ts）。浏览器对 module 脚本强制 JS MIME，
+# 且原生 TS 类型擦除并非所有浏览器默认开启（直服 .ts 会报 "Unexpected token
+# '{'"）。因此这里启动一个常驻 Node worker（Node>=22.6 自带的
+# module.stripTypeScriptTypes 类型剥离，本项目前端已确认为纯可擦除语法），把
+# /static 下的 .ts（或缺失 .js 但存在同名 .ts 的请求）实时转译为 ESM JS 下发；
+# 磁盘上真实存在的 .js / 其他资源原样放行。按 (路径, mtime, size) 缓存。
+# Node 不存在 / 剥离失败时退回原样直服（配合上方 .ts→text/javascript 注册）。
+import subprocess as _ts_subprocess
+import threading as _ts_threading
+import json as _ts_json
+
+_TS_WORKER_JS = (
+    "const readline=require('node:readline');"
+    "const {stripTypeScriptTypes}=require('node:module');"
+    "const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity});"
+    "rl.on('line',(line)=>{let req;try{req=JSON.parse(line)}catch(e){"
+    "process.stdout.write(JSON.stringify({ok:false,error:'bad json'})+String.fromCharCode(10));return}"
+    "try{process.stdout.write(JSON.stringify({ok:true,code:stripTypeScriptTypes(req.code)})+String.fromCharCode(10))}"
+    "catch(e){process.stdout.write(JSON.stringify({ok:false,error:String(e&&e.message||e)})+String.fromCharCode(10))}});"
+)
+_ts_node_worker = None
+_ts_node_lock = _ts_threading.Lock()
+
+def _ts_start_worker():
+    global _ts_node_worker
+    try:
+        _ts_node_worker = _ts_subprocess.Popen(
+            # CommonJS 模式（-e 默认 CJS），worker 脚本里用 require()
+            ["node", "-e", _TS_WORKER_JS],
+            stdin=_ts_subprocess.PIPE, stdout=_ts_subprocess.PIPE,
+            stderr=_ts_subprocess.DEVNULL,
+            text=True, encoding="utf-8", bufsize=1,
+        )
+    except Exception:
+        _ts_node_worker = None
+
+def _ts_transpile(code: str) -> str:
+    """同步向常驻 Node worker 发送源码，返回剥离类型后的 JS；失败抛异常。"""
+    w = _ts_node_worker
+    if w is None:
+        raise RuntimeError("ts worker unavailable")
+    with _ts_node_lock:
+        w.stdin.write(_ts_json.dumps({"code": code}) + "\n")
+        w.stdin.flush()
+        line = w.stdout.readline()
+        if not line:
+            raise RuntimeError("ts worker closed")
+        out = _ts_json.loads(line)
+        if not out.get("ok"):
+            raise RuntimeError("strip failed: " + str(out.get("error")))
+        return out["code"]
+
+_ts_start_worker()
+_ts_cache: dict = {}
+
+class TSTranspileMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if _ts_node_worker is None or not path.startswith("/static/"):
+            return await call_next(request)
+        rel = path[len("/static/"):]
+        if not (rel.endswith(".ts") or rel.endswith(".js")):
+            return await call_next(request)
+        fs_path = WEB_DIR / rel
+        if rel.endswith(".js"):
+            # 磁盘上有真实 .js 就交给静态服务；否则按 tsc 约定找同名 .ts
+            if fs_path.is_file():
+                return await call_next(request)
+            fs_path = fs_path.with_suffix(".ts")
+            if not fs_path.is_file():
+                return await call_next(request)
+        else:
+            if not fs_path.is_file():
+                return await call_next(request)
+        try:
+            st = fs_path.stat()
+            cache_key = (str(fs_path), st.st_mtime_ns, st.st_size)
+            js = _ts_cache.get(cache_key)
+            if js is None:
+                code = fs_path.read_text(encoding="utf-8")
+                js = _ts_transpile(code).encode("utf-8")
+                _ts_cache[cache_key] = js
+            resp = Response(content=js, media_type="text/javascript; charset=utf-8")
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
+        except Exception:
+            return await call_next(request)  # 转译失败退回原样
+
+app.add_middleware(TSTranspileMiddleware)
 
 # 托管生成的音频文件
 app.mount("/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
@@ -65,10 +291,16 @@ app.mount("/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
 app.mount("/models", StaticFiles(directory=str(MODELS_DIR)), name="models")
 # 托管上传的 3D 背景模型
 app.mount("/backgrounds", StaticFiles(directory=str(BACKGROUNDS_DIR)), name="backgrounds")
-# 托管背景音乐文件
-app.mount("/bgm", StaticFiles(directory=str(BGM_DIR)), name="bgm")
 # 托管前端静态资源 (css/js)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+# 托管动作库文件 (anim/)
+app.mount("/anim", StaticFiles(directory=str(WEB_DIR / "anim")), name="anim")
+# 托管 AI 画图技能生成的图片（/generated/<文件名>）
+GENERATED_DIR = BASE_DIR / "web" / "generated"
+GENERATED_DIR.mkdir(exist_ok=True)
+app.mount("/generated", StaticFiles(directory=str(GENERATED_DIR)), name="generated")
+
+
 
 # 允许的 3D 模型扩展名
 ALLOWED_MODEL_EXTS = {".glb", ".gltf", ".vrm"}
@@ -147,17 +379,69 @@ DEFAULT_VOICE = "zh-CN-YunxiNeural"  # 男声云稀，亲切自然
 # 句子结束符（用于流式分句 TTS）
 SENTENCE_END = re.compile(r"[。！？!?\n…；;~]")
 
+
+def _tts_plain_text(text: str) -> str:
+    """把 Markdown 转成 TTS 可自然朗读的纯文本（先渲染再读）。
+
+    朗读版「渲染」：代码块/链接/图片/表格/行内标记等一律转成口语化文本，
+    避免语音把 **、|、反引号、URL 等原始符号念出来。
+    """
+    s = str(text or "")
+    # 代码块：整段替换为「代码」（不朗读代码内容）
+    s = re.sub(r"```[\w+#-]*[ \t]*\n[\s\S]*?```", "（代码）", s)
+    s = re.sub(r"```[\w+#-]*[ \t]*```", "", s)
+    # 图片 ![alt](url) → alt（无 alt 则删除）
+    s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", lambda m: (m.group(1) or "").strip(), s)
+    # 链接 [文字](url) → 文字
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)
+    # 行内代码 `x` → x
+    s = re.sub(r"`([^`\n]+)`", r"\1", s)
+    # 加粗 / 斜体 / 删除线
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"__([^_]+)__", r"\1", s)
+    s = re.sub(r"(^|[^*])\*([^*\n]+)\*(?!\*)", r"\1\2", s)
+    s = re.sub(r"(^|[^_])_([^_\n]+)_(?!_)", r"\1\2", s)
+    s = re.sub(r"~~([^~]+)~~", r"\1", s)
+    # 表格：跳过分隔线行，单元格用逗号连接成一句话
+    out_lines = []
+    for ln in s.split("\n"):
+        t = ln.strip()
+        if re.fullmatch(r"\|?[\s:|-]+\|?", t):
+            continue
+        if t.startswith("|") and t.endswith("|"):
+            cells = [c.strip() for c in t.strip("|").split("|")]
+            out_lines.append("，".join(c for c in cells if c))
+            continue
+        out_lines.append(ln)
+    s = "\n".join(out_lines)
+    # 标题 / 引用 / 列表 / 分隔线标记
+    s = re.sub(r"^\s*#{1,6}\s*", "", s, flags=re.M)
+    s = re.sub(r"^\s*>\s?", "", s, flags=re.M)
+    s = re.sub(r"^\s*(?:[-*+]\s+|\d+\.\s+)", "", s, flags=re.M)
+    s = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", "", s, flags=re.M)
+    # 普通网址直接删除（避免朗读整串 URL；图片/视频链接已被上面规则处理）
+    s = re.sub(r"https?://[^\s，。！？!?\n]+", "", s)
+    # 清理残留符号与多余空白
+    s = re.sub(r"[*_`#>\-\[\]\(\)|!~]", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
 # 全局 TTS 配置（运行时可被前端 /api/tts/config 修改，持久化到 tts_config.json）
 TTS_CONFIG_FILE = BASE_DIR / "tts_config.json"
 DEFAULT_TTS_CONFIG = {
-    "engine": "edge_tts",                       # "edge_tts" | "gpt_sovits"
+    "engine": "edge_tts",                       # "edge_tts" | "gpt_sovits" | "api"
     "edge_voice": DEFAULT_VOICE,                # edge_tts 音色 ShortName
     "edge_rate": "+8%",                         # 语速
     "gptsovits_url": "http://127.0.0.1:7860/",  # GPT-SoVITS API 服务地址
     "gptsovits_ref_audio": "",                  # 参考音频绝对路径
     "gptsovits_character": "星见雅",
+    # 供应商 API TTS（OpenAI 兼容 /audio/speech，如硅基流动 CosyVoice）
+    "api_url": "",                              # 端点；空=不启用
+    "api_key": "",                              # 专用密钥；空=沿用供应商 API Key
+    "api_model": "",                            # 模型名，如 FunAudioLLM/CosyVoice2-0.5B
+    "api_voice": "",                            # 音色 id
 }
-
 def _load_tts_config():
     """从文件加载 TTS 配置，不存在则用默认值。"""
     if TTS_CONFIG_FILE.exists():
@@ -228,11 +512,14 @@ async def get_edge_voices() -> list:
 
 async def generate_tts_edge(text: str, voice: str, rate: str):
     """edge_tts 在线合成 mp3，返回 (audio_bytes, mime_type) 或 None。
-    
+
     音频数据直接返回，不保留持久文件。"""
     clean = re.sub(r"[*_`#>\-\[\]\(\)]", "", text).strip()
     if not clean:
         return None
+    # 空音色兜底（卡片应用/历史配置可能写入空串，导致 Invalid voice）
+    voice = (voice or "").strip() or DEFAULT_VOICE
+    rate = (rate or "").strip() or "+8%"
     # 使用临时文件生成，读完后立即删除
     audio_id = f"{uuid.uuid4().hex}.mp3"
     audio_path = AUDIO_DIR / audio_id
@@ -302,8 +589,40 @@ def generate_tts_gptsovits(text: str, ref_audio: str, url: str, character: str =
     return (data, "audio/wav")
 
 
+async def generate_tts_api(text: str, api_url: str, api_key: str,
+                             api_model: str = "", api_voice: str = ""):
+    """调用供应商的 OpenAI 兼容 TTS（/audio/speech），返回 (audio_bytes, mime_type) 或 None。
+
+    api_url 形如 https://api.siliconflow.cn/v1/audio/speech，SDK 按 base_url 自动拼端点。
+    """
+    clean = text.translate(dict.fromkeys(map(ord, "*_`#>[]()"), None)).strip()
+    if not clean:
+        return None
+    if not (api_url or "").strip() or not (api_key or "").strip():
+        raise RuntimeError("API TTS 未配置完整（缺 api_url / api_key）")
+    base = (api_url or "").strip().rstrip("/")
+    if base.endswith("/audio/speech"):
+        base = base[:-len("/audio/speech")]
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(api_key=api_key, base_url=base)
+    model = (api_model or "").strip() or "FunAudioLLM/CosyVoice2-0.5B"
+    voice = (api_voice or "").strip() or "default"
+    resp = await client.audio.speech.create(model=model, voice=voice, input=clean)
+    data = getattr(resp, "content", None)
+    if data is None and hasattr(resp, "read"):
+        data = resp.read()
+    if not data:
+        raise RuntimeError("API TTS 返回空音频")
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return (bytes(data), "audio/mpeg")
+
+
 async def generate_tts(text: str):
-    """根据当前引擎生成 TTS，返回 (audio_bytes, mime_type) 或 None，失败自动回退 edge_tts。"""
+    """根据当前引擎生成 TTS，返回 (audio_bytes, mime_type) 或 None，失败自动回退 edge_tts。
+
+    引擎来源：edge_tts（免费在线）| gpt_sovits（本地）| api（当前供应商的 API TTS）。
+    """
     engine = tts_config.get("engine", "edge_tts")
     try:
         if engine == "gpt_sovits":
@@ -314,18 +633,24 @@ async def generate_tts(text: str):
                 tts_config["gptsovits_url"],
                 tts_config.get("gptsovits_character", ""),
             )
+        if engine == "api":
+            return await generate_tts_api(
+                text,
+                tts_config.get("api_url", ""),
+                tts_config.get("api_key", ""),
+                tts_config.get("api_model", ""),
+                tts_config.get("api_voice", ""),
+            )
         return await generate_tts_edge(text, tts_config["edge_voice"], tts_config["edge_rate"])
     except Exception as e:
         print(f"[TTS] {engine} 失败，回退 edge_tts: {e}")
         try:
-            fallback_voice = tts_config.get("edge_voice", DEFAULT_VOICE)
-            fallback_rate = tts_config.get("edge_rate", "+8%")
+            fallback_voice = (tts_config.get("edge_voice") or "").strip() or DEFAULT_VOICE
+            fallback_rate = (tts_config.get("edge_rate") or "").strip() or "+8%"
             return await generate_tts_edge(text, fallback_voice, fallback_rate)
         except Exception as e2:
             print(f"[TTS] edge_tts 也失败: {e2}")
             return None
-
-
 # ---------- STT ----------
 # 本地语音识别模型（懒加载，仅首次使用或 API 失败时初始化）
 _local_stt_model = None
@@ -398,21 +723,44 @@ def _detect_ext_from_bytes(data: bytes) -> str:
     return ".webm"
 
 
-def convert_to_wav(input_path: str, output_path: str) -> bool:
-    """用 ffmpeg 把任意音频格式转成 16k 单声道 wav，并做降噪 + 响度归一化提升识别率。
+def convert_to_wav(input_path: str, output_path: str, noise_reduction: bool = False) -> bool:
+    """用 ffmpeg 把任意音频格式转成 16k 单声道 wav。
+
+    noise_reduction=False（默认快速路径）：高通/低通 + 响度归一化 + 保守静音裁剪，
+    干净环境下速度快、送入 STT 的音频更短 → 识别更快；
+    noise_reduction=True（降噪路径）：附加 afftdn 频域降噪，
+    用于首轮识别失败（环境噪声过大）时重试，提升准确率。
 
     滤波链：
     - highpass=f=80      去掉低频嗡嗡（电源/空调/手震）
     - lowpass=f=8000     去掉高频无用信号（16k 采样上限 8k）
+    - silenceremove      保守裁掉录音开头的确认窗口与结尾的自适应静音尾巴
+                         （阈值 -55dB 仅去除真静音，绝不误伤轻声语音）
+    - afftdn=nr=10       频域降噪，压制稳态背景噪声（仅降噪路径）
     - dynaudnorm         动态响度归一化，放大安静部分，小声说话也能被识别
-    - afftdn=nr=10       频域降噪，压制稳态背景噪声
+    - aresample=soxr     高质量重采样到 16k（浏览器 48k 录音降采样更干净，
+                         减少混叠噪声 → 提升识别准确率）
     """
     # 预处理：检查文件是否是常见音频格式
     if not _is_valid_audio(input_path):
         print(f"[ffmpeg] 跳过无效音频文件: {os.path.getsize(input_path)} 字节")
         return False
 
-    af = "highpass=f=80,lowpass=f=8000,afftdn=nr=10,dynaudnorm=p=0.9:s=5"
+    # 注意 stop_periods 必须为 -1（去掉全部结尾静音）。
+    # 用 1 时 ffmpeg 会在遇到的"第一个 ≥100ms 的静音"处截断整个输出：
+    # 用户句内停顿（~0.3~1.5s，非常常见）会让后半句整段丢失 → "听不清用户在干啥"。
+    trim = ("silenceremove=start_periods=1:start_threshold=-55dB:start_silence=0.15"
+            ":stop_periods=-1:stop_threshold=-55dB:stop_silence=0.1")
+    # dynaudnorm 响度归一化：放大轻声说话（关键！否则安静录音被 STT 视为空/只识别一两个字）
+    # 裁剪阈值取 -55dB（仅去除真静音），避免把轻声语音误当静音裁掉
+    # soxr 重采样放在链尾，保证 48k→16k 转换质量（提升识别准确率）
+    resample = "aresample=16000:resampler=soxr"
+    if noise_reduction:
+        af = f"highpass=f=80,lowpass=f=8000,afftdn=nr=10,{trim},dynaudnorm=p=0.9:s=5,{resample}"
+        af_label = "降噪"
+    else:
+        af = f"highpass=f=80,lowpass=f=8000,{trim},dynaudnorm=p=0.9:s=5,{resample}"
+        af_label = "裁剪"
     is_raw_opus = input_path.endswith(".opus")
 
     def _run_attempts(attempt_list):
@@ -435,42 +783,44 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
                 print(f"[ffmpeg] {label} 异常: {e}")
         return False
 
-    attempts = []
     if is_raw_opus:
         # 裸 Opus 数据包：必须使用 -f opus 显式指定 demuxer
-        attempts.append(
+        filtered_cmds = [
             (["ffmpeg", "-y", "-f", "opus", "-i", input_path,
               "-af", af,
               "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-              output_path], "Opus滤波版"))
-        attempts.append(
+              output_path], "Opus" + af_label + "版")]
+        plain_cmds = [
             (["ffmpeg", "-y", "-f", "opus", "-i", input_path,
               "-ar", "16000", "-ac", "1",
-              output_path], "Opus基础版"))
-    # 通用容器格式尝试（WebM/Ogg/MP4 等）
-    attempts.extend([
-        # 方案1: 完整滤波链
-        (["ffmpeg", "-y", "-i", input_path,
-          "-af", af,
-          "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-          output_path], "滤波版"),
-        # 方案2: 基础转换（无滤波）
-        (["ffmpeg", "-y", "-i", input_path,
-          "-ar", "16000", "-ac", "1",
-          output_path], "基础版"),
-        # 方案3: 容错 + 修复损坏的 webm（处理 MediaRecorder 未正确封包的情况）
-        (["ffmpeg", "-y",
-          "-err_detect", "ignore_err",
-          "-fflags", "+genpts+igndts",
-          "-analyzeduration", "10M",
-          "-probesize", "10M",
-          "-vn",
-          "-i", input_path,
-          "-ar", "16000", "-ac", "1",
-          output_path], "修复版"),
-    ])
+              output_path], "Opus基础版")]
+    else:
+        # 通用容器格式尝试（WebM/Ogg/MP4 等）
+        filtered_cmds = [
+            # 方案1: 滤波链（裁剪或降噪）
+            (["ffmpeg", "-y", "-i", input_path,
+              "-af", af,
+              "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
+              output_path], af_label + "版"),
+        ]
+        plain_cmds = [
+            # 方案2: 基础转换（无滤波）
+            (["ffmpeg", "-y", "-i", input_path,
+              "-ar", "16000", "-ac", "1",
+              output_path], "基础版"),
+            # 方案3: 容错 + 修复损坏的 webm（处理 MediaRecorder 未正确封包的情况）
+            (["ffmpeg", "-y",
+              "-err_detect", "ignore_err",
+              "-fflags", "+genpts+igndts",
+              "-analyzeduration", "10M",
+              "-probesize", "10M",
+              "-vn",
+              "-i", input_path,
+              "-ar", "16000", "-ac", "1",
+              output_path], "修复版"),
+        ]
 
-    ok = _run_attempts(attempts)
+    ok = _run_attempts(filtered_cmds + plain_cmds)
     if ok:
         return True
 
@@ -502,17 +852,172 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
     return False
 
 
+# ---------- STT（语音转文字）独立配置 ----------
+# 与 TTS 配置同模式：独立文件 stt_config.json，运行时可经 /api/stt/config 修改。
+STT_CONFIG_FILE = BASE_DIR / "stt_config.json"
+DEFAULT_STT_CONFIG = {
+    "provider": "auto",                         # auto=云端优先本地兜底 | cloud=仅云端 | local=仅本地
+    "api_url": "https://api.siliconflow.cn/v1/audio/transcriptions",
+    "api_key": "",                              # 语音识别专用密钥；留空沿用大语言模型 API Key
+    "model": "FunAudioLLM/SenseVoiceSmall",     # 云端识别模型名
+    "local_enabled": True,                      # 本地 faster-whisper 兜底开关
+    "local_model": "base",                      # 本地模型规格
+    "local_device": "cpu",
+    "local_compute_type": "int8",
+    "api_timeout": 15,
+    "hf_endpoint": "https://hf-mirror.com",
+}
+
+
+def _load_stt_config():
+    """加载 STT 独立配置；首次运行从 settings.json 的 stt 段迁移旧值。"""
+    cfg = dict(DEFAULT_STT_CONFIG)
+    if STT_CONFIG_FILE.exists():
+        try:
+            with open(STT_CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                cfg.update({k: saved[k] for k in DEFAULT_STT_CONFIG if k in saved})
+                return cfg
+        except Exception as e:
+            logger.warning(f"加载 STT 配置失败: {e}")
+    try:
+        legacy = load_config().get("stt", {})
+        if isinstance(legacy, dict):
+            for k in DEFAULT_STT_CONFIG:
+                if k in legacy:
+                    cfg[k] = legacy[k]
+    except Exception:
+        pass
+    return cfg
+
+
+def _save_stt_config(cfg: dict):
+    """保存 STT 配置到独立文件。"""
+    try:
+        with open(STT_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存 STT 配置失败: {e}")
+
+
+stt_config = _load_stt_config()
+
+
 def _get_local_stt_config():
-    """读取 STT 本地降级配置。"""
-    cfg = load_config().get("stt", {})
+    """读取 STT 本地降级配置（来自独立的 stt_config.json）。"""
     return {
-        "enabled": cfg.get("local_enabled", True),
-        "model": cfg.get("local_model", "base"),
-        "device": cfg.get("local_device", "cpu"),
-        "compute_type": cfg.get("local_compute_type", "int8"),
-        "api_timeout": cfg.get("api_timeout", 5),
-        "hf_endpoint": cfg.get("hf_endpoint", "https://hf-mirror.com"),
+        "enabled": bool(stt_config.get("local_enabled", True)),
+        "model": stt_config.get("local_model", "base"),
+        "device": stt_config.get("local_device", "cpu"),
+        "compute_type": stt_config.get("local_compute_type", "int8"),
+        "api_timeout": stt_config.get("api_timeout", 15),
+        "hf_endpoint": stt_config.get("hf_endpoint", "https://hf-mirror.com"),
     }
+
+
+# ---------- 唤醒词（Wake Word）配置 ----------
+# 独立文件 wake_config.json，运行时可经 /api/wake/config 修改。
+WAKE_CONFIG_FILE = BASE_DIR / "wake_config.json"
+DEFAULT_WAKE_CONFIG = {
+    "enabled": True,           # 唤醒功能总开关（前端待机模式仍由用户手动选择）
+    "words": ["大白"],          # 唤醒词列表：识别文本命中任意一个即唤醒
+    "fuzzy_threshold": 0.6,    # 模糊匹配阈值（复杂噪声场景容错，0.3~0.95）
+}
+
+_WAKE_PUNCT_RE = re.compile(
+    r"[\s，。！？、,.!?~…—\"'“”‘’（）()《》<>：:；;【】\[\]·\-]"
+)
+
+
+def _load_wake_config():
+    """加载唤醒词配置；首次运行写入默认文件。"""
+    cfg = dict(DEFAULT_WAKE_CONFIG)
+    if WAKE_CONFIG_FILE.exists():
+        try:
+            with open(WAKE_CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                cfg.update({k: saved[k] for k in DEFAULT_WAKE_CONFIG if k in saved})
+        except Exception as e:
+            logger.warning(f"加载唤醒词配置失败: {e}")
+    words = [str(w).strip() for w in (cfg.get("words") or []) if str(w).strip()]
+    cfg["words"] = (words or list(DEFAULT_WAKE_CONFIG["words"]))[:5]
+    try:
+        cfg["fuzzy_threshold"] = min(0.95, max(0.3, float(cfg.get("fuzzy_threshold", 0.6))))
+    except Exception:
+        cfg["fuzzy_threshold"] = 0.6
+    return cfg
+
+
+def _save_wake_config(cfg: dict):
+    """保存唤醒词配置到独立文件。"""
+    try:
+        with open(WAKE_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存唤醒词配置失败: {e}")
+
+
+wake_config = _load_wake_config()
+if not WAKE_CONFIG_FILE.exists():
+    _save_wake_config({k: wake_config[k] for k in DEFAULT_WAKE_CONFIG})
+
+
+def _normalize_for_wake(text: str) -> str:
+    """唤醒匹配前的文本标准化：去标点/空白、转小写。"""
+    return _WAKE_PUNCT_RE.sub("", (text or "")).lower()
+
+
+def _to_pinyin_str(text: str) -> str:
+    """中文转无声调拼音串（非中文字符保留原样），用于近音字容错匹配。
+
+    例：'大白' → 'dabai'，'大摆/打拜/大白呀' 的拼音串同样包含 'dabai'。
+    pypinyin 未安装时原样返回（退化为字符级模糊匹配）。
+    """
+    if _lazy_pinyin is None:
+        return text
+    try:
+        return "".join(_lazy_pinyin(text))
+    except Exception:
+        return text
+
+
+def match_wake_word(text: str) -> Optional[str]:
+    """判断识别文本是否命中唤醒词（复杂声学场景容错）。
+
+    四层策略（依次尝试，返回命中的原始唤醒词，未命中返回 None）：
+    1) 精确包含：标准化文本包含任一唤醒词；
+    2) 拼音包含：无声调拼音序列命中 → 近音字容错
+       （「大白」被误识别为「大摆」「打拜」「大拜」等仍可唤醒）；
+    3) 滑动窗口字符模糊比对：窗口长度 = 词长±1，容忍多字/漏字；
+    4) 超短句兜底：整句与唤醒词相似度达标（如只听清一个字的呼喊）。
+    """
+    norm = _normalize_for_wake(text)
+    if not norm:
+        return None
+    norm_py = _to_pinyin_str(norm)
+    threshold = float(wake_config.get("fuzzy_threshold", 0.6))
+    for raw_word in wake_config.get("words", []):
+        word = _normalize_for_wake(raw_word)
+        if not word or len(word) < 2:
+            # 过短的唤醒词误触率高，忽略单字配置
+            continue
+        if word in norm:
+            return raw_word
+        # 拼音级近音匹配（要求拼音串足够长，避免单音节误触发）
+        word_py = _to_pinyin_str(word)
+        if len(word_py) >= 4 and word_py in norm_py:
+            return raw_word
+        for win in {max(2, len(word) - 1), len(word), len(word) + 1}:
+            for i in range(0, max(1, len(norm) - win + 1)):
+                seg = norm[i:i + win]
+                if difflib.SequenceMatcher(None, word, seg).ratio() >= threshold:
+                    return raw_word
+        if len(norm) <= len(word) + 1 and \
+                difflib.SequenceMatcher(None, word, norm).ratio() >= threshold + 0.15:
+            return raw_word
+    return None
 
 
 def _load_local_stt_model():
@@ -555,12 +1060,21 @@ def speech_to_text_local(wav_path: str) -> str:
     model = _load_local_stt_model()
     if model is False:
         raise RuntimeError("本地 STT 模型未就绪")
+    # 初始提示词：声明普通话对话场景并注入唤醒词，偏置识别方向提升专有名词准确率
+    initial_prompt = "以下是普通话日常对话内容。"
+    wake_words = [w for w in (wake_config.get("words") or []) if w.strip()]
+    if wake_words:
+        initial_prompt += "对方的名字可能是：" + "、".join(wake_words) + "。"
     segments, info = model.transcribe(wav_path, beam_size=5, language="zh",
+                                       temperature=[0.0, 0.2, 0.4],
+                                       initial_prompt=initial_prompt,
                                        vad_filter=True,
                                        vad_parameters=dict(
-                                           min_silence_duration_ms=500,
-                                           threshold=0.4,
-                                       ))
+                                           min_silence_duration_ms=400,
+                                           threshold=0.3,
+                                       ),
+                                       condition_on_previous_text=False,
+                                       without_timestamps=True)
     text = " ".join(seg.text.strip() for seg in segments)
     if not text:
         raise RuntimeError("本地模型未识别到语音内容")
@@ -569,28 +1083,51 @@ def speech_to_text_local(wav_path: str) -> str:
 
 
 def speech_to_text(wav_path: str) -> str:
-    """调用 SiliconFlow 语音识别 API，失败时自动降级到本地模型。"""
+    """语音识别：云端 API（独立配置的地址/密钥/模型）优先，失败自动降级本地 faster-whisper。"""
     import requests
-    config = load_config()
     stt_cfg = _get_local_stt_config()
+    provider = (stt_config.get("provider") or "auto").strip()
 
-    # 第一选择：SiliconFlow API（快速、准确）
-    url = "https://api.siliconflow.cn/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {config['api_key']}"}
-    with open(wav_path, "rb") as f:
-        files = {"file": ("audio.wav", f, "audio/wav")}
-        data = {"model": "FunAudioLLM/SenseVoiceSmall"}
-        try:
-            resp = requests.post(url, headers=headers, files=files, data=data,
-                                 timeout=stt_cfg["api_timeout"])
-            resp.raise_for_status()
-            text = resp.json().get("text", "").strip()
-            if text:
-                return text
-            # API 返回空文本也视为失败
-            raise RuntimeError("API 返回空文本")
-        except Exception as e:
-            print(f"[STT-API] 失败（{e}），尝试本地降级…")
+    # 云端密钥：优先用 STT 专用 Key；未单独填写时兼容旧版沿用大语言模型 API Key
+    dedicated_key = (stt_config.get("api_key") or "").strip()
+    api_key = dedicated_key or (load_config().get("api_key") or "").strip()
+    can_cloud = provider != "local" and bool(api_key) \
+        and (bool(dedicated_key) or api_key.startswith("sk-"))
+
+    # 第一选择：云端语音识别 API（快速、准确）；网络抖动自动重试一次再降级
+    if can_cloud:
+        url = (stt_config.get("api_url") or "").strip() or DEFAULT_STT_CONFIG["api_url"]
+        model = (stt_config.get("model") or "").strip() or DEFAULT_STT_CONFIG["model"]
+        headers = {"Authorization": f"Bearer {api_key}"}
+        last_err: Exception = RuntimeError("未请求")
+        for attempt in range(2):  # 复杂场景容错：超时/瞬断重试一次
+            with open(wav_path, "rb") as f:
+                files = {"file": ("audio.wav", f, "audio/wav")}
+                data = {"model": model}
+                try:
+                    resp = requests.post(url, headers=headers, files=files, data=data,
+                                         timeout=stt_cfg["api_timeout"])
+                    resp.raise_for_status()
+                    text = resp.json().get("text", "").strip()
+                    if text:
+                        return text
+                    # API 返回空文本也视为失败（无内容时重试无意义，直接跳出）
+                    raise RuntimeError("API 返回空文本")
+                except Exception as e:
+                    last_err = e
+                    print(f"[STT-API] 第{attempt + 1}次失败（{e}）")
+                    msg = str(e).lower()
+                    transient = any(k in msg for k in ("timeout", "timed out", "connection", "ssl"))
+                    empty_text = "空文本" in str(e)
+                    # 仅网络瞬断重试；HTTP 错误/空文本直接跳出走本地降级
+                    if provider == "cloud":
+                        raise RuntimeError(f"语音识别失败（仅云端模式）: {e}")
+                    if not transient or empty_text:
+                        break
+                    time.sleep(0.4)
+        print(f"[STT-API] 云端识别最终失败（{last_err}），尝试本地降级…")
+    elif provider != "local":
+        print("[STT-API] 未配置云端密钥（本地模式），直接使用本地识别…")
 
     # 第二选择：本地 faster-whisper 降级
     if stt_cfg["enabled"]:
@@ -605,12 +1142,175 @@ def speech_to_text(wav_path: str) -> str:
 # ---------- 路由 ----------
 @app.get("/")
 async def index():
-    return FileResponse(str(WEB_DIR / "index.html"))
+    resp = FileResponse(str(WEB_DIR / "index.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+# ---------- 动作库测试页 ----------
+@app.get("/anim-test")
+async def anim_library_test():
+    """Mixamo 动作库测试页"""
+    resp = FileResponse(str(WEB_DIR / "animation-library-test.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+@app.get("/anim-download")
+async def anim_download_checklist():
+    """Mixamo 动作下载清单页"""
+    resp = FileResponse(str(WEB_DIR / "anim" / "download-checklist.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+@app.get("/bigscreen")
+async def bigscreen_preview():
+    """网页版任务直播大屏（bigscreen.html）：浏览器直接打开即预览，
+    3D 大屏用隐藏 iframe + html2canvas 每帧取帧贴纹理，两边画面一致。"""
+    resp = FileResponse(str(WEB_DIR / "bigscreen.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+@app.get("/anim-library")
+async def anim_library_console():
+    """动作库管理控制台"""
+    resp = FileResponse(str(WEB_DIR / "anim" / "index.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+# ---------- Mixamo 代理下载服务 ----------
+@app.get("/api/mixamo/status")
+async def mixamo_status():
+    """获取下载服务状态"""
+    from mixamo_download_service import service
+    return service.get_status()
+
+
+@app.post("/api/mixamo/start")
+async def mixamo_start(request: Request):
+    """启动代理浏览器"""
+    from mixamo_download_service import service
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    except:
+        body = {}
+    proto = body.get("proto")
+    try:
+        result = await service.start(proto=proto)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mixamo/stop")
+async def mixamo_stop():
+    """关闭浏览器"""
+    from mixamo_download_service import service
+    try:
+        result = await service.stop()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mixamo/save-cookies")
+async def mixamo_save_cookies():
+    """保存当前登录 cookies"""
+    from mixamo_download_service import service
+    try:
+        result = await service.save_cookies()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mixamo/check-login")
+async def mixamo_check_login():
+    """基于 cookies 检测是否已登录（不打断登录页）"""
+    from mixamo_download_service import service
+    if not service.is_running:
+        return {"is_logged_in": service.is_logged_in}
+    try:
+        logged = await service.check_login_cookies()
+        return {"is_logged_in": logged}
+    except Exception:
+        return {"is_logged_in": service.is_logged_in}
+
+
+@app.post("/api/mixamo/goto")
+async def mixamo_goto(request: Request):
+    """跳转到 Mixamo 主页"""
+    from mixamo_download_service import service
+    try:
+        result = await service.goto_mixamo()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mixamo/download")
+async def mixamo_download(request: Request):
+    """下载单个动作"""
+    try:
+        body = await request.json()
+    except:
+        raise HTTPException(status_code=400, detail="invalid json")
+    name = body.get("name")
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    from mixamo_download_service import service
+    if not service.is_running:
+        raise HTTPException(status_code=400, detail="浏览器未启动，请先调用 /api/mixamo/start")
+    try:
+        result = await service.download_animation(name)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mixamo/batch-download")
+async def mixamo_batch_download(request: Request):
+    """批量下载动作（后台异步执行）"""
+    try:
+        body = await request.json()
+    except:
+        raise HTTPException(status_code=400, detail="invalid json")
+    names = body.get("names", [])
+    if not names:
+        raise HTTPException(status_code=400, detail="names required")
+    from mixamo_download_service import service
+    if not service.is_running:
+        raise HTTPException(status_code=400, detail="浏览器未启动，请先调用 /api/mixamo/start")
+    # 后台异步执行：必须持有任务引用，否则 asyncio 可能把任务 GC 掉导致"没反应"
+    import asyncio
+    # 取消并等待上一个未完成的批量任务，避免并发抢同一页面导航
+    if getattr(service, "_task", None) and not service._task.done():
+        service._task.cancel()
+    service._stop_event.clear()
+    service._task = asyncio.create_task(service.batch_download(names))
+    return {"status": "started", "total": len(names)}
+
+
+@app.post("/api/mixamo/debug-dom")
+async def mixamo_debug_dom(request: Request):
+    """临时调试：dump 当前搜索页真实 DOM 结构（用后删）"""
+    from mixamo_download_service import service
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not service.is_running:
+        return {"error": "browser not running"}
+    try:
+        return await service.debug_dom(body.get("query", "Idle"), bool(body.get("interact")))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/info")
 async def info():
-    return {"lan_ip": get_lan_ip(), "port": 8000}
+    return {"lan_ip": get_lan_ip(), "port": SERVER_PORT}
 
 
 # ---------- TTS 配置 ----------
@@ -647,9 +1347,13 @@ async def tts_config_get():
 async def tts_config_set(payload: dict):
     """更新 TTS 配置（部分字段）"""
     for k in ("engine", "edge_voice", "edge_rate",
-              "gptsovits_url", "gptsovits_ref_audio", "gptsovits_character"):
+              "gptsovits_url", "gptsovits_ref_audio", "gptsovits_character",
+              "api_url", "api_key", "api_model", "api_voice"):
         if k in payload:
             tts_config[k] = payload[k]
+    # 空音色兜底：不允许保存空白 edge_voice（会导致 Invalid voice）
+    if not (tts_config.get("edge_voice") or "").strip():
+        tts_config["edge_voice"] = DEFAULT_VOICE
     # 切换音色后清空缓存，便于下次重新拉取
     if "edge_voice" in payload:
         global _edge_voices_cache
@@ -657,6 +1361,827 @@ async def tts_config_set(payload: dict):
     # 持久化保存
     _save_tts_config({k: tts_config[k] for k in DEFAULT_TTS_CONFIG})
     return {"ok": True, "config": tts_config}
+
+
+# ---------- STT（语音转文字）配置 ----------
+@app.get("/api/stt/config")
+async def stt_config_get():
+    """获取语音识别独立配置（供前端表单回填）。"""
+    return dict(stt_config)
+
+
+@app.post("/api/stt/config")
+async def stt_config_set(payload: dict):
+    """更新语音识别独立配置（部分字段），立即生效并持久化到 stt_config.json。"""
+    global _local_stt_model
+    for k in DEFAULT_STT_CONFIG:
+        if k in payload and payload[k] is not None:
+            v = payload[k]
+            stt_config[k] = str(v).strip() if isinstance(v, str) else v
+    if stt_config.get("provider") not in ("auto", "cloud", "local"):
+        stt_config["provider"] = "auto"
+    # 本地模型参数变化后清空缓存，下次识别时按新参数重新加载
+    if any(k in payload for k in ("local_model", "local_device", "local_compute_type")):
+        with _local_stt_lock:
+            _local_stt_model = None
+    _save_stt_config({k: stt_config[k] for k in DEFAULT_STT_CONFIG})
+    logger.info(
+        f"STT 配置更新: provider={stt_config['provider']} model={stt_config['model']} "
+        f"专用密钥={'已设置' if (stt_config.get('api_key') or '').strip() else '未设置（沿用主 Key）'}"
+    )
+    return {"ok": True, "config": {k: stt_config[k] for k in DEFAULT_STT_CONFIG}}
+
+
+# ---------- 唤醒词（Wake Word）配置 ----------
+@app.get("/api/wake/config")
+async def wake_config_get():
+    """获取唤醒词配置（供前端回填）。"""
+    return {k: wake_config[k] for k in DEFAULT_WAKE_CONFIG}
+
+
+@app.post("/api/wake/config")
+async def wake_config_set(payload: dict):
+    """更新唤醒词配置（部分字段），立即生效并持久化到 wake_config.json。"""
+    if "words" in payload:
+        words = payload.get("words")
+        if isinstance(words, str):
+            # 支持逗号/顿号/空格分隔的字符串形式
+            words = [w for w in re.split(r"[,,、\s]+", words) if w.strip()]
+        if isinstance(words, list):
+            cleaned = [str(w).strip() for w in words if str(w).strip()]
+            wake_config["words"] = (cleaned or list(DEFAULT_WAKE_CONFIG["words"]))[:5]
+    if "fuzzy_threshold" in payload:
+        try:
+            v = float(payload["fuzzy_threshold"])
+            wake_config["fuzzy_threshold"] = min(0.95, max(0.3, v))
+        except Exception:
+            pass
+    if "enabled" in payload:
+        wake_config["enabled"] = bool(payload["enabled"])
+    _save_wake_config({k: wake_config[k] for k in DEFAULT_WAKE_CONFIG})
+    logger.info(
+        f"唤醒词配置更新: words={wake_config['words']} "
+        f"fuzzy={wake_config['fuzzy_threshold']} enabled={wake_config['enabled']}"
+    )
+    return {"ok": True, "config": {k: wake_config[k] for k in DEFAULT_WAKE_CONFIG}}
+
+
+# ============================================================
+# 任务中心 + DSH 桥接（DeepSeek Harness ↔ 大白）
+# 任务中心把 codex/opencode、后台命令、DSH 智能体统一纳入可视化调度；
+# DSH 任务由角色提交 → 用户确认 → DSH 智能体执行 → 结果回传任务中心。
+# ============================================================
+from task_orchestrator import (
+    get_orchestrator,
+    TaskOrchestrator,
+    STATUS_CONFIRMING,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    STATUS_DONE,
+    STATUS_ERROR,
+    STATUS_CANCELLED,
+)
+
+# 状态名兼容（旧前端确认卡片仍用 pending/running/done...）
+_LEGACY_STATUS = {
+    STATUS_CONFIRMING: "pending",
+    STATUS_QUEUED: "pending",
+    STATUS_RUNNING: "running",
+    STATUS_DONE: "done",
+    STATUS_ERROR: "error",
+    STATUS_CANCELLED: "cancelled",
+}
+
+
+def _legacy(task) -> Optional[str]:
+    return _LEGACY_STATUS.get(task.status)
+
+
+async def request_harness_task(ws: WebSocket, task_text: str, cwd: Optional[str] = None):
+    """角色调用 call_deepseek_harness 时由工具结果触发：登记 DSH 任务并发起确认。
+
+    返回 orchestrator 任务（kind=dsh，confirm=True）。前端确认卡片 + 任务中心双通道。
+
+    工作目录：优先用传入的 cwd（LLM 显式指定且有效时）；否则回退到全局工作区，
+    杜绝"改了工作区但任务仍跑旧目录"（AI 可能凭记忆填旧路径或参数缺失）。
+    """
+    if not (cwd and os.path.isdir(cwd)):
+        cwd = _workspace_current().get("cwd") or ""
+    orch = get_orchestrator()
+    task = await orch.create(
+        kind="dsh",
+        title="DSH 智能体任务",
+        ws=ws,
+        brief=task_text,
+        confirm=True,
+        channel="dsh",
+        extra={"cwd": cwd},
+    )
+    # 兼容旧版确认卡片（新任务中心通过 task_event 同步）
+    await safe_send_json(ws, {
+        "type": "bridge_confirm",
+        "request_id": task.id,
+        "task": task_text,
+        "require_confirm": True,
+        "task_id": task.id,
+    })
+    return task
+
+
+# ---------- 任务中心：codex/后台命令接入 ----------
+
+async def _mirror_codex_event(task, data: dict) -> None:
+    """把 codex 流式事件镜像成任务中心的步骤/日志/结果。"""
+    try:
+        kind = str(data.get("type") or "")
+        if kind == "codex_start":
+            await task_center_add_step_safe(task, f"已交给 {data.get('label') or data.get('tool')}（/{data.get('tool')}）")
+        elif kind == "codex_log":
+            # 结构化明细：工具调用开始记为里程碑步骤；参数/输出/对话行进实时日志（批量推送）
+            entries = data.get("entries") or []
+            if not isinstance(entries, list):
+                entries = []
+            logs = []
+            tool_no = int((task.extra or {}).get("codex_tool_count") or 0)
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                et = str(e.get("type") or "")
+                if et == "tool":
+                    tool_no += 1
+                    await task_center_add_step_safe(
+                        task, f"🔧 第 {tool_no} 步 {e.get('tool') or '工具'}")
+                elif et in ("args", "out", "log", "turn", "tool_end", "header"):
+                    t = str(e.get("text") or "")
+                    if t:
+                        logs.append(t)
+            if task.extra is not None:
+                task.extra["codex_tool_count"] = tool_no
+            if logs:
+                # 每批最多 40 行进任务中心日志（完整明细在 codex 卡片/任务 trace 接口）
+                await task_center_add_logs_safe(task, logs[-40:])
+        elif kind == "codex_progress":
+            fresh = str(data.get("fresh") or "").strip()
+            if fresh:
+                for line in fresh.splitlines()[:6]:
+                    await task_center_add_log_safe(task, line)
+        elif kind == "codex_error":
+            await task_center_add_log_safe(task, "⚠️ " + str(data.get("message") or "执行出错"))
+        elif kind == "codex_done":
+            summary = str(data.get("summary") or data.get("raw_tail") or "").strip()
+            if summary:
+                steps_n = data.get("steps_total") or (task.extra or {}).get("codex_tool_count") or 0
+                lines_n = data.get("lines_total") or ""
+                cnt = f"，执行 {steps_n} 步 / {lines_n} 行" if steps_n or lines_n else ""
+                await task_center_add_step_safe(
+                    task, f"{'✅' if data.get('success') else '❌'} {data.get('label')} 完成（exit={data.get('exit_code')}{cnt}）")
+            # 系统核验验收标准：把 PASS/FAIL 结果写进任务中心日志
+            v = data.get("verify")
+            if isinstance(v, dict):
+                if v.get("found"):
+                    if v.get("ok"):
+                        await task_center_add_log_safe(
+                            task, f"✅ 验收核验通过：PASS {v.get('pass')} / FAIL {v.get('fail')}")
+                    else:
+                        await task_center_add_log_safe(
+                            task, f"❌ 验收核验未通过：PASS {v.get('pass')} / FAIL {v.get('fail')}（{v.get('reason')}）")
+                else:
+                    await task_center_add_log_safe(
+                        task, "⚠ 验收核验：未提供【验收核验】块，无法系统确认达标")
+            await task_center_set_result_safe(task, summary or "（无输出）", STATUS_DONE if data.get("success") else STATUS_ERROR)
+        elif kind == "codex_terminated":
+            await task_center_set_error_safe(task, str(data.get("message") or "任务已终止"))
+        elif kind == "codex_timeout":
+            await task_center_set_error_safe(task, str(data.get("message") or "任务超时"))
+    except Exception:
+        pass
+
+
+async def _mirror_bg_report(task, report: str) -> None:
+    """把后台任务 report 增量镜像为任务中心日志。"""
+    for line in str(report).splitlines():
+        line = line.strip()
+        if line and (not task.logs or task.logs[-1] != line):
+            await task_center_add_log_safe(task, line)
+
+
+async def task_center_add_step_safe(task, text: str) -> None:
+    orch = get_orchestrator()
+    try:
+        await orch.add_step(task, text)
+    except Exception:
+        pass
+
+
+async def task_center_add_log_safe(task, text: str) -> None:
+    orch = get_orchestrator()
+    try:
+        await orch.add_log(task, text)
+    except Exception:
+        pass
+
+
+async def task_center_add_logs_safe(task, texts: list) -> None:
+    orch = get_orchestrator()
+    try:
+        await orch.add_logs(task, list(texts))
+    except Exception:
+        pass
+
+
+async def task_center_set_result_safe(task, text: str, status: str = STATUS_DONE) -> None:
+    orch = get_orchestrator()
+    try:
+        await orch.set_result(task, text, status)
+    except Exception:
+        pass
+
+
+async def task_center_set_error_safe(task, text: str) -> None:
+    orch = get_orchestrator()
+    try:
+        await orch.set_error(task, text)
+    except Exception:
+        pass
+
+
+class _TaskTeeWS:
+    """把 invoke_tool_stream 推给真实 ws 的消息同时镜像到任务中心（不改 codex_runner）。"""
+
+    def __init__(self, real_ws, task):
+        self._real = real_ws
+        self._task = task
+        try:
+            self.client_state = real_ws.client_state
+        except AttributeError:
+            self.client_state = None  # 仅测试/极端场景：webhook 无连接
+
+    async def send_json(self, data: dict) -> None:
+        if self._real is not None:
+            await self._real.send_json(data)
+        await _mirror_codex_event(self._task, data)
+
+
+# 待用户确认的 codex/opencode 委派：task_id -> 确认后要启动的协程工厂。
+# 与 DSH 桥接同一套安全闸门：智能体委派一律先经用户确认才真正执行（防误操作）。
+_pending_codex_runners: dict[str, Callable] = {}
+
+
+# ---------- 多智能体并发治理：文件域路由 + 核心域闸门 + 隔离工作树 ----------
+# 文件域：web=只动 web/ 前端（可并行）；skills=只动 skills/ 插件（按目录并行）；
+#         core=涉及根目录 *.py / harness/*.py（同一时间只允许 1 个任务，自动在隔离工作树执行）
+SCOPE_WEB = "web"
+SCOPE_SKILLS = "skills"
+SCOPE_CORE = "core"
+
+# core 强信号：任务描述命中其一即按核心域串行+隔离（宁可多排队，不可多并发）
+_CORE_SIGNALS = (
+    "server.py", "agent.py", "memory.py", "harness", "核心", "后端",
+    "热重载", "hot_reload", "执行链路", "上下文", "记忆", "调度",
+    "codex_runner", "task_orchestrator", "心跳", "重构", "热更新", "重启",
+)
+_WEB_SIGNALS = ("web/", ".ts", "前端", "页面", "聊天框", "视频页", "样式", "css",
+                "ui", "按钮", "弹窗", "气泡", "工作区")
+_SKILLS_SIGNALS = ("skills/", "技能", "skill")
+
+
+def _infer_scope(task_desc: str) -> str:
+    """按任务描述推断文件域：core / web / skills（默认 core 保守串行）。"""
+    t = (task_desc or "").lower()
+    if any(k in t for k in _CORE_SIGNALS):
+        return SCOPE_CORE
+    if any(k in t for k in _WEB_SIGNALS):
+        return SCOPE_WEB
+    if any(k in t for k in _SKILLS_SIGNALS):
+        return SCOPE_SKILLS
+    return SCOPE_CORE
+
+
+# 核心域并发闸门：core 任务同一时间只执行 1 个，其余排队（Semaphore=1，延迟到事件循环内创建）
+_core_slot: Optional[asyncio.Semaphore] = None
+
+
+def _get_core_slot() -> asyncio.Semaphore:
+    global _core_slot
+    if _core_slot is None:
+        _core_slot = asyncio.Semaphore(1)
+    return _core_slot
+
+
+def _wt_root_dir() -> str:
+    """隔离工作树根目录：settings.json -> agent.worktree_dir，默认 <仓库父目录>/dabai_worktrees。"""
+    try:
+        cfg = _load_settings()
+        v = str((cfg or {}).get("agent", {}).get("worktree_dir") or "").strip()
+        if v:
+            return v
+    except Exception:
+        pass
+    return str((BASE_DIR.parent / "dabai_worktrees"))
+
+
+def _git_run(cwd: str, args: list, timeout: int = 60) -> tuple:
+    """同步执行 git 命令，返回 (returncode, stdout, stderr)。"""
+    import subprocess
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run(["git", "-C", cwd] + args, capture_output=True,
+                           text=True, timeout=timeout, creationflags=flags)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except Exception as e:
+        return -1, "", f"git 执行异常: {e}"
+
+
+def _auto_wt_create_sync(task) -> tuple:
+    """为 core 任务创建隔离工作树 codex/wt-<id>（基于 HEAD）。返回 (wt_dir, branch, err)。"""
+    repo = str(BASE_DIR)
+    rc, _, err = _git_run(repo, ["rev-parse", "--is-inside-work-tree"])
+    if rc != 0:
+        return None, None, f"主仓库不是 git 仓库，无法隔离：{err}"
+    slug = "wt-" + (task.id or "x").replace("task-", "")[:10]
+    wt_root = _wt_root_dir()
+    try:
+        os.makedirs(wt_root, exist_ok=True)
+    except Exception as e:
+        return None, None, f"无法创建工作树目录 {wt_root}: {e}"
+    target = os.path.join(wt_root, slug)
+    branch = "codex/" + slug
+    if os.path.isdir(target):
+        return None, None, f"同名工作树已存在（{target}），请先人工 wt_list/wt_merge/wt_discard 处理"
+    rc, out, err = _git_run(repo, ["worktree", "add", "-b", branch, "HEAD", target])
+    if rc != 0:
+        return None, None, f"创建工作树失败: {err or out}"
+    return target, branch, None
+
+
+def _auto_wt_merge_sync(task, wt_dir: str, branch: str) -> str:
+    """core 任务结束后：wt 内提交 → 合回主分支 → 清理。冲突失败保留现场，不破坏任何改动。"""
+    repo = str(BASE_DIR)
+    out_lines = []
+    rc, st, _ = _git_run(repo, ["status", "--porcelain"])
+    if rc == 0 and st.strip():
+        out_lines.append("⚠ 主工作区有未提交改动：若与本次改动涉及相同文件，git 会拒绝合并并保留现场（不覆盖）。")
+    rc, st_wt, _ = _git_run(wt_dir, ["status", "--porcelain"])
+    if rc == 0 and st_wt.strip():
+        rc2, o2, e2 = _git_run(wt_dir, ["add", "-A"])
+        if rc2 != 0:
+            return "\n".join(out_lines + [f"✘ 隔离区 git add 失败：{e2 or o2}（工作树保留，请人工 wt_merge/wt_discard）"])
+        rc2, o2, e2 = _git_run(wt_dir, ["commit", "-m", f"auto: {task.title[:80]}"])
+        if rc2 != 0:
+            return "\n".join(out_lines + [f"✘ 隔离区 git commit 失败：{e2 or o2}（工作树保留，请人工 wt_merge/wt_discard）"])
+        out_lines.append(f"✔ 隔离区已提交 {len(st_wt.strip().splitlines())} 处改动")
+    else:
+        out_lines.append("ℹ 隔离区无改动（或均为忽略文件），跳过提交。")
+    rc, o3, e3 = _git_run(repo, ["merge", "--no-ff", branch, "-m", f"merge worktree {os.path.basename(wt_dir)}"])
+    if rc != 0:
+        return "\n".join(out_lines + [f"⚠ 合并冲突/失败：{(e3 or o3)[:400]}；工作树与分支保留，可人工 wt_merge 或 wt_discard 处理。"])
+    out_lines.append("✔ 已合并回主分支（--no-ff）")
+    _git_run(repo, ["worktree", "remove", "--force", wt_dir])
+    _git_run(repo, ["branch", "-d", branch])
+    out_lines.append("✔ 已清理隔离工作树与临时分支")
+    return "\n".join(out_lines)
+
+
+async def _run_codex_tool_task(ws: WebSocket, tool_name: str, tcfg: dict, task_desc: str) -> None:
+    """登记 /cx /ai 委派任务【需用户确认】后再真正执行（与 DSH 桥接一致的安全闸门）。
+
+    任务进入 confirming 状态并推送确认卡片；用户在任务中心/确认卡点击
+    「确认执行」后，才会启动 codex/opencode 子进程。拒绝则丢弃，绝不执行。
+    """
+    orch = get_orchestrator()
+    # 死循环防护：相同任务在近 30 分钟内已"静默失败"≥2 次 → 不再重复提交。
+    # 防止 codex/opencode 启动即失败/无输出时，同一任务被反复原样重发空跑。
+    fp = re.sub(r"\s+", " ", task_desc or "").strip().lower()
+    now = time.time()
+    silent_fail = 0
+    for t in orch._tasks.values():
+        if t.kind != "codex-tool" or t.status != STATUS_ERROR:
+            continue
+        if now - t.updated_at > 1800:
+            continue
+        if re.sub(r"\s+", " ", t.brief or "").strip().lower() == fp:
+            # 只拦"几乎没有有效输出"的失败（结果/错误都很短），有实质进展的不拦
+            if len((t.result or "").strip()) < 200 and len((t.error or "").strip()) < 200:
+                silent_fail += 1
+    if silent_fail >= 2:
+        logger.warning("[Delegate] 相同任务 30 分钟内已静默失败 %d 次，已拦截重复委派", silent_fail)
+        await safe_send_json(ws, {
+            "type": "codex_msg",
+            "kind": "error",
+            "text": (f"⛔ 相同任务在近 30 分钟内已连续失败 {silent_fail} 次（且都没有有效输出），"
+                     "为避免重复空跑已拦截。请先到任务中心查看最近任务的日志定位原因，"
+                     "或修改任务描述后再试。"),
+        })
+        return
+    scope = _infer_scope(task_desc)  # 多智能体并发治理：按任务描述判定文件域
+    task = await orch.create(
+        kind="codex-tool",
+        title=f"/{tool_name} {task_desc[:40]}",
+        ws=ws,
+        brief=task_desc,
+        confirm=True,  # ← 安全闸门：所有智能体委派都要求用户确认
+        channel="codex" if tool_name == "cx" else "opencode",
+        extra={"scope": scope},
+    )
+    await task_center_add_log_safe(
+        task,
+        f"🗂 文件域判定：{scope}"
+        + ("（web 前端，可与他人并行）" if scope == SCOPE_WEB
+           else "（技能插件）" if scope == SCOPE_SKILLS
+           else "（核心代码：串行执行 + 隔离工作树）"),
+    )
+
+    async def _launch():
+        tee = _TaskTeeWS(ws, task)
+        if scope == SCOPE_CORE:
+            # 核心域并发闸门：core 任务同一时间只执行 1 个，其余排队等待
+            await task_center_add_step_safe(task, "⌛ 排入核心域队列（核心文件任务同一时间只执行 1 个）…")
+            await _get_core_slot().acquire()
+            try:
+                await _run_agent_in_workspace(task, tee)
+            finally:
+                _get_core_slot().release()
+        else:
+            await _run_agent_in_workspace(task, tee)
+
+    async def _run_agent_in_workspace(task, tee):
+        """执行 agent 任务；core 域自动在隔离工作树执行（不触发大白热重载），结束后合回主分支。"""
+        wt_dir, branch, err = None, None, None
+        if scope == SCOPE_CORE:
+            wt_dir, branch, err = await asyncio.to_thread(_auto_wt_create_sync, task)
+            if err:
+                await task_center_add_log_safe(task, f"⚠ 未能创建隔离工作树（{err}），将退化为在主工作区直接执行")
+            else:
+                await task_center_add_step_safe(
+                    task, f"🛡 已创建隔离工作树：{wt_dir}（分支 {branch}；改动不触发核心热重载）")
+        try:
+            await codex_runner.invoke_tool_stream(tool_name, tcfg, task_desc, tee,
+                                                  task_id=task.id, work_dir=wt_dir)
+        except Exception as e:
+            await task_center_set_error_safe(task, f"{e.__class__.__name__}: {e}")
+        if wt_dir and branch:
+            try:
+                msg = await asyncio.to_thread(_auto_wt_merge_sync, task, wt_dir, branch)
+                await task_center_add_logs_safe(task, msg.splitlines())
+            except Exception as e:
+                await task_center_add_log_safe(task, f"✘ 自动合并回主分支失败: {e}。请人工 wt_list/wt_merge 处理。")
+
+    _pending_codex_runners[task.id] = _launch
+    # 兼容旧前端确认卡片（任务中心通过 task_event 同步，同一套确认 UI）
+    await safe_send_json(ws, {
+        "type": "bridge_confirm",
+        "request_id": task.id,
+        "task": task_desc,
+        "require_confirm": True,
+        "task_id": task.id,
+    })
+
+
+async def _launch_if_pending(task_id: str) -> None:
+    """用户确认通过后，真正启动之前登记的 codex/opencode 执行器。"""
+    runner = _pending_codex_runners.pop(task_id, None)
+    if runner is not None:
+        asyncio.create_task(runner())
+
+
+def _drop_pending(task_id: str) -> None:
+    """用户拒绝/取消时丢弃待确认的委派，确保绝不执行。"""
+    _pending_codex_runners.pop(task_id, None)
+
+
+class _BroadcastWS:
+    """恢复任务的伪 ws：把 codex 事件广播给所有已连接前端（重启后原 ws 已失效）。"""
+
+    async def send_json(self, data: dict) -> None:
+        for ws in list(manager.active):
+            await safe_send_json(ws, data)
+
+
+async def _daily_review_loop(interval: float = 6 * 3600) -> None:
+    """基础能力：定期增量复盘执行日志（卡点聚类 → 策略沉淀），失败静默。"""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            from execution_loop.hooks import execution_review
+            report = execution_review()
+            logger.info("[DailyReview] %s", str(report)[:400])
+        except Exception as e:
+            logger.warning("[DailyReview] 复盘失败: %s", e)
+
+
+async def _recover_codex_tasks() -> int:
+    """server 重启/热重载后：把仍在跑的 codex/opencode 独立进程接回任务中心并恢复监听。"""
+    orch = get_orchestrator()
+    n = 0
+    for entry in codex_runner.recover_running_tasks():
+        try:
+            tid = str(entry.get("id") or "")
+            if not tid or orch.get(tid):
+                continue
+            tool_name = str(entry.get("tool") or "")
+            title = f"/{tool_name} {str(entry.get('task') or '')[:40]}" if tool_name else "编码助手（恢复）"
+            channel = "codex" if tool_name == "cx" else "opencode"
+            broadcast = _BroadcastWS()
+            task = await orch.restore(
+                task_id=tid,
+                kind="codex-tool",
+                title=title,
+                ws=broadcast,
+                brief=str(entry.get("task") or ""),
+                channel=channel,
+                extra={"recovered": True, "pid": entry.get("pid"), "alive": entry.get("alive")},
+            )
+            if task is None:
+                continue
+            tee = _TaskTeeWS(broadcast, task)
+            asyncio.create_task(codex_runner.invoke_tool_recover(tid, tee))
+            n += 1
+        except Exception as e:
+            logger.warning(f"[TaskCenter] codex 任务恢复失败: {e}")
+    return n
+
+
+def _harness_task_snapshot(t: dict, full: bool = False) -> dict:
+    """把 Harness TaskSystem 的 flow/batch 任务映射成任务中心快照格式。
+
+    brief 列表（list_tasks）只有 progress/waiting_confirm；full 详情（status()）
+    才有 action 里的步骤/条目状态，可生成 steps 摘要。
+    """
+    st = t.get("state") or ""
+    status = {"pending": "queued", "running": "running", "succeeded": "done",
+              "failed": "error", "cancelled": "cancelled"}.get(st, st or "queued")
+    if t.get("waiting_confirm"):
+        status = "confirming"
+    steps: list[str] = []
+    if full:
+        act = t.get("action") or {}
+        if t.get("kind") == "flow":
+            ss = act.get("step_states") or {}
+            for sid, s in ss.items():
+                sst = s.get("state") if isinstance(s, dict) else ""
+                label = {"pending": "待执行", "running": "执行中", "succeeded": "✓ 完成",
+                         "failed": "✗ 失败", "cancelled": "已取消",
+                         "waiting_confirm": "⏳ 待确认"}.get(sst, sst)
+                steps.append(f"{sid}：{label}")
+        elif t.get("kind") == "batch":
+            is_ = act.get("item_states") or {}
+            total = len(act.get("items") or [])
+            ok = sum(1 for s in is_.values() if isinstance(s, dict) and s.get("state") == "succeeded")
+            fail = sum(1 for s in is_.values() if isinstance(s, dict) and s.get("state") == "failed")
+            steps.append(f"条目 {ok}/{total} 成功" + (f"，{fail} 失败" if fail else ""))
+    return {
+        "id": t.get("id"), "kind": t.get("kind"),
+        "channel": "harness", "title": t.get("name") or "Harness 任务",
+        "status": status, "brief": t.get("goal") or "",
+        "steps": steps, "logs": [],
+        "result": t.get("result") or "", "error": t.get("error") or "",
+        "confirm": bool(t.get("waiting_confirm")),
+        "extra": {"harness": True, "state": st, "progress": t.get("progress")},
+        "agent": {"name": "Harness 流程", "icon": "⚙️", "color": "#7c6cf0",
+                  "desc": "Harness 长任务/流程/批量执行器"},
+        "created_at": int((t.get("created_at") or 0) * 1000),
+        "updated_at": int((t.get("finished_at") or t.get("created_at") or 0) * 1000),
+        "progress": t.get("progress"),
+    }
+
+
+@app.get("/api/tasks")
+async def task_center_list():
+    """任务中心列表（全部通道：DSH/Codex/OpenCode/后台命令 + Harness 长任务/流程/批量）。"""
+    orch = get_orchestrator()
+    tasks = orch.list(limit=50)
+    # 合并 Harness TaskSystem 的 flow/batch 任务（统一映射：进度/步骤/待确认）
+    try:
+        h = _harness()
+        for t in h.tasks.list_tasks(limit=50):
+            if t.get("kind") not in ("flow", "batch"):
+                continue
+            tasks.append(_harness_task_snapshot(t))
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 合并 Harness 任务失败: {e}")
+    tasks.sort(key=lambda x: -(x.get("created_at") or 0))
+    return {"ok": True, "tasks": tasks[:50]}
+
+
+@app.get("/api/tasks/{task_id}")
+async def task_center_get(task_id: str):
+    orch = get_orchestrator()
+    task = orch.get(task_id)
+    if task is not None:
+        return {"ok": True, "task": task.snapshot(full=True)}
+    # 回退：Harness TaskSystem 的 flow/batch 任务（详情含步骤/条目状态）
+    try:
+        ht = _harness().tasks.status(task_id)
+        if ht is not None and ht.get("kind") in ("flow", "batch"):
+            return {"ok": True, "task": _harness_task_snapshot(ht, full=True)}
+    except Exception as e:
+        logger.warning(f"[TaskCenter] Harness 任务详情回退失败: {e}")
+    raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+
+@app.get("/api/tasks/{task_id}/trace")
+async def task_center_trace(task_id: str, after: int = 0, limit: int = 500):
+    """下钻接口：返回 codex/opencode 任务的已解析执行明细（工具/参数/输出/耗时）。
+    数据直接来自 codex_logs/<task_id>.log（文件即事实源），带全局 seq 可分页回补。
+    """
+    try:
+        res = codex_runner.get_task_trace(task_id, after=after, limit=min(int(limit), 2000))
+    except Exception as e:
+        logger.warning(f"[TaskCenter] trace 读取失败 {task_id}: {e}")
+        res = None
+    if not res:
+        raise HTTPException(status_code=404, detail="该任务没有可追溯的执行明细（仅 codex/opencode 任务支持）")
+    return {"ok": True, **res}
+
+
+@app.get("/api/tasks/{task_id}/log")
+async def task_center_log(task_id: str, offset: int = 0, max_lines: int = 1000):
+    """原始日志追读：与 trace 同源（codex_logs/<task_id>.log），按字节偏移取尾部。"""
+    try:
+        res = codex_runner.get_task_log_tail(task_id, offset=offset, max_lines=min(int(max_lines), 5000))
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 原始日志读取失败 {task_id}: {e}")
+        res = None
+    if not res:
+        raise HTTPException(status_code=404, detail="该任务没有原始日志（仅 codex/opencode 任务支持）")
+    return {"ok": True, **res}
+
+
+@app.post("/api/tasks/{task_id}/confirm")
+async def task_center_confirm(task_id: str, payload: dict):
+    """用户确认/拒绝某个任务。approve=true → 执行；false → 取消。
+
+    所有通道共用同一闸门：确认通过后，若该任务登记了待执行器（codex/opencode），
+    立刻真正启动；拒绝则丢弃待执行器，保证绝不执行。
+    """
+    orch = get_orchestrator()
+    task = await orch.confirm(task_id, bool(payload.get("approve")))
+    if task is None:
+        # 回退：Harness TaskSystem 的 flow/batch 任务（approve/reject 等待确认的步骤）
+        try:
+            ts = _harness().tasks
+            note = str(payload.get("note") or "")
+            if payload.get("approve"):
+                ok, msg = ts.approve_step(task_id, note)
+            else:
+                ok, msg = ts.reject_step(task_id, note)
+            if ok:
+                return {"ok": True, "task_id": task_id, "status": "queued" if payload.get("approve") else "cancelled"}
+        except Exception as e:
+            logger.warning(f"[TaskCenter] Harness 任务确认回退失败: {e}")
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if payload.get("approve"):
+        await _launch_if_pending(task_id)
+    else:
+        _drop_pending(task_id)
+    return {"ok": True, "task_id": task.id, "status": task.status}
+
+
+@app.post("/api/tasks/{task_id}/kill")
+async def task_center_kill(task_id: str):
+    """中断一个执行中任务（DSH 会话取消 / 后台命令 kill / 待确认委派丢弃）。"""
+    orch = get_orchestrator()
+    task = orch.get(task_id)
+    if task is None:
+        # 回退：Harness TaskSystem 的 flow/batch 任务（cancel 中断整个流程/批量）
+        try:
+            if _harness().tasks.cancel(task_id):
+                return {"ok": True, "task_id": task_id, "status": "cancelled"}
+        except Exception as e:
+            logger.warning(f"[TaskCenter] Harness 任务中断回退失败: {e}")
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+
+    def cancel_fn(t):
+        if t.kind == "dsh":
+            import codex_runner  # noqa: F401  保证模块已加载（dshell 共用）
+            from harness_bridge import get_bridge as _gb
+            return _gb().cancel((t.extra or {}).get("cwd"))
+        if t.kind == "codex-tool":
+            _drop_pending(t.id)  # 待确认委派：丢弃待执行器，绝不执行
+            # 已运行的独立进程任务：按注册表整树终止（taskkill /T）
+            return codex_runner.kill_task(t.id) if t.status == STATUS_RUNNING else None
+        if t.kind == "media-worker":
+            wid = (t.extra or {}).get("worker_id") or ""
+            if wid:
+                return _get_media_workers().cancel(wid, reason="用户在任务中心取消")
+            return None
+        if t.kind == "sub-agent":
+            wid = (t.extra or {}).get("worker_id") or ""
+            if wid:
+                return _get_sub_agents().cancel(wid, reason="用户在任务中心取消")
+            return None
+        return None
+
+    await orch.cancel(task_id, cancel_fn)
+    return {"ok": True, "task_id": task_id, "status": task.status}
+
+
+@app.post("/api/tasks/clear")
+async def task_center_clear():
+    """批量清除所有已完成/失败/已取消的终态任务（任务中心「清除已完成」按钮）。
+
+    双源清理：内存 orchestrator + Harness TaskSystem（含持久化日志），
+    避免清除后轮询刷新又恢复。
+    """
+    orch = get_orchestrator()
+    n = orch.clear_finished()
+    try:
+        h = _harness()
+        n += h.tasks.clear_finished()
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 清除 Harness 任务失败: {e}")
+    return {"ok": True, "cleared": n}
+
+
+# ---------- DSH 桥接（兼容旧前端确认卡片，引擎已迁移到任务中心） ----------
+
+@app.get("/api/bridge/info")
+async def harness_bridge_info():
+    bridge = get_bridge()
+    reachable = await asyncio.to_thread(bridge.ping)
+    orch = get_orchestrator()
+    active = [t.snapshot(full=True) for t in orch.list(50)
+              if t["status"] in (STATUS_CONFIRMING, STATUS_QUEUED, STATUS_RUNNING)]
+    return {
+        "ok": True,
+        "reachable": reachable,
+        "config": bridge.config_view(),
+        "pending": active,
+    }
+
+
+@app.post("/api/bridge/confirm")
+async def harness_bridge_confirm(payload: dict):
+    request_id = str(payload.get("request_id") or "")
+    approve = bool(payload.get("approve"))
+    orch = get_orchestrator()
+    task = await orch.confirm(request_id, approve)
+    if task is None or task.id != request_id:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if approve:
+        await _launch_if_pending(request_id)
+    else:
+        _drop_pending(request_id)
+    # 兼容推送旧卡片状态
+    await safe_send_json(task.ws, {
+        "type": "bridge_status",
+        "request_id": task.id,
+        "task": task.brief,
+        "status": _legacy(task),
+        "reply": task.result,
+        "error": task.error,
+    }) if task.ws else None
+    return {"ok": True, "request_id": request_id, "status": _legacy(task)}
+
+
+@app.get("/api/bridge/status")
+async def harness_bridge_status(request_id: str):
+    orch = get_orchestrator()
+    task = orch.get(request_id)
+    if task is None:
+        return {"ok": False, "reason": "not_found"}
+    return {
+        "ok": True,
+        "request_id": task.id,
+        "task": task.brief,
+        "status": _legacy(task),
+        "reply": task.result,
+        "error": task.error,
+    }
+
+
+@app.post("/api/bridge/cancel")
+async def harness_bridge_cancel(payload: dict):
+    request_id = str(payload.get("request_id") or "")
+    orch = get_orchestrator()
+    task = orch.get(request_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    if task.kind == "codex-tool":
+        # codex/opencode：未开始（待确认）则丢弃待执行器；已运行交给任务中心 kill
+        _drop_pending(request_id)
+        await orch.cancel(request_id)
+    else:
+        from harness_bridge import get_bridge as _gb
+        await orch.cancel(request_id, lambda t: _gb().cancel((t.extra or {}).get("cwd")))
+    return {"ok": True, "cancelled": True, "request_id": request_id}
+
+
+@app.post("/api/bridge/say")
+async def harness_bridge_say(payload: dict):
+    """反向通道：DSH 侧（我）通过它让「大白」对用户说一句话 / 递一条消息。
+
+    白名单防滥用：仅接受纯文本，最长 2000 字；推送给所有已连接前端。
+    """
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text 不能为空")
+    text = text[:2000]
+    for ws in list(manager.active):
+        await safe_send_json(ws, {"type": "bridge_say", "text": text})
+    logger.info(f"[Bridge] 反向上行消息已推送: {text[:60]}")
+    return {"ok": True}
+
 
 
 # ---------- 角色卡片 ----------
@@ -700,32 +2225,414 @@ def _save_role_config(role_name: str, system_prompt: str, user_name: str = "", t
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-# ---------- 大语言模型（LLM）配置 ----------
+# ---------- 大语言模型（LLM）供应商（全局资源） ----------
+# 供应商注册表：任意数量的模型供应商（Ollama 本地 / 自定义 OpenAI 兼容 API）作为
+# 全局资源统一管理。角色卡片只引用「供应商 id + 模型名」，不再各自存 base_url/api_key，
+# 避免"选 Ollama 本地却加载自定义 API 模型"这类串配置问题。
+LLM_PROVIDER_KINDS = ("ollama", "custom")
+LLM_PROVIDER_KIND_LABELS = {"ollama": "Ollama 本地", "custom": "自定义 API"}
+
+
+def _llm_provider_meta(provider: dict) -> dict:
+    """供应商出参（纯凭证存储：名称/类型/地址/密钥/默认模型）。"""
+    return {
+        "id": provider.get("id", ""),
+        "name": provider.get("name", ""),
+        "kind": provider.get("kind", "custom"),
+        "base_url": provider.get("base_url", ""),
+        "api_key": provider.get("api_key", ""),
+        "default_model": provider.get("default_model", ""),
+    }
+def _ensure_llm_providers(cfg: dict) -> list:
+    """规范化 settings.json 的供应商注册表（llm_providers 列表）。
+
+    兼容旧配置迁移：
+    - 旧 llm_profiles（ollama/custom 双档位）→ 播种为两个供应商
+    - 顶层旧 base_url/model/api_key → 兜底播种一个供应商
+    """
+    providers = cfg.get("llm_providers")
+    if not isinstance(providers, list):
+        providers = []
+    norm = []
+    seen = set()
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id") or "").strip() or ("prov-" + uuid.uuid4().hex[:8])
+        if pid in seen:
+            continue
+        seen.add(pid)
+        kind = str(p.get("kind") or "").strip()
+        if kind not in LLM_PROVIDER_KINDS:
+            base = str(p.get("base_url") or "").strip()
+            kind = "ollama" if (":11434" in base or str(p.get("api_key") or "").lower() == "ollama") else "custom"
+        norm.append({
+            "id": pid,
+            "name": str(p.get("name") or LLM_PROVIDER_KIND_LABELS.get(kind, kind)).strip(),
+            "kind": kind,
+            "base_url": str(p.get("base_url") or "").strip(),
+            "api_key": str(p.get("api_key") or "").strip(),
+            "default_model": str(p.get("default_model") or "").strip(),
+        })
+    if not norm:
+        profiles = cfg.get("llm_profiles")
+        if isinstance(profiles, dict):
+            for kind, prof in profiles.items():
+                if not isinstance(prof, dict):
+                    continue
+                base = str(prof.get("base_url") or "").strip()
+                model = str(prof.get("model") or "").strip()
+                if not (base or model):
+                    continue
+                k = kind if kind in LLM_PROVIDER_KINDS else ("ollama" if ":11434" in base else "custom")
+                # 迁移用稳定 id：每次 GET 都得到同一供应商 id，前端/卡片引用不会漂移
+                pid = "prov-" + k
+                while pid in seen:
+                    pid = "prov-" + k + "-" + uuid.uuid4().hex[:6]
+                seen.add(pid)
+                norm.append({
+                    "id": pid,
+                    "name": LLM_PROVIDER_KIND_LABELS.get(k, k),
+                    "kind": k,
+                    "base_url": base,
+                    "api_key": str(prof.get("api_key") or "").strip(),
+                    "default_model": model,
+                })
+        if not norm:
+            legacy_base = str(cfg.get("base_url") or "").strip()
+            legacy_model = str(cfg.get("model") or "").strip()
+            if legacy_base or legacy_model:
+                k = "ollama" if (":11434" in legacy_base or str(cfg.get("api_key") or "").lower() == "ollama") else "custom"
+                pid = "prov-" + k
+                while pid in seen:
+                    pid = "prov-" + k + "-" + uuid.uuid4().hex[:6]
+                seen.add(pid)
+                norm.append({
+                    "id": pid,
+                    "name": LLM_PROVIDER_KIND_LABELS.get(k, k),
+                    "kind": k,
+                    "base_url": legacy_base,
+                    "api_key": str(cfg.get("api_key") or "").strip(),
+                    "default_model": legacy_model,
+                })
+    # Ollama 本地 api_key 留空补占位符（Ollama 认证随意，但 codex_runner 要求非空）
+    for p in norm:
+        if p["kind"] == "ollama" and not p["api_key"]:
+            p["api_key"] = "ollama"
+    cfg["llm_providers"] = norm
+    return norm
+def _sync_llm_legacy_mirror(cfg: dict, provider: dict):
+    """把激活供应商同步到旧式镜像字段，供 agent / codex / STT 等既有读取路径使用。
+
+    - 顶层 base_url / model / api_key：agent.py 每次 reload 时读取生效字段
+    - llm_profiles[kind] + llm_provider：codex_runner 等按档位回退读取
+    """
+    p = _llm_provider_meta(provider)
+    kind = p["kind"]
+    cfg.setdefault("llm_profiles", {})
+    cfg["llm_profiles"][kind] = {
+        "base_url": p["base_url"],
+        "model": p["default_model"],
+        "api_key": p["api_key"],
+    }
+    cfg["llm_provider"] = kind
+    cfg["base_url"] = p["base_url"]
+    cfg["model"] = p["default_model"]
+    cfg["api_key"] = p["api_key"]
+
+
+
+
+def _active_provider(cfg: dict) -> Optional[dict]:
+    """返回当前激活供应商（llm_provider_id 优先；兼容旧 llm_provider kind）。"""
+    providers = _ensure_llm_providers(cfg)
+    if not providers:
+        return None
+    active_id = str(cfg.get("llm_provider_id") or "").strip()
+    if active_id:
+        for p in providers:
+            if p["id"] == active_id:
+                return p
+    kind = str(cfg.get("llm_provider") or "").strip()
+    if kind:
+        for p in providers:
+            if p["kind"] == kind:
+                return p
+    # 首次启动：激活第一个有 base_url 的供应商
+    for p in providers:
+        if p["base_url"]:
+            return p
+    return providers[0]
+
+
+def _load_settings() -> dict:
+    with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_settings(cfg: dict):
+    with open(BASE_DIR / "settings.json", "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+async def _reload_shared_agents() -> int:
+    """热重载全部共享 Agent 的 LLM 客户端，切换/修改供应商即时生效。"""
+    n = 0
+    for ag in list(_shared_agents.values()):
+        try:
+            await ag.reload_llm_config()
+            n += 1
+        except Exception as e:
+            logger.warning(f"重载 Agent LLM 配置失败: {e}")
+    return n
+
+
+def _providers_payload(cfg: dict) -> dict:
+    """供应商列表 + 当前激活信息 + 温度（供前端回填）。"""
+    providers = _ensure_llm_providers(cfg)
+    active = _active_provider(cfg)
+    providers_out = []
+    for p in providers:
+        item = _llm_provider_meta(p)
+        item["_active"] = bool(active and p["id"] == active["id"])
+        providers_out.append(item)
+    return {
+        "providers": providers_out,
+        "active_id": active["id"] if active else "",
+        "temperature": cfg.get("temperature", 0.2),
+    }
+
+
 @app.get("/api/llm/config")
 async def llm_config_get():
-    """获取当前大语言模型配置（base_url / model / api_key），供角色卡片表单回填默认值。"""
+    """获取 LLM 供应商概况：供应商列表 + 当前激活 + 全局温度。"""
     try:
-        cfg = load_config()
-        return {
-            "base_url": cfg.get("base_url", ""),
-            "model": cfg.get("model", ""),
-            "api_key": cfg.get("api_key", ""),
-        }
+        cfg = _load_settings()
+        payload = _providers_payload(cfg)
+        payload["kind_labels"] = LLM_PROVIDER_KIND_LABELS
+        payload["base_url"] = cfg.get("base_url", "")
+        payload["model"] = cfg.get("model", "")
+        payload["api_key"] = cfg.get("api_key", "")
+        return payload
     except Exception as e:
-        return {"base_url": "", "model": "", "api_key": "", "error": str(e)}
+        return {"providers": [], "active_id": "", "temperature": 0.2, "error": str(e)}
 
 
-@app.get("/api/llm/models")
-async def llm_models_list(base_url: str = "", api_key: str = ""):
-    """从模型提供方自动加载可用模型列表（OpenAI 兼容 /models 接口）。
+@app.post("/api/llm/config")
+async def llm_config_set(payload: dict):
+    """保存 LLM 全局配置：激活指定供应商 / 更新温度。
 
-    未传 base_url / api_key 时回退到 settings.json 中的全局默认配置。
+    payload（均可选）：
+      provider_id: 激活该供应商（立即全局生效，热重载 Agent）
+      provider:     兼容旧档位名 ollama|custom（激活对应 kind 的第一个供应商）
+      temperature:  全局采样温度
+      providers:    兼容旧双档位 dict {kind: {base_url, model, api_key}} → 更新同 kind 供应商
     """
-    cfg = load_config()
-    base_url = (base_url or "").strip() or (cfg.get("base_url") or "").strip()
-    api_key = (api_key or "").strip() or (cfg.get("api_key") or "").strip()
-    if not base_url or not api_key:
-        return {"models": [], "error": "缺少 base_url 或 api_key"}
+    cfg = _load_settings()
+    providers = _ensure_llm_providers(cfg)
+    legacy_incoming = payload.get("providers")
+    if isinstance(legacy_incoming, dict):
+        for kind, prof in legacy_incoming.items():
+            if not isinstance(prof, dict) or kind not in LLM_PROVIDER_KINDS:
+                continue
+            target = next((p for p in providers if p["kind"] == kind), None)
+            if target is None:
+                target = {
+                    "id": "prov-" + kind + "-" + uuid.uuid4().hex[:6],
+                    "name": LLM_PROVIDER_KIND_LABELS.get(kind, kind),
+                    "kind": kind,
+                    "base_url": "",
+                    "api_key": "",
+                    "default_model": "",
+                }
+                providers.append(target)
+            for k, field in (("base_url", "base_url"), ("model", "default_model"),
+                             ("api_key", "api_key")):
+                if k in prof and prof[k] is not None:
+                    target[field] = str(prof[k]).strip()
+        cfg["llm_providers"] = providers
+    provider_id = str(payload.get("provider_id") or "").strip()
+    if not provider_id:
+        legacy_kind = str(payload.get("provider") or "").strip()
+        if legacy_kind in LLM_PROVIDER_KINDS:
+            t = next((p for p in providers if p["kind"] == legacy_kind), None)
+            if t:
+                provider_id = t["id"]
+    if provider_id:
+        target = next((p for p in providers if p["id"] == provider_id), None)
+        if target is None:
+            raise HTTPException(400, f"供应商不存在: {provider_id}")
+        active = _active_provider(cfg)
+        if not active or active["id"] != provider_id:
+            # 激活该供应商：LLM 凭证写入全局（model 用卡片/默认模型）
+            cfg["llm_provider_id"] = provider_id
+            _sync_llm_legacy_mirror(cfg, target)
+    if temperature is not None and temperature != "":
+        try:
+            cfg["temperature"] = round(max(0.0, min(2.0, float(temperature))), 2)
+        except (TypeError, ValueError):
+            pass
+    if not cfg.get("llm_provider_id"):
+        active = _active_provider(cfg)
+        if active:
+            cfg["llm_provider_id"] = active["id"]
+            _sync_llm_legacy_mirror(cfg, active)
+    _save_settings(cfg)
+    reloaded = await _reload_shared_agents()
+    out = _providers_payload(cfg)
+    out["reloaded"] = reloaded
+
+    active = _active_provider(cfg)
+    logger.info(
+        f"LLM 供应商已切换: {active['name'] if active else '?'} "
+        f"model={cfg.get('model', '')} 重载Agent={reloaded}"
+    )
+    return out
+
+
+@app.get("/api/llm/providers")
+async def llm_providers_list():
+    """供应商列表（全局资源）+ 当前激活 + 温度。"""
+    try:
+        return {"code": 200, **_providers_payload(_load_settings())}
+    except Exception as e:
+        return JSONResponse({"code": 500, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/llm/providers")
+async def llm_providers_create(payload: dict):
+    """新建供应商（全局资源）。body: {name, kind, base_url, api_key, default_model, activate?}"""
+    kind = str(payload.get("kind") or "").strip() or "custom"
+    if kind not in LLM_PROVIDER_KINDS:
+        raise HTTPException(400, f"未知供应商类型: {kind}（可选 ollama/custom）")
+    name = str(payload.get("name") or "").strip() or LLM_PROVIDER_KIND_LABELS.get(kind, kind)
+    provider = {
+        "id": "prov-" + uuid.uuid4().hex[:8],
+        "name": name,
+        "kind": kind,
+        "base_url": str(payload.get("base_url") or "").strip(),
+        "api_key": str(payload.get("api_key") or "").strip(),
+        "default_model": str(payload.get("default_model") or "").strip(),
+    }
+    if provider["kind"] == "ollama" and not provider["api_key"]:
+        provider["api_key"] = "ollama"
+    cfg = _load_settings()
+    providers = _ensure_llm_providers(cfg)
+    providers.append(provider)
+    cfg["llm_providers"] = providers
+    active = _active_provider(cfg)
+    should_activate = (not active) or bool(payload.get("activate"))
+    if should_activate:
+        # 新建即启用：把该供应商设为当前 LLM
+        cfg["llm_provider_id"] = provider["id"]
+        _sync_llm_legacy_mirror(cfg, provider)
+    _save_settings(cfg)
+    reloaded = await _reload_shared_agents() if should_activate else 0
+    new_active = _active_provider(cfg)
+    return {
+        "ok": True,
+        "provider": _llm_provider_meta(provider),
+        "active_id": new_active["id"] if new_active else "",
+        "reloaded": reloaded,
+    }
+
+
+@app.put("/api/llm/providers/{pid}")
+async def llm_providers_update(pid: str, payload: dict):
+    """更新供应商字段（名称/类型/地址/密钥/默认模型）。修改地址后需重新选择模型。"""
+    cfg = _load_settings()
+    providers = _ensure_llm_providers(cfg)
+    target = next((p for p in providers if p["id"] == pid), None)
+    if target is None:
+        raise HTTPException(404, "供应商不存在")
+    if "name" in payload and str(payload.get("name") or "").strip():
+        target["name"] = str(payload["name"]).strip()
+    if "kind" in payload:
+        k = str(payload.get("kind") or "").strip()
+        if k in LLM_PROVIDER_KINDS:
+            target["kind"] = k
+    for k, field in (("base_url", "base_url"), ("api_key", "api_key"),
+                     ("default_model", "default_model")):
+        if k in payload and payload[k] is not None:
+            target[field] = str(payload[k]).strip()
+    if target["kind"] == "ollama" and not target["api_key"]:
+        target["api_key"] = "ollama"
+    cfg["llm_providers"] = providers
+    active = _active_provider(cfg)
+    is_active = bool(active and active["id"] == pid)
+    if is_active:
+        # 激活中的供应商被修改 → 重新同步生效配置
+        _sync_llm_legacy_mirror(cfg, target)
+    _save_settings(cfg)
+    reloaded = await _reload_shared_agents() if is_active else 0
+    return {"ok": True, "provider": _llm_provider_meta(target), "reloaded": reloaded}
+
+
+@app.delete("/api/llm/providers/{pid}")
+async def llm_providers_delete(pid: str):
+    """删除供应商。若删除的是当前激活供应商，自动激活剩余第一个。"""
+    cfg = _load_settings()
+    providers = _ensure_llm_providers(cfg)
+    remain = [p for p in providers if p["id"] != pid]
+    if len(remain) == len(providers):
+        raise HTTPException(404, "供应商不存在")
+    active = _active_provider(cfg)
+    was_active = bool(active and active["id"] == pid)
+    cfg["llm_providers"] = remain
+    reloaded = 0
+    if was_active or str(cfg.get("llm_provider_id") or "") == pid:
+        cfg["llm_provider_id"] = ""
+        nxt = _active_provider(cfg)
+        if nxt:
+            cfg["llm_provider_id"] = nxt["id"]
+            _sync_llm_legacy_mirror(cfg, nxt)
+            reloaded = await _reload_shared_agents()
+    _save_settings(cfg)
+    return {"ok": True, "active_id": cfg.get("llm_provider_id", ""), "reloaded": reloaded}
+
+
+@app.post("/api/llm/providers/{pid}/activate")
+async def llm_providers_activate(pid: str):
+    """把某供应商设为当前使用（立即全局生效，热重载 Agent）。"""
+    cfg = _load_settings()
+    providers = _ensure_llm_providers(cfg)
+    target = next((p for p in providers if p["id"] == pid), None)
+    if target is None:
+        raise HTTPException(404, "供应商不存在")
+    cfg["llm_provider_id"] = pid
+    _sync_llm_legacy_mirror(cfg, target)
+    _save_settings(cfg)
+    reloaded = await _reload_shared_agents()
+    return {"ok": True, "provider": _llm_provider_meta(target), "active_id": pid, "reloaded": reloaded}
+
+
+@app.post("/api/llm/providers/test")
+async def llm_providers_test(payload: dict):
+    """测试供应商连通性并拉取模型列表（不保存）。
+
+    body: {kind, base_url, api_key}；也接受 provider_id 直接测已存供应商。
+    """
+    kind = str(payload.get("kind") or "").strip()
+    base_url = str(payload.get("base_url") or "").strip()
+    api_key = str(payload.get("api_key") or "").strip()
+    pid = str(payload.get("provider_id") or "").strip()
+    if pid:
+        cfg = _load_settings()
+        providers = _ensure_llm_providers(cfg)
+        p = next((x for x in providers if x["id"] == pid), None)
+        if p is None:
+            return JSONResponse({"code": 404, "message": "供应商不存在"}, status_code=404)
+        kind = p["kind"]
+        base_url = base_url or p.get("base_url", "").strip()
+        api_key = api_key or p.get("api_key", "").strip()
+    if not base_url:
+        return {"models": [], "error": "缺少 Base URL"}
+    is_local_ollama = (":11434" in base_url or "localhost" in base_url or "127.0.0.1" in base_url)
+    if not api_key:
+        if is_local_ollama or kind == "ollama":
+            api_key = "ollama"
+        else:
+            return {"models": [], "error": "缺少 API Key"}
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
@@ -737,11 +2644,301 @@ async def llm_models_list(base_url: str = "", api_key: str = ""):
         return {"models": [], "error": str(e)}
 
 
+_NON_CHAT_MODEL_HINTS = (
+    "embedding", "embeddings", "reranker", "rerank", "retriever",
+    "bge-", "m3e", "gte-", "jina-embeddings",
+    "image", "img", "ocr", "asr", "captioner", "whisper", "speech",
+    "tts", "audio", "voice", "kolors", "cogview", "flux",
+    "stable-diffusion", "text2img", "text-to-image", "wan",
+)
+
+
+def _is_chat_model(model_id: str) -> bool:
+    """粗略判断某个模型 id 是否可用于聊天补全（过滤嵌入/重排/图像/OCR/ASR/TTS 等）。"""
+    mid = (model_id or "").lower()
+    return not any(h in mid for h in _NON_CHAT_MODEL_HINTS)
+
+
+@app.get("/api/llm/models")
+async def llm_models_list(provider: str = "", base_url: str = "", api_key: str = ""):
+    """严格按指定供应商加载可用模型列表（OpenAI 兼容 /models）。
+
+    - provider=供应商id：只从该供应商的 base_url 拉取，绝不串用其它供应商配置
+      （修复"选了 Ollama 本地却加载自定义 API 模型"的串配置问题）
+    - 旧调用方式（显式 base_url + api_key）：仅当未传 provider 时按显式地址拉取
+    - 两者都缺 → 报错提示，绝不回退到全局 base_url（那正是串配置的根源）
+    """
+    pid = (provider or "").strip()
+    base_url = (base_url or "").strip()
+    api_key = (api_key or "").strip()
+    if pid:
+        cfg = _load_settings()
+        providers = _ensure_llm_providers(cfg)
+        p = next((x for x in providers if x["id"] == pid), None)
+        if p is None:
+            return {"models": [], "error": f"供应商不存在: {pid}"}
+        base_url = p.get("base_url", "").strip()
+        api_key = p.get("api_key", "").strip()
+        if not base_url:
+            return {"models": [], "error": "该供应商未配置 Base URL，请先在「供应商」里补全"}
+    if not base_url:
+        return {"models": [], "error": "缺少 base_url：请先选择/配置供应商"}
+    is_local_ollama = (":11434" in base_url or "localhost" in base_url or "127.0.0.1" in base_url)
+    if not api_key:
+        if is_local_ollama:
+            api_key = "ollama"
+        else:
+            return {"models": [], "error": "缺少 api_key"}
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        names = []
+        async for m in client.models.list():
+            names.append(m.id)
+        names = sorted(names)
+        return {
+            # 只列出可用于对话的模型，避免在角色卡片里选中嵌入/图像/OCR 等
+            # 非聊天模型后，保存配置导致聊天 400「Model does not exist」。
+            "models": [m for m in names if _is_chat_model(m)],
+            "all_models": names,
+        }
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+
+# ---------- 工作区（全局工作目录：DSH / Codex / OpenCode / shell 共用） ----------
+def _workspace_current() -> dict:
+    """读取当前工作区：codex_config.json 的 work_dir 为准，兼读桥接 cwd。"""
+    cwd = ""
+    try:
+        with open(BASE_DIR / "codex_config.json", "r", encoding="utf-8") as f:
+            cj = json.load(f)
+        cwd = str((cj.get("agent") or {}).get("work_dir") or "").strip()
+    except Exception:
+        pass
+    bridge_cwd = ""
+    try:
+        with open(BASE_DIR / "harness_bridge.json", "r", encoding="utf-8") as f:
+            bj = json.load(f)
+        bridge_cwd = str(bj.get("cwd") or "").strip()
+    except Exception:
+        pass
+    return {
+        "cwd": cwd or bridge_cwd or str(Path.home()),
+        "codex_work_dir": cwd,
+        "bridge_cwd": bridge_cwd,
+    }
+
+
+@app.get("/api/workspace")
+async def workspace_get():
+    """获取当前工作区路径（持久化在 codex_config.json / harness_bridge.json）。"""
+    return _workspace_current()
+
+
+@app.post("/api/workspace")
+async def workspace_set(payload: dict):
+    """设置全局工作区：写入 codex_config.json 的 work_dir + harness_bridge.json 的 cwd，
+    并运行时同步 EXECUTOR/桥接配置 —— DSH、Codex、OpenCode、shell 全部围绕新工作区执行。
+    """
+    path = (payload.get("path") or payload.get("dir") or "").strip()
+    if not path:
+        raise HTTPException(400, "缺少 path")
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        raise HTTPException(404, f"目录不存在: {path}")
+    # 1) codex_config.json → agent.work_dir（Codex / OpenCode / shell EXECUTOR 的工作目录）
+    try:
+        cpath = BASE_DIR / "codex_config.json"
+        with open(cpath, "r", encoding="utf-8") as f:
+            cc = json.load(f)
+        cc.setdefault("agent", {})["work_dir"] = path
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump(cc, f, ensure_ascii=False, indent=2)
+        codex_runner.reload_relay_config()      # 热重载 AGENT_CFG + EXECUTOR.cwd
+        codex_runner.EXECUTOR.cwd = path        # 双保险：直接同步执行器
+    except Exception as e:
+        logger.warning(f"写入 codex_config.json 失败: {e}")
+        raise HTTPException(500, f"写入 codex 配置失败: {e}")
+    # 2) harness_bridge.json → cwd（DSH 智能体任务工作目录）
+    try:
+        bpath = BASE_DIR / "harness_bridge.json"
+        with open(bpath, "r", encoding="utf-8") as f:
+            hb = json.load(f)
+        hb["cwd"] = path
+        with open(bpath, "w", encoding="utf-8") as f:
+            json.dump(hb, f, ensure_ascii=False, indent=2)
+        # 运行时同步桥接实例配置（避免单例缓存旧 cwd）
+        try:
+            from harness_bridge import get_bridge as _gb_ws
+            _bridge_ws = _gb_ws()
+            if hasattr(_bridge_ws, "_file_cfg"):
+                _bridge_ws._file_cfg["cwd"] = path
+            if hasattr(_bridge_ws, "_session_ids"):
+                # 新工作区映射新会话，避免复用旧目录会话
+                _bridge_ws._session_ids = {}
+        except Exception as e:
+            logger.warning(f"运行时刷新 DSH 桥接 cwd 失败: {e}")
+    except Exception as e:
+        logger.warning(f"写入 harness_bridge.json 失败: {e}")
+        raise HTTPException(500, f"写入桥接配置失败: {e}")
+    logger.info(f"工作区已切换: {path}")
+    return {"ok": True, **_workspace_current()}
+
+
+@app.get("/api/workspace/roots")
+async def workspace_roots():
+    """列出可选工作区根目录（本地盘符 + 用户常用目录，手机端也可直接选）。"""
+    roots = []
+    home = Path.home()
+    for sub in ("Desktop", "Downloads", "Documents", "Videos", "Music", "Pictures"):
+        p = home / sub
+        if p.is_dir():
+            roots.append({"path": str(p), "label": sub})
+    for drv in ("C:\\", "D:\\", "E:\\", "F:\\"):
+        if os.path.isdir(drv):
+            roots.append({"path": drv, "label": drv})
+    cur = _workspace_current().get("cwd") or ""
+    if cur and cur not in [r["path"] for r in roots]:
+        roots.insert(0, {"path": cur, "label": "当前工作区"})
+    seen = set()
+    out = []
+    for r in roots:
+        if r["path"] not in seen:
+            seen.add(r["path"]); 
+            out.append(r)
+    return {"roots": out}
+
+
+@app.get("/api/workspace/list")
+async def workspace_list(path: str = ""):
+    """列出指定目录下的子目录（供手机端逐级下钻浏览目录）。
+
+    - path 为空 → 返回盘符/常用根目录（与 /api/workspace/roots 等价）
+    - 返回 {"path", "parent", "dirs": [{"name", "path"}, ...]}，dirs 按名称排序
+    - 权限不足/不存在 → 返回 {"path":..., "parent":..., "dirs": [], "error": ...} 不抛异常
+    """
+    def _readable_dirs(base: str) -> list:
+        out = []
+        try:
+            for entry in os.scandir(base):
+                try:
+                    if entry.is_dir(follow_symlinks=True):
+                        name = entry.name
+                        # 过滤系统/隐藏目录，减少手机端噪音
+                        if name.startswith(".") or name.startswith("$"):
+                            continue
+                        if name.lower() in ("windows", "system volume information", "recycler",
+                                            "$recycle.bin", "program files", "program files (x86)",
+                                            "node_modules", "__pycache__", "appdata"):
+                            continue
+                        out.append({"name": name, "path": entry.path})
+                except OSError:
+                    continue
+        except OSError as e:
+            return [], str(e)
+        out.sort(key=lambda x: x["name"].lower())
+        return out, None
+
+    base = (path or "").strip()
+    if not base:
+        roots = []
+        home = Path.home()
+        for sub in ("Desktop", "Downloads", "Documents", "Videos", "Music", "Pictures"):
+            q = home / sub
+            if q.is_dir():
+                roots.append({"name": sub, "path": str(q)})
+        BS = chr(92)  # 反斜杠
+        for drv in ("C:" + BS, "D:" + BS, "E:" + BS, "F:" + BS):
+            if os.path.isdir(drv):
+                roots.append({"name": drv.strip(BS) + "盘", "path": drv})
+        return {"path": "", "parent": "", "dirs": roots}
+
+    base = os.path.abspath(os.path.expanduser(base))
+    if not os.path.isdir(base):
+        return {"path": base, "parent": "", "dirs": [], "error": "目录不存在"}
+    dirs, err = _readable_dirs(base)
+    parent = os.path.dirname(base) if os.path.dirname(base) != base else ""
+    return {"path": base, "parent": parent, "dirs": dirs, "error": err}
+
+# 已保存工作区列表（多工作区收藏，独立持久化文件 workspace_saved.json）
+SAVED_WS_FILE = BASE_DIR / "workspace_saved.json"
+
+def _load_saved_workspaces() -> list:
+    try:
+        with open(SAVED_WS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        arr = data.get("workspaces") if isinstance(data, dict) else data
+        if isinstance(arr, list):
+            return [str(x.get("path", "")).strip() for x in arr if isinstance(x, dict) and str(x.get("path", "")).strip()]
+    except Exception:
+        pass
+    return []
+
+def _save_saved_workspaces(paths: list) -> None:
+    arr = [{"path": p} for p in paths]
+    try:
+        with open(SAVED_WS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"workspaces": arr}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存工作区列表失败: {e}")
+
+
+@app.get("/api/workspaces")
+async def workspaces_list():
+    """获取已保存的工作区列表 + 当前激活工作区。"""
+    saved = _load_saved_workspaces()
+    # 已保存但当前目录已不存在的，标记但保留（用户可删除）
+    items = []
+    for p in saved:
+        items.append({"path": p, "exists": os.path.isdir(p)})
+    return {"workspaces": items, "current": _workspace_current().get("cwd") or ""}
+
+
+@app.post("/api/workspaces")
+async def workspaces_add(payload: dict):
+    """把指定路径添加进已保存工作区列表（去重）。不切换当前工作区。"""
+    path = (payload.get("path") or payload.get("dir") or "").strip()
+    if not path:
+        raise HTTPException(400, "缺少 path")
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        raise HTTPException(404, f"目录不存在: {path}")
+    saved = _load_saved_workspaces()
+    if path not in saved:
+        saved.insert(0, path)
+        _save_saved_workspaces(saved)
+    return {"ok": True, "path": path, "workspaces": saved}
+
+
+@app.delete("/api/workspaces")
+async def workspaces_remove(payload: dict):
+    """从已保存列表移除指定路径（不删磁盘目录，只是不再收藏）。"""
+    path = (payload.get("path") or payload.get("dir") or "").strip()
+    if not path:
+        raise HTTPException(400, "缺少 path")
+    path = os.path.abspath(os.path.expanduser(path))
+    saved = _load_saved_workspaces()
+    if path in saved:
+        saved = [p for p in saved if p != path]
+        _save_saved_workspaces(saved)
+    return {"ok": True, "workspaces": saved}
+
+
+@app.post("/api/workspaces/{path:path}/activate")
+async def workspaces_activate(path: str):
+    """激活已保存的工作区（与 /api/workspace 设置当前一致，所有智能体围绕它执行）。"""
+    return await workspace_set({"path": path})
+
 
 @app.get("/api/character_cards")
 async def character_cards_list():
-    """获取所有角色卡片。"""
-    return {"cards": _load_character_cards()}
+    """获取所有角色卡片 + 当前服务端激活的卡片（单系统模式：以服务端为准）。"""
+    active_id = ""
+    try:
+        active_id = str(_load_settings().get("active_role_card") or "")
+    except Exception:
+        pass
+    return {"cards": _load_character_cards(), "active_id": active_id}
 
 
 @app.get("/api/config/role")
@@ -773,9 +2970,9 @@ async def tools_config_get():
 
 @app.get("/api/tools")
 async def tools_list():
-    """返回当前所有可用工具（本地 + MCP），供角色卡片配置工具白名单。"""
+    """返回当前所有可用工具（本地 + harness 技能/插件），供角色卡片配置工具白名单。"""
     tools = get_available_tools()
-    # 补充 MCP 工具（需 shared agent 已初始化）
+    # 补充 agent 已加载的工具（本地 + harness 技能/插件，全部 skill 化）
     try:
         ag = await get_shared_agent("default")
         seen = {t["name"] for t in tools}
@@ -787,22 +2984,29 @@ async def tools_list():
                 tools.append({
                     "name": name,
                     "description": fn.get("description", ""),
-                    "source": "mcp",
+                    "source": "skill",
                 })
     except Exception as e:
-        logger.warning(f"获取 MCP 工具列表失败: {e}")
+        logger.warning(f"获取工具列表失败: {e}")
     return {"tools": tools}
 
 
 def _normalize_card_tts(payload_tts: dict) -> dict:
-    """归一化卡片 TTS 字段，缺省沿用当前全局 TTS 配置。"""
+    """归一化卡片 TTS 字段，缺省沿用当前全局 TTS 配置。
+
+    API 供应商 TTS（engine=api）的地址/密钥/模型/音色也是卡片级应用配置。
+    """
     return {
         "engine": payload_tts.get("engine", tts_config.get("engine", "edge_tts")),
-        "edge_voice": payload_tts.get("edge_voice", tts_config.get("edge_voice", "")),
+        "edge_voice": payload_tts.get("edge_voice", tts_config.get("edge_voice", "")) or DEFAULT_VOICE,
         "edge_rate": payload_tts.get("edge_rate", tts_config.get("edge_rate", "+8%")),
         "gptsovits_url": payload_tts.get("gptsovits_url", tts_config.get("gptsovits_url", "")),
         "gptsovits_ref_audio": payload_tts.get("gptsovits_ref_audio", tts_config.get("gptsovits_ref_audio", "")),
         "gptsovits_character": payload_tts.get("gptsovits_character", tts_config.get("gptsovits_character", "")),
+        "api_url": payload_tts.get("api_url", tts_config.get("api_url", "")),
+        "api_key": payload_tts.get("api_key", tts_config.get("api_key", "")),
+        "api_model": payload_tts.get("api_model", tts_config.get("api_model", "")),
+        "api_voice": payload_tts.get("api_voice", tts_config.get("api_voice", "")),
     }
 
 
@@ -814,14 +3018,51 @@ def _normalize_card_tools(payload_tools: dict) -> dict:
     }
 
 
-def _normalize_card_llm(payload_llm: dict) -> dict:
-    """归一化卡片 LLM 字段：空串 = 未配置，应用时沿用全局默认配置。"""
-    payload_llm = payload_llm or {}
+def _normalize_card_animations(payload_animations: dict) -> dict:
+    """归一化卡片专属动作配置：是否启用 + 允许的动作名列表（空列表=全部动作）。
+
+    未配置（None/缺失）时返回 None，前端按"未配置 → 执行所有动作"处理。
+    """
+    if not isinstance(payload_animations, dict):
+        return None
     return {
-        "model": (payload_llm.get("model") or "").strip(),
-        "base_url": (payload_llm.get("base_url") or "").strip(),
-        "api_key": (payload_llm.get("api_key") or "").strip(),
+        "enabled": bool(payload_animations.get("enabled", True)),
+        "allowed": list(payload_animations.get("allowed", []) or []),
     }
+
+
+def _normalize_card_llm(payload_llm: dict) -> dict:
+    """归一化卡片 LLM 字段：卡片只存「供应商 + 模型名 + 温度」。
+
+    供应商的 base_url/api_key 统一取自全局供应商注册表（全球资源），卡片不再各自
+    存一套地址——彻底避免"Ollama 本地串用自定义 API 配置"。
+
+    兼容旧字段：provider / base_url / api_key 若传入则原样保留（旧卡迁移信息，
+    应用时按 base_url 匹配供应商）；前端新保存时只写 provider_id / model / temperature。
+    """
+    payload_llm = payload_llm or {}
+    temperature = payload_llm.get("temperature")
+    if temperature is None or temperature == "":
+        temperature = None
+    else:
+        try:
+            temperature = round(max(0.0, min(2.0, float(temperature))), 2)
+        except (TypeError, ValueError):
+            temperature = None
+    out = {
+        "provider_id": (payload_llm.get("provider_id") or "").strip(),
+        "model": (payload_llm.get("model") or "").strip(),
+        "temperature": temperature,
+    }
+    # 卡片一旦声明了供应商（provider_id），就不再携带自己的 base_url/api_key，
+    # 应用时统一从全局供应商注册表取地址/密钥；否则旧卡遗留的迁移字段会被一直带下去，
+    # 造成“选了新供应商却残留旧地址/旧密钥”的串配置。
+    if not out["provider_id"]:
+        for legacy in ("provider", "base_url", "api_key"):
+            v = payload_llm.get(legacy)
+            if isinstance(v, str) and v.strip():
+                out[legacy] = v.strip()
+    return out
 
 
 @app.post("/api/character_cards")
@@ -834,12 +3075,14 @@ async def character_cards_create(payload: dict):
         "id": uuid.uuid4().hex[:12],
         "name": name,
         "role_name": (payload.get("role_name") or "").strip(),
+        "wake_word": (payload.get("wake_word") or "").strip(),
         "user_name": (payload.get("user_name") or "").strip(),
         "model_url": payload.get("model_url", ""),
         "model_name": payload.get("model_name", ""),
         "system_prompt": payload.get("system_prompt", ""),
         "tts": _normalize_card_tts(payload.get("tts", {})),
         "tools": _normalize_card_tools(payload.get("tools", {})),
+        "animations": _normalize_card_animations(payload.get("animations")),
         "llm": _normalize_card_llm(payload.get("llm", {})),
         "created_at": int(time.time()),
     }
@@ -860,6 +3103,8 @@ async def character_cards_update(card_id: str, payload: dict):
             card["name"] = (payload.get("name") or "").strip()
         if "role_name" in payload:
             card["role_name"] = (payload.get("role_name") or "").strip()
+        if "wake_word" in payload:
+            card["wake_word"] = (payload.get("wake_word") or "").strip()
         if "user_name" in payload:
             card["user_name"] = (payload.get("user_name") or "").strip()
         if "model_url" in payload:
@@ -872,6 +3117,8 @@ async def character_cards_update(card_id: str, payload: dict):
             card["tts"] = _normalize_card_tts({**card.get("tts", {}), **payload["tts"]})
         if "tools" in payload:
             card["tools"] = _normalize_card_tools({**card.get("tools", {}), **payload["tools"]})
+        if "animations" in payload:
+            card["animations"] = _normalize_card_animations(payload["animations"])
         if "llm" in payload:
             card["llm"] = _normalize_card_llm({**card.get("llm", {}), **payload["llm"]})
         _save_character_cards(cards)
@@ -907,6 +3154,20 @@ async def character_cards_apply(card_id: str):
     card = next((c for c in cards if c.get("id") == card_id), None)
     if not card:
         raise HTTPException(404, "卡片不存在")
+    # 检测人设是否变化：系统提示词或角色名变了 → 开全新会话，
+    # 避免旧会话历史把人设带偏，让新系统提示词立即生效
+    persona_changed = False
+    try:
+        with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
+            _prev_cfg = json.load(f)
+        new_prompt = (card.get("system_prompt") or "").strip()
+        new_role = (card.get("role_name") or card.get("name") or "AI助手").strip()
+        persona_changed = (
+            (_prev_cfg.get("system_prompt") or "").strip() != new_prompt
+            or (_prev_cfg.get("role_name") or "").strip() != new_role
+        )
+    except Exception:
+        persona_changed = True
     # 1. 更新 settings.json 角色名 + 系统提示词 + 用户称呼 + 工具配置（agent 每次对话动态读取，即时生效）
     _save_role_config(
         (card.get("role_name") or card.get("name") or "AI助手").strip(),
@@ -914,35 +3175,69 @@ async def character_cards_apply(card_id: str):
         (card.get("user_name") or "").strip(),
         card.get("tools"),
     )
-    # 2. 更新 TTS 配置
+    # 2. 更新 TTS 配置（空 edge_voice 不覆盖全局，防止 Invalid voice）
     tts = card.get("tts", {})
-    for k in ("engine", "edge_voice", "edge_rate",
-              "gptsovits_url", "gptsovits_ref_audio", "gptsovits_character"):
-        if k in tts:
+    for k in ("engine", "edge_rate",
+              "gptsovits_url", "gptsovits_ref_audio", "gptsovits_character",
+              "api_url", "api_key", "api_model", "api_voice"):
+        if k in tts and (tts[k] or k == "engine"):
             tts_config[k] = tts[k]
-    if tts.get("edge_voice"):
+            tts_config[k] = tts[k]
+    if (tts.get("edge_voice") or "").strip():
+        tts_config["edge_voice"] = tts["edge_voice"].strip()
         global _edge_voices_cache
         _edge_voices_cache = None
+    if not (tts_config.get("edge_voice") or "").strip():
+        tts_config["edge_voice"] = DEFAULT_VOICE
     _save_tts_config({k: tts_config[k] for k in DEFAULT_TTS_CONFIG})
-    # 3. 更新 LLM 配置（settings.json + 运行时 agent 客户端），未配置字段沿用全局默认
+    # 3. 更新 LLM 配置（settings.json + 运行时 agent 客户端）
+    # 卡片只声明供应商（provider_id）+ 模型名；供应商的 base_url/api_key 取自全局
+    # 注册表，绝不在卡片里各自存一套（避免 Ollama 串用自定义 API 配置）。
+    # 兼容旧卡：provider（档位名）/ base_url / api_key 作为迁移信息匹配供应商。
     llm = card.get("llm") or {}
+    llm_provider_id = (llm.get("provider_id") or "").strip()
     llm_model = (llm.get("model") or "").strip()
-    llm_base_url = (llm.get("base_url") or "").strip()
-    llm_api_key = (llm.get("api_key") or "").strip()
-    if llm_model or llm_base_url or llm_api_key:
+    llm_temperature = llm.get("temperature")
+    legacy_provider = (llm.get("provider") or "").strip()
+    legacy_base_url = (llm.get("base_url") or "").strip()
+    legacy_api_key = (llm.get("api_key") or "").strip()
+    if (llm_provider_id or llm_model or legacy_provider or legacy_base_url
+            or legacy_api_key or llm_temperature is not None):
         try:
-            with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
-                _cfg = json.load(f)
+            _cfg = _load_settings()
+            providers = _ensure_llm_providers(_cfg)
+            prov = None
+            if llm_provider_id:
+                prov = next((p for p in providers if p["id"] == llm_provider_id), None)
+            if prov is None and legacy_base_url:
+                matches = [p for p in providers
+                           if (p.get("base_url") or "").strip() == legacy_base_url]
+                if len(matches) == 1:
+                    prov = matches[0]
+            if prov is None and legacy_provider in LLM_PROVIDER_KINDS:
+                prov = next((p for p in providers if p["kind"] == legacy_provider), None)
+            if prov is None:
+                prov = _active_provider(_cfg)
+            if prov:
+                _cfg["llm_provider_id"] = prov["id"]
+                _sync_llm_legacy_mirror(_cfg, prov)
             if llm_model:
                 _cfg["model"] = llm_model
-            if llm_base_url:
-                _cfg["base_url"] = llm_base_url
-            if llm_api_key:
-                _cfg["api_key"] = llm_api_key
-            with open(BASE_DIR / "settings.json", "w", encoding="utf-8") as f:
-                json.dump(_cfg, f, ensure_ascii=False, indent=2)
-            agent = await get_shared_agent()
-            await agent.reload_llm_config()
+                if prov:
+                    _kind = prov.get("kind") or "custom"
+                    _cfg.setdefault("llm_profiles", {})
+                    _cfg["llm_profiles"].setdefault(_kind, {})["model"] = llm_model
+            if llm_temperature is not None:
+                _cfg["temperature"] = llm_temperature
+            _save_settings(_cfg)
+            # 重载全部共享 Agent（按 user_id 分实例），确保保存/切换卡片后
+            # 每个用户正在使用的 Agent 都立即换成新供应商模型，而不是只重载 default。
+            reloaded = await _reload_shared_agents()
+            logger.info(
+                f"应用角色卡片 LLM 配置已生效: provider_id={_cfg.get('llm_provider_id', '')} "
+                f"model={_cfg.get('model', '')} base_url={_cfg.get('base_url', '')} "
+                f"reloaded={reloaded}"
+            )
         except Exception as e:
             logger.warning(f"应用角色卡片 LLM 配置失败: {e}")
     # 4. 持久化当前活动角色卡片（记忆命名空间按卡片隔离）
@@ -958,7 +3253,12 @@ async def character_cards_apply(card_id: str):
     session_id = None
     try:
         agent = await get_shared_agent()
-        session_id = await agent.set_role_card_namespace(card_id)
+        if persona_changed:
+            # 人设已变：强制开新会话，新系统提示词立即生效，不被旧历史带偏
+            session_id = await agent.create_fresh_session(card_id)
+            logger.info(f"人设已变化，为角色卡片 {card.get('name')} 开启全新会话")
+        else:
+            session_id = await agent.set_role_card_namespace(card_id)
     except Exception as e:
         logger.warning(f"切换角色卡片记忆空间失败: {e}")
     logger.info(f"应用角色卡片: {card.get('name')}")
@@ -1113,8 +3413,15 @@ async def rename_model(name: str, payload: dict):
 # ---------- 3D 背景模型管理 ----------
 @app.get("/api/backgrounds")
 async def list_backgrounds():
-    """列出所有已上传的 3D 背景模型"""
-    items = []
+    """列出所有可用的 3D 背景场景（含默认背景 'default' 星空，无文件路径）"""
+    items = [{
+        'name': 'default',
+        'display_name': '默认背景 · 星空',
+        'url': 'default',
+        'size': 0,
+        'type': 'default',
+        'is_default': True,
+    }]
     for f in BACKGROUNDS_DIR.iterdir():
         if f.is_file() and f.suffix.lower() in ALLOWED_MODEL_EXTS:
             stat = f.stat()
@@ -1123,10 +3430,11 @@ async def list_backgrounds():
                 "url": f"/backgrounds/{f.name}",
                 "size": stat.st_size,
                 "type": f.suffix.lower().lstrip("."),
+                "is_default": False,
                 "mtime": int(stat.st_mtime),
             })
-    items.sort(key=lambda m: m["mtime"], reverse=True)
-    return {"backgrounds": items}
+    files = sorted(items[1:], key=lambda m: m["mtime"], reverse=True)
+    return {"backgrounds": items[:1] + files}
 
 
 @app.post("/api/background/upload")
@@ -1189,64 +3497,118 @@ async def rename_background(name: str, payload: dict):
     return {"old_name": safe_old, "new_name": safe_new, "url": f"/backgrounds/{safe_new}"}
 
 
-# ---------- BGM 背景音乐管理 ----------
-ALLOWED_BGM_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
-BGM_MAX_SIZE = 50 * 1024 * 1024  # 50MB
+# ---------- 在线音乐（music_lib：搜索 / 解析 / 自建歌单） ----------
+@app.get("/api/music/search")
+def music_api_search(kw: str, limit: int = 8):
+    """聚合搜索在线歌曲（酷我+网易云）。返回结构化歌曲列表。"""
+    kw = (kw or "").strip()
+    if not kw:
+        raise HTTPException(400, "缺少搜索词 kw")
+    limit = max(1, min(int(limit), 30))
+    try:
+        songs = music_lib.search_all(kw, limit)
+    except Exception as e:
+        logger.error("music search failed: %s", e)
+        raise HTTPException(502, f"搜索失败: {e}")
+    return {"results": songs}
 
 
-@app.get("/api/bgm")
-async def list_bgm():
-    """列出所有背景音乐文件"""
-    items = []
-    for f in BGM_DIR.iterdir():
-        if f.is_file() and f.suffix.lower() in ALLOWED_BGM_EXTS:
-            stat = f.stat()
-            items.append({
-                "name": f.name,
-                "url": f"/bgm/{f.name}",
-                "size": stat.st_size,
-                "type": f.suffix.lower().lstrip("."),
-                "mtime": int(stat.st_mtime),
-            })
-    items.sort(key=lambda m: m["mtime"], reverse=True)
-    return {"bgm": items}
+@app.get("/api/music/resolve")
+def music_api_resolve(source: str, song_id: str):
+    """解析单曲直链（供前端 <audio> 播放）。失败返回 ok=false。"""
+    source = (source or "").strip().lower()
+    sid = (song_id or "").strip()
+    if source not in ("kuwo", "netease") or not sid:
+        raise HTTPException(400, "参数错误：source=kuwo|netease, song_id 必填")
+    try:
+        url = music_lib.resolve(source, sid)
+    except Exception as e:
+        logger.error("music resolve failed: %s", e)
+        url = None
+    if not url:
+        return {"ok": False, "error": "该歌曲暂时拿不到播放链接（可能 VIP/版权受限或已下架）"}
+    return {"ok": True, "url": url}
 
 
-@app.post("/api/bgm/upload")
-async def upload_bgm(file: UploadFile = File(...)):
-    """上传背景音乐文件"""
-    if not file.filename:
-        raise HTTPException(400, "缺少文件名")
-    ext = Path(file.filename).suffix.lower()
-    if ext not in ALLOWED_BGM_EXTS:
-        raise HTTPException(400, f"不支持的格式 {ext}，仅支持 {', '.join(ALLOWED_BGM_EXTS)}")
-
-    data = await file.read()
-    if len(data) > BGM_MAX_SIZE:
-        raise HTTPException(413, f"文件过大 ({len(data)//1024//1024}MB)，上限 {BGM_MAX_SIZE//1024//1024}MB")
-
-    safe_name = re.sub(r"[^\w.\-]", "_", file.filename)
-    target = BGM_DIR / f"{int(asyncio.get_event_loop().time() * 1000)}_{safe_name}"
-    target.write_bytes(data)
-    return {
-        "name": target.name,
-        "url": f"/bgm/{target.name}",
-        "size": len(data),
-        "type": ext.lstrip("."),
-    }
+@app.get("/api/music/boards")
+def music_api_list_boards():
+    """列出内置热门榜单（云音乐热歌/新歌/飙升/原创）。"""
+    return {"boards": [
+        {"id": pid, "name": name, "source": "netease"}
+        for pid, name in music_lib._BOARDS
+    ]}
 
 
-@app.delete("/api/bgm/{name}")
-async def delete_bgm(name: str):
-    """删除指定背景音乐"""
-    safe = Path(name).name
-    target = BGM_DIR / safe
-    if not target.is_file():
-        raise HTTPException(404, "BGM不存在")
-    if target.suffix.lower() not in ALLOWED_BGM_EXTS:
-        raise HTTPException(400, "非音频文件")
-    target.unlink()
-    return {"deleted": safe}
+@app.get("/api/music/boards/{pid}")
+def music_api_board_songs(pid: str):
+    """获取某个榜单的歌曲列表（网易云歌单接口实时拉取）。"""
+    pid = (pid or "").strip()
+    if not pid:
+        raise HTTPException(400, "缺少榜单 id")
+    try:
+        pl = music_lib.nt_playlist(pid, 50)
+    except Exception as e:
+        logger.error("music board failed: %s", e)
+        raise HTTPException(502, f"榜单加载失败: {e}")
+    return {"board": {"id": pid, "name": pl.get("name") or pid,
+                      "songs": pl.get("songs") or []}}
+
+
+@app.get("/api/music/playlists")
+def music_api_list_playlists():
+    """列出用户自建歌单。"""
+    return {"playlists": music_lib.list_playlists()}
+
+
+@app.post("/api/music/playlists")
+def music_api_create_playlist(payload: dict):
+    """创建自建歌单。body: {"name": "..."}"""
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "歌单名不能为空")
+    try:
+        pl = music_lib.create_playlist(name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "playlist": pl}
+
+
+@app.get("/api/music/playlists/{pid}")
+def music_api_get_playlist(pid: str):
+    """获取自建歌单详情（含歌曲列表）。"""
+    pl = music_lib.get_playlist(pid)
+    if not pl:
+        raise HTTPException(404, "歌单不存在")
+    return {"playlist": pl}
+
+
+@app.delete("/api/music/playlists/{pid}")
+def music_api_delete_playlist(pid: str):
+    """删除自建歌单。"""
+    if not music_lib.delete_playlist(pid):
+        raise HTTPException(404, "歌单不存在")
+    return {"ok": True, "deleted": pid}
+
+
+@app.post("/api/music/playlists/{pid}/songs")
+def music_api_add_song(pid: str, payload: dict):
+    """向歌单加入歌曲。body: {"song": {"source","id","name","artists"}}"""
+    song = payload.get("song") or {}
+    try:
+        pl = music_lib.add_song(pid, song)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not pl:
+        raise HTTPException(404, "歌单不存在")
+    return {"ok": True, "playlist": pl}
+
+
+@app.delete("/api/music/playlists/{pid}/songs/{song_id}")
+def music_api_remove_song(pid: str, song_id: str):
+    """从歌单移除歌曲。"""
+    if not music_lib.remove_song(pid, song_id):
+        raise HTTPException(404, "歌单不存在或歌曲不在歌单中")
+    return {"ok": True, "removed": song_id}
 
 
 # ---------- Agent & 记忆管理 API ----------
@@ -1279,14 +3641,13 @@ async def user_name_set(payload: dict):
 
 @app.get("/api/agent/status")
 async def agent_status():
-    """获取 Agent 状态（已加载的 MCP 工具数等）。"""
+    """获取 Agent 状态（已加载的工具数等）。"""
     try:
         agent = await get_shared_agent()
         tools_count = len(agent._all_tools) if agent._all_tools else 0
         return {
             "initialized": agent._initialized,
             "tools_count": tools_count,
-            "mcp_connected": agent.mcp_manager is not None,
             "has_memory": agent.memory is not None,
         }
     except Exception as e:
@@ -1294,17 +3655,26 @@ async def agent_status():
 
 
 @app.get("/api/sessions")
-async def list_sessions(user_id: str = "default"):
-    """列出当前角色卡片记忆空间下用户的所有会话。"""
+async def list_sessions(user_id: str = "default", q: str = ""):
+    """列出当前角色卡片记忆空间下用户的所有会话。
+
+    q 非空时按标题或消息内容模糊搜索（兼容旧调用：不带 q 行为不变，
+    返回字段在原有基础上新增 message_count/summary/approx_tokens/pinned/
+    archived/is_current，旧前端只读原字段不受影响）。
+    """
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    sessions = await agent.get_sessions()
+    sessions = await agent.get_sessions(query=(q or "").strip() or None)
     return {"sessions": sessions}
 
 
 @app.post("/api/sessions/switch")
 async def switch_session(payload: dict):
-    """切换到指定会话（仅限当前角色卡片记忆空间内的会话）。"""
+    """切换到指定会话（仅限当前角色卡片记忆空间内的会话）。
+
+    返回该会话的完整历史（user/ai 轮次，最多 300 轮）与最新摘要，
+    供前端对话栏完整渲染；旧字段形状保持不变。
+    """
     user_id = payload.get("user_id", "default")
     session_id = payload.get("session_id", "")
     if not session_id:
@@ -1314,8 +3684,69 @@ async def switch_session(payload: dict):
     if not await agent.memory.session_belongs_to_namespace(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.switch_session(session_id)
-    history = await agent.get_history()
-    return {"session_id": session_id, "history": history}
+    history = await agent.get_session_history(session_id, max_rounds=300)
+    summary = await agent.get_session_summary(session_id)
+    return {"session_id": session_id, "history": history, "summary": summary}
+
+
+@app.post("/api/sessions/rename")
+async def rename_session(payload: dict):
+    """重命名指定会话（标题 1-60 字符）。"""
+    user_id = payload.get("user_id", "default")
+    session_id = payload.get("session_id", "")
+    title = (payload.get("title") or "").strip()
+    if not session_id or not title:
+        raise HTTPException(400, "缺少 session_id 或 title")
+    agent = await get_shared_agent(user_id)
+    await agent.sync_memory_namespace()
+    if not await agent.memory.session_belongs_to_namespace(session_id):
+        raise HTTPException(400, "该会话不属于当前角色卡片")
+    await agent.rename_session(session_id, title)
+    return {"ok": True, "session_id": session_id, "title": title[:60]}
+
+
+@app.post("/api/sessions/pin")
+async def pin_session(payload: dict):
+    """置顶 / 取消置顶指定会话。"""
+    user_id = payload.get("user_id", "default")
+    session_id = payload.get("session_id", "")
+    pinned = bool(payload.get("pinned", True))
+    if not session_id:
+        raise HTTPException(400, "缺少 session_id")
+    agent = await get_shared_agent(user_id)
+    await agent.sync_memory_namespace()
+    if not await agent.memory.session_belongs_to_namespace(session_id):
+        raise HTTPException(400, "该会话不属于当前角色卡片")
+    await agent.set_session_pinned(session_id, pinned)
+    return {"ok": True, "session_id": session_id, "pinned": pinned}
+
+
+@app.post("/api/sessions/archive")
+async def archive_session(payload: dict):
+    """归档 / 取消归档指定会话（归档后不出现在默认列表、不被自动复用）。"""
+    user_id = payload.get("user_id", "default")
+    session_id = payload.get("session_id", "")
+    archived = bool(payload.get("archived", True))
+    if not session_id:
+        raise HTTPException(400, "缺少 session_id")
+    agent = await get_shared_agent(user_id)
+    await agent.sync_memory_namespace()
+    if not await agent.memory.session_belongs_to_namespace(session_id):
+        raise HTTPException(400, "该会话不属于当前角色卡片")
+    await agent.set_session_archived(session_id, archived)
+    return {"ok": True, "session_id": session_id, "archived": archived}
+
+
+@app.get("/api/sessions/{session_id}/history")
+async def session_history(session_id: str, user_id: str = "default"):
+    """获取指定会话的完整历史（user/ai 轮次）与最新摘要。"""
+    agent = await get_shared_agent(user_id)
+    await agent.sync_memory_namespace()
+    if not await agent.memory.session_belongs_to_namespace(session_id):
+        raise HTTPException(400, "该会话不属于当前角色卡片")
+    history = await agent.get_session_history(session_id, max_rounds=300)
+    summary = await agent.get_session_summary(session_id)
+    return {"session_id": session_id, "history": history, "summary": summary}
 
 
 @app.post("/api/sessions/new")
@@ -1339,6 +3770,51 @@ async def delete_session(session_id: str, user_id: str = "default"):
     return {"deleted": session_id}
 
 
+# ---------- Codex / OpenCode 网页透传（无缝移植飞书能力） ----------
+@app.get("/api/codex/config")
+async def codex_config():
+    """返回当前 codex/opencode 配置（本地 codex_config.json，网页可查看/调试）"""
+    codex_runner.check_config_reload()
+    cfg = codex_runner.AGENT_CFG
+    llm = codex_runner.LLM_CFG
+    return {
+        "work_dir": cfg.get("work_dir", ""),
+        "sync_timeout_sec": cfg.get("sync_timeout_sec", 120),
+        "max_reply_chars": cfg.get("max_reply_chars", 3800),
+        "tool_progress_interval_sec": cfg.get("tool_progress_interval_sec", 60),
+        "tools": cfg.get("tools", {}),
+        "llm_available": codex_runner.llm_available(),
+        "llm_model": llm.get("model", ""),
+        "llm_base_url": llm.get("base_url", ""),
+    }
+
+
+@app.get("/api/codex/pwd")
+async def codex_pwd():
+    codex_runner.check_config_reload()
+    return {"cwd": codex_runner.EXECUTOR.cwd}
+
+
+@app.post("/api/codex/cd")
+async def codex_cd(payload: dict):
+    codex_runner.check_config_reload()
+    d = (payload.get("dir") or payload.get("path") or "").strip()
+    if not d:
+        raise HTTPException(400, "缺少 dir")
+    if not os.path.isdir(d):
+        raise HTTPException(404, f"目录不存在: {d}")
+    codex_runner.EXECUTOR.cwd = os.path.abspath(d)
+    return {"cwd": codex_runner.EXECUTOR.cwd}
+
+
+@app.post("/api/codex/tasks/{tid}/kill")
+async def codex_task_kill(tid: str):
+    r = codex_runner.kill_task(tid)
+    if r.get("ok"):
+        return {"result": "已终止独立进程任务" if r.get("reason") != "进程已结束" else "任务进程已结束"}
+    return {"result": codex_runner.EXECUTOR.kill(tid)}
+
+
 # ---------- WebSocket ----------
 class ConnectionManager:
     def __init__(self):
@@ -1355,23 +3831,64 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# 最近一次活动的前端连接（ws/state）：定时任务等无人值守组件需要
+# 「把汇报投递给用户当前所在的连接」，用这个引用兜底。
+_last_chat_conn: dict = {"ws": None, "state": None}
+# 断点续跑去重：正在自主恢复中的用户集合（防止启动恢复与重连恢复重复触发）
+_resume_inflight: set = set()
+
 
 async def safe_send_json(ws: WebSocket, data: dict) -> bool:
-    """安全发送 WebSocket 消息，连接已关闭时静默忽略。"""
+    """安全发送 WebSocket 消息；连接已关闭/客户端不在场时静默忽略（不刷日志）。"""
     try:
+        if ws is None:
+            return False  # 后台续跑/无客户端在场：不发送，避免 AttributeError 刷屏
         if ws.client_state != WebSocketState.CONNECTED:
-            print(f"[WS] 发送失败: 连接状态={ws.client_state}, msg_type={data.get('type')}")
-            return False
+            return False  # 连接已断开（刷新/关页/断网/热重载）：正常状态，静默跳过
         await ws.send_json(data)
         return True
     except (RuntimeError, Exception) as e:
-        print(f"[WS] 发送异常: {type(e).__name__}, msg_type={data.get('type')}")
+        logger.warning("[WS] 发送异常: %s, msg_type=%s", type(e).__name__, data.get("type"))
         return False
 
 
 # 全局 Agent 实例（所有连接共享，按 user_id 区分记忆；游戏/非游戏模式共用同一实例）
 _shared_agents: dict[str, AIAgent] = {}
 _agent_lock = asyncio.Lock()
+
+# ── 单系统模式：一个服务器 = 一套状态 ──────────────────────────────
+# 1) 统一用户身份：前端各设备 localStorage 各自生成 user_id，服务端一律归一到
+#    settings.json -> agent.unified_user_id（默认 default），所有设备共享同一份
+#    记忆/会话，切换设备不断档；
+# 2) 全局共享历史：所有 WebSocket 连接共用同一份 history 列表（内存镜像），
+#    任何设备发消息都追加到同一份，刷新/换设备后看到的是同一条对话线。
+_global_history: list = []
+_global_history_ready: bool = False
+
+
+def _unified_user_id() -> str:
+    """单系统模式的统一用户 ID（settings.json -> agent.unified_user_id）。"""
+    try:
+        v = (_load_settings().get("agent", {}) or {}).get("unified_user_id") or ""
+        return str(v).strip() or "default"
+    except Exception:
+        return "default"
+
+
+async def _ensure_global_history() -> list:
+    """首次连接时把统一用户的持久化历史载入全局共享列表。"""
+    global _global_history, _global_history_ready
+    if not _global_history_ready:
+        try:
+            agent = await get_shared_agent(_unified_user_id())
+            hist = await agent.get_history()
+            if len(hist) > 200:
+                hist = hist[-100:]
+            _global_history[:] = hist
+        except Exception as e:
+            logger.warning(f"加载全局历史失败（忽略）: {e}")
+        _global_history_ready = True
+    return _global_history
 
 
 async def get_shared_agent(user_id: str = "default") -> AIAgent:
@@ -1399,6 +3916,281 @@ def get_reward_memory() -> RewardMemory:
     return _shared_reward_memory
 
 
+def _tool_result_preview(result: str) -> str:
+    """工具结果的前端展示文本：特殊标记 JSON 转成一句话摘要（避免把完整任务 JSON
+    刷进聊天面板），普通结果保留前 2000 字符（与 agent.py 的截断上限对齐，
+    前端工具链卡片默认折叠为一行摘要，点击展开才显示完整文本，不会刷屏）。"""
+    try:
+        r = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return result[:2000]
+    if not isinstance(r, dict):
+        return result[:2000]
+    if r.get("__screen_command__"):
+        return f"已执行屏幕命令：{r.get('tool')} {str(r.get('args'))[:200]}"
+    if r.get("__dsh_bridge__"):
+        task_tail = str(r.get("task") or "")[:200]
+        return f"已提请 DSH 智能体确认任务：{task_tail}"
+    if r.get("__codex_delegate__"):
+        agent_id = str(r.get("agent") or r.get("tool") or "").lower()
+        agent_label = {"codex": "Codex", "opencode": "OpenCode"}.get(agent_id, "编码助手")
+        task_tail = str(r.get("task") or "")[:200]
+        return f"已提请 {agent_label} 确认任务：{task_tail}"
+    if r.get("__media_watch__"):
+        kind = str(r.get("kind") or "")
+        title = str(r.get("title") or "")
+        return f"已派出媒体子智能体负责{kind}《{title}》，播完会自动向你汇报"
+    if r.get("__media_watch_cancel__"):
+        return f"已收回媒体子智能体（{str(r.get('reason') or '用户要求')[:80]}）"
+    if r.get("__sub_agent_spawn__"):
+        task_tail = str(r.get("task") or "")[:120]
+        return f"已下发子智能体执行任务：{task_tail}"
+    return result[:2000]
+
+
+# ============================================================
+# 媒体子智能体（media watch）—— 播放类长耗时任务的子进程委托
+# ============================================================
+
+_MW_KIND_LABEL = {"music": "听歌", "playlist": "歌单看护", "video": "视频看护",
+                   "general": "通用任务"}
+
+
+async def _media_worker_event_push(event: str, worker) -> None:
+    """媒体子智能体注册表事件 → 推送给归属前端（供 UI 实时渲染）。"""
+    if worker.ws is None:
+        return
+    await safe_send_json(worker.ws, {
+        "type": "media_worker_event",
+        "kind": event,
+        "event": worker.snapshot(full=False),
+    })
+
+
+# ---------- 通用子智能体（sub-agents） ----------
+
+# 子智能体汇报去抖：同一连接短时间内大量子智能体完成时，合并成一条汇报给主智能体
+_report_buffers: dict = {}          # ws -> list[(text, state)]
+_report_timers: dict = {}           # ws -> asyncio.Task
+
+
+async def _sub_agent_event_push(event: str, worker) -> None:
+    """通用子智能体注册表事件 → 推送给归属前端（任务中心已由镜像 task_event 展示）。"""
+    if worker.ws is None:
+        return
+    await safe_send_json(worker.ws, {
+        "type": "sub_agent_event",
+        "kind": event,
+        "event": worker.snapshot(full=False),
+    })
+
+
+async def _spawn_sub_agent(ws: WebSocket, state, r: dict) -> None:
+    """处理 __sub_agent_spawn__ 标记：登记录入通用子智能体并后台启动执行。"""
+    task = str(r.get("task") or "").strip()
+    if not task:
+        logger.warning("[SubAgent] spawn 标记缺少 task，丢弃")
+        return
+    title = str(r.get("title") or "")[:60] or task[:40]
+    note = str(r.get("note") or "")[:200]
+    try:
+        worker = await _get_sub_agents().spawn(
+            ws, state, task, title=title,
+            extra={"note": note},
+        )
+        logger.info(f"[SubAgent] 已下发子智能体「{title}」[{worker.id}]")
+    except Exception as e:
+        logger.warning(f"[SubAgent] 下发失败: {e}")
+
+
+async def _deliver_sub_agent_report(worker, message: str) -> None:
+    """通用子智能体完成/出错 → 去抖合并后反馈主智能体（防大量完成时刷屏）。"""
+    # 定时任务：无论有无前端连接，先把执行结果记入任务历史
+    job_id = ((getattr(worker, "extra", None) or {}).get("job_id"))
+    if job_id:
+        try:
+            from scheduler import record_result
+            ok = getattr(worker, "status", None) in ("done",)
+            record_result(job_id, ok, message[:600])
+        except Exception as e:
+            logger.warning(f"[Scheduler] 记录定时任务结果失败（忽略）: {e}")
+    ws = getattr(worker, "ws", None)
+    state = getattr(worker, "owner", None)
+    if ws is None:
+        # 无人值守派发（定时任务）：汇报投递给最近的活动连接
+        ws = _last_chat_conn.get("ws") if _last_chat_conn else None
+        if ws is None or ws not in manager.active:
+            return
+        state = _last_chat_conn.get("state")
+    label = _MW_KIND_LABEL.get(getattr(worker, "kind", ""), "通用任务")
+    text = f"【子智能体汇报｜{label}】{message}"
+    buf = _report_buffers.setdefault(ws, [])
+    buf.append((text, state))
+    if ws not in _report_timers:
+        async def _flush():
+            await asyncio.sleep(2.0)
+            _report_timers.pop(ws, None)
+            items = _report_buffers.pop(ws, [])
+            if not items:
+                return
+            state = items[0][1]
+            if len(items) == 1:
+                combined = items[0][0]
+            else:
+                heads = [t.split("：", 1)[-1][:120] for t, _ in items]
+                combined = (f"【子智能体汇报】本次共 {len(items)} 项完成：\n"
+                            + "\n".join(f"{i}. {h}" for i, h in enumerate(heads, 1)))
+            history = getattr(state, "_ws_history", None) or []
+            ok = await _kickoff_response(ws, combined, history, state, proactive=True,
+                                         external_trigger=True, msg_source="auto")
+            if not ok:
+                asyncio.create_task(_retry_deliver_report(ws, state, history, combined))
+        _report_timers[ws] = asyncio.ensure_future(_flush())
+
+
+async def _spawn_media_worker(ws: WebSocket, state, r: dict) -> None:
+    """处理 __media_watch__ 标记：派出子智能体 + 注入 worker_id + 下发屏幕指令。
+
+    子智能体在 media_workers 注册表 + 任务中心各有一份条目；worker_id 注入
+    屏幕指令后，前端「播完/停止」回报时带回来，闭环匹配到同一个子进程。
+    """
+    kind = str(r.get("kind") or "music")
+    title = str(r.get("title") or "未命名播放")
+    screen = r.get("screen") or {}
+    tool = str(screen.get("tool") or "")
+    args = dict(screen.get("args") or {})
+    if not tool:
+        logger.warning("[MediaWorker] watch 标记缺少 screen.tool，丢弃")
+        return
+    worker = await _get_media_workers().spawn(
+        ws, state, kind, title,
+        brief=str(r.get("brief") or f"看护《{title}》播完并汇报"),
+        extra={"tool": tool, "screen": args},
+    )
+    args["worker_id"] = worker.id
+    # 超时兜底：时长未知或过长时给一个看护上限，防止前端事件丢失导致悬挂
+    try:
+        dur = float(args.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur and 0 < dur < 6 * 3600:
+        await _get_media_workers().start_watchdog(worker.id, deadline=time.time() + dur + 300)
+    else:
+        await _get_media_workers().start_watchdog(worker.id)
+    await safe_send_json(ws, {"type": "screen_command", "tool": tool, "args": args})
+    # 任务中心已由 manager 同步创建条目（channel=media），主智能体可在列表看到子进程
+    logger.info(f"[MediaWorker] 已派出 {kind}《{title}》[{worker.id}] → {tool}")
+
+
+async def _cancel_media_worker(ws: WebSocket, r: dict) -> None:
+    """处理 __media_watch_cancel__ 标记：收回子智能体 + 下发停止播放指令。"""
+    wid = str(r.get("worker_id") or "").strip()
+    reason = str(r.get("reason") or "用户要求收回")
+    if wid:
+        await _get_media_workers().cancel(wid, reason)
+        logger.info(f"[MediaWorker] 已收回子智能体 {wid}（{reason}）")
+    screen = r.get("screen") or {}
+    tool = str(screen.get("tool") or "")
+    if tool:
+        await safe_send_json(ws, {"type": "screen_command", "tool": tool,
+                                  "args": screen.get("args") or {}})
+
+
+async def _cancel_media_on_stop(ws: WebSocket, tool: str, args: dict) -> None:
+    """主智能体发出停止类屏幕指令（stop_music / control_video stop）时，
+    把该连接上同类型的看护子智能体一并静默收尾（播放没了，看护也结束）。"""
+    if tool == "stop_music":
+        kinds = ("music", "playlist")
+    elif tool == "control_video" and str(args.get("action")) == "stop":
+        kinds = ("video",)
+    else:
+        return
+    try:
+        mgr = _get_media_workers()
+        for w in mgr.active():
+            if w.ws is ws and w.kind in kinds:
+                await mgr.cancel(w.id, reason="播放被停止")
+    except Exception as e:
+        logger.warning(f"[MediaWorker] 停止联动收尾失败: {e}")
+
+
+async def _deliver_media_worker_report(worker, message: str) -> None:
+    """子智能体干完活 → 以『子智能体汇报』的形式反馈给主智能体。
+
+    主智能体由此知道：哪个子进程干完了什么活，并自然地转述给用户。
+    """
+    ws = getattr(worker, "ws", None)
+    if ws is None:
+        return
+    state = getattr(worker, "owner", None)
+    history = getattr(state, "_ws_history", None) or []
+    label = _MW_KIND_LABEL.get(worker.kind, worker.kind)
+    text = f"【子智能体汇报｜{label}】{message}"
+    try:
+        ok = await _kickoff_response(ws, text, history, state, proactive=True,
+                                     external_trigger=True, msg_source="auto")
+        if not ok:
+            # 主智能体正在回复/冷却中 → 稍后补投，汇报不丢失
+            asyncio.create_task(_retry_deliver_report(ws, state, history, text))
+    except Exception as e:
+        logger.warning(f"[MediaWorker] 汇报投递失败: {e}")
+
+
+async def _retry_deliver_report(ws, state, history, text: str) -> None:
+    deadline = time.time() + 600  # 慢模型下主回复可能很久才结束，汇报耐心补投
+    while time.time() < deadline:
+        if state is None or state.active_task is None or state.active_task.done():
+            try:
+                ok = await _kickoff_response(ws, text, history, state, proactive=True,
+                                             external_trigger=True, msg_source="auto")
+            except Exception as e:
+                logger.warning(f"[MediaWorker] 补投汇报失败: {e}")
+                ok = False
+            if ok:
+                return
+        await asyncio.sleep(1.5)
+
+
+async def _handle_music_end(ws: WebSocket, payload: dict) -> None:
+    """前端 <audio> 单曲播完回报：闭环到看护子智能体（歌单播完最后一首才算完）。"""
+    wid = str(payload.get("worker_id") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    final = bool(payload.get("final"))
+    mgr = _get_media_workers()
+    worker = mgr.get(wid) if wid else None
+    # 归属校验：worker 必须属于这条连接；wid 缺失时按连接 + 歌名模糊兜底
+    if worker is not None and worker.ws is not ws:
+        worker = None
+    if worker is None and name:
+        for w in mgr.active():
+            if (w.ws is ws and w.kind in ("music", "playlist")
+                    and name and (w.title in name or name in w.title)):
+                worker = w
+                break
+    if worker is None:
+        return
+    if worker.kind == "playlist" and not final:
+        return  # 歌单还没到最后一首
+    label = name or worker.title
+    await mgr.complete(worker.id, f"《{label}》已经播放完毕。")
+
+
+async def _handle_music_stop(ws: WebSocket, payload: dict) -> None:
+    wid = str(payload.get("worker_id") or "").strip()
+    mgr = _get_media_workers()
+    for w in mgr.active():
+        if w.ws is ws and w.kind in ("music", "playlist") and (not wid or w.id == wid):
+            await mgr.cancel(w.id, reason="用户停止播放")
+
+
+async def _handle_video_stop(ws: WebSocket, payload: dict) -> None:
+    wid = str(payload.get("worker_id") or "").strip()
+    mgr = _get_media_workers()
+    for w in mgr.active():
+        if w.ws is ws and w.kind == "video" and (not wid or w.id == wid):
+            await mgr.cancel(w.id, reason="用户关闭大屏")
+
+
 # ---------- 会话状态（per-connection） ----------
 class WSState:
     """每个 WebSocket 连接的会话状态，支持打断式流式响应。"""
@@ -1411,6 +4203,8 @@ class WSState:
         self.current_model: Optional[str] = None     # 当前使用的角色模型名
         self.current_background: Optional[str] = None  # 当前使用的背景场景名
         self.current_bgm: Optional[str] = None       # 当前播放的背景音乐名
+        self.current_anim: Optional[dict] = None      # 前端上报的当前动作（{name,category,emotion}）
+        self._ws_history: list = []                # 连接级短期记忆（子智能体汇报等外部触发用）
         self.game_engine: GameEngine = GameEngine()  # 游戏引擎实例
         self.perception_dispatcher = PerceptionDispatcher()  # 统一感知路由调度器
         self.last_response_done: float = 0           # 上次回复完成时间戳（被动事件冷却用）
@@ -1451,6 +4245,62 @@ class WSState:
             self.current_session = None
 
 
+def _append_history_round(history: list, user_text: str, full_text: str,
+                          proactive: bool, record_history: bool,
+                          replace_last: bool = False) -> None:
+    """将一轮对话写入连接级短期记忆（history）。
+
+    用户输入轮次 → {"user": user_text, "ai": full_text}（原行为）；
+    AI 主动说话轮次 → {"user": "", "ai": full_text}：空 user 作为标记，
+    渲染层（memory._connection_pairs_to_records / agent 历史组装）跳过空 user
+    轮次，LLM 上下文只看到「AI 之前主动说了一段话」，用户搭话时可基于此回应。
+    被打断（用户插话）时也调用本函数，把已生成的部分内容补记进历史。
+
+    replace_last=True（断点续跑完成）：若最后一条是对同一用户输入的半截记录，
+    用完整回复替换它，避免同一问题在历史里出现「半截 + 完整」两条。
+    """
+    text = (full_text or "").strip()
+    if not text or not record_history:
+        return
+    entry = {"user": "" if proactive else user_text, "ai": text}
+    if replace_last and history:
+        last = history[-1]
+        if str(last.get("user") or "") == str(entry["user"] or ""):
+            old = str(last.get("ai") or "").strip()
+            if old and (text.startswith(old) or len(old) <= len(text)):
+                history[-1] = entry
+                return
+    history.append(entry)
+    # 防止长时间会话 history 无限增长导致内存泄漏（LLM 只用最后 10 条）
+    if len(history) > 200:
+        history[:] = history[-100:]
+
+
+_RESUME_EXACT = {
+    "继续", "继续吧", "继续做", "继续干", "继续干活", "继续工作", "继续任务",
+    "继续查", "继续改", "继续写", "接着", "接着来", "接着做", "接着干",
+    "接着查", "接着改", "接着写",
+}
+_RESUME_PREFIX = ("继续", "接着")
+_RESUME_TASK_WORDS = (
+    "优化", "改", "写", "查", "做", "干", "修", "任务", "项目", "接口",
+    "代码", "之前", "刚才", "上回", "处理", "弄", "搞", "完成",
+    "分析", "搜索", "找", "跑", "编译", "调试", "部署",
+)
+
+
+def _is_resume_intent(text: str) -> bool:
+    """判断用户消息是否为「继续被打断的任务」的明确指令。"""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t in _RESUME_EXACT:
+        return True
+    if t.startswith(_RESUME_PREFIX):
+        return any(w in t for w in _RESUME_TASK_WORDS)
+    return False
+
+
 async def handle_user_message_stream(ws: WebSocket, user_text: str, history: list,
                                       session_id: str, state: WSState,
                                       current_model: Optional[str] = None,
@@ -1458,13 +4308,18 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                                       current_bgm: Optional[str] = None,
                                       game_context: Optional[str] = None,
                                       record_history: bool = True,
-                                      msg_source: str = "chat"):
+                                      msg_source: str = "chat",
+                                      proactive: bool = False,
+                                      resume_checkpoint: Optional[dict] = None):
     """流式处理：AI 流式响应（含工具调用）→ 按句切分 → 每句生成 TTS → 推送 audio_chunk。
 
     支持：
-    - MCP 工具调用状态实时推送
+    - 技能工具调用状态实时推送
     - 长期记忆自动保存
     - 首句延迟 ≈ AI 首句生成时间 + 单句 TTS 时间（通常 1~2s）
+
+    resume_checkpoint: 非空 = 断点续跑（热重载/重启打断的角色对话轮）：
+        不走普通上下文重建，直接调用 agent.resume_turn 从断点继续。
 
     Args:
         record_history: 是否记录到短期记忆（history）。仅用户直接输入应记录，
@@ -1475,84 +4330,305 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
     """
     if not user_text.strip():
         return
-    await safe_send_json(ws, {"type": "thinking", "session_id": session_id})
+    # —— 用户说「继续/接着做」：从断点续跑被打断的任务（方案 A）——
+    # 只在明确表达继续意图且存在「已暂停」断点时触发，避免误续旧任务；
+    # 断点不可用时回退到任务状态摘要重建（方案 C 兜底）。
+    if resume_checkpoint is None and not proactive:
+        try:
+            from agent import (load_paused_turn_checkpoint, load_task_resume_state,
+                               resume_fresh_seconds)
+            _fresh_win = resume_fresh_seconds()
+            _cp = load_paused_turn_checkpoint(state.user_id)
+            if _cp and _cp.get("paused") and _is_resume_intent(user_text):
+                _cp_ts = float(_cp.get("updated_at") or 0)
+                # 只有「新鲜窗口」内的暂停断点才自动续跑；
+                # 过期的旧任务不恢复，也不注入过期摘要——「继续」按普通消息处理
+                if _cp_ts and time.time() - _cp_ts <= _fresh_win:
+                    resume_checkpoint = _cp
+            else:
+                _st = load_task_resume_state(state.user_id)
+                if _st and _is_resume_intent(user_text):
+                    _st_ts = float(_st.get("ts") or 0)
+                    if _st_ts and time.time() - _st_ts <= _fresh_win:
+                        _summary = str(_st.get("summary") or "").strip()
+                        if _summary:
+                            user_text = ("继续之前被打断的任务：" + _summary +
+                                         "（如果任务已经完成或信息过时，请直接告诉我）")
+        except Exception:
+            pass
+    await safe_send_json(ws, {
+        "type": "thinking",
+        "session_id": session_id,
+        "resume": bool(resume_checkpoint),
+    })
 
     buffer = ""
     full_text = ""
+    held_stream = ""        # 待路由的实时文本：短文本先攒着，判定工具轮/正文后再分发
+    STREAM_FLUSH_CHARS = 40  # 超过该长度视为正文（通常是最终回答），实时冲刷进正文
     seq = 0
-    SOFT_CUT_LEN = 24
+    SOFT_CUT_LEN = 60   # 兜底字符切分（主要靠句号/逗号自然分段，此值只防超长无标点句）
+    TTS_LOOKAHEAD = 3   # 并行预生成句数：语音持续跟随文字，生成慢于播放也不断档
     tool_calls_made = []  # 记录本轮调用的工具
+    # 真实思维链（reasoning_content）的「思考中」实时指示：
+    # 服务端累积全文，按间隔节流只推尾部，让前端回复气泡底部一行持续更新，
+    # 用户可据此判断对话仍在推进而非卡住/失败。不朗读、不进正文。
+    reasoning_total = ""
+    reasoning_last_send = 0.0
+    REASONING_SEND_INTERVAL = 0.25
+    REASONING_TAIL_LEN = 180
 
-    async def flush(sentence: str):
-        """生成单句 TTS 并推送（音频数据 base64 编码，即时销毁）。"""
-        nonlocal seq
-        sentence = re.sub(r"[*_`#>\-\[\]\(\)]", "", sentence).strip()
-        if not sentence or len(sentence) < 2:
-            return
-        if state.is_cancelled(session_id):
-            return
-        seq += 1
-        audio_b64 = None
-        audio_mime = None
+    # ---- 文本/语音解耦：文本经 stream_text 即时推送（不等语音）；
+    #      语音由后台 worker 并行预生成 + 按序发送（持续跟随文字）----
+    tts_q: asyncio.Queue = asyncio.Queue()
+    tts_task = None
+    TTS_SENTINEL = object()
+
+    async def _gen_tts_audio(sentence: str):
+        """生成单句 TTS 音频（base64 编码）。"""
         try:
             result = await generate_tts(sentence)
             if result:
                 audio_bytes, mime_type = result
-                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                audio_mime = mime_type
+                b64 = base64.b64encode(audio_bytes).decode("utf-8")
                 del audio_bytes  # 释放内存
+                return b64, mime_type
         except Exception as e:
             print(f"[TTS] 失败: {e}")
+        return None, None
+
+    async def _send_audio_chunk(seq_no: int, sentence: str, thinking: bool,
+                                audio_b64, audio_mime):
+        if ws is None:
+            return  # 无客户端在场（如启动后台续跑）：只落库，不浪费 TTS
         if state.is_cancelled(session_id):
             return
         await safe_send_json(ws, {
             "type": "audio_chunk",
             "session_id": session_id,
-            "seq": seq,
+            "seq": seq_no,
             "text": sentence,
             "audio_b64": audio_b64,
             "audio_mime": audio_mime,
             "final": False,
+            "thinking": thinking,
+        })
+
+    async def _tts_worker():
+        """并行预生成 + 按序发送：语音持续跟随文字，一小段一小段不中断。"""
+        inflight: dict = {}   # seq -> 生成任务
+        meta: dict = {}       # seq -> (sentence, thinking)
+        results: dict = {}    # seq -> (sentence, thinking, audio_b64, mime)
+        next_send = 1
+        finished = False
+
+        def _collect():
+            for s in list(inflight.keys()):
+                t = inflight[s]
+                if t.done():
+                    try:
+                        b64, mime = t.result()
+                    except Exception:
+                        b64, mime = None, None
+                    sentence, thinking = meta.get(s, ("", False))
+                    results[s] = (sentence, thinking, b64, mime)
+                    del inflight[s]
+                    del meta[s]
+
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(tts_q.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    item = TTS_SENTINEL
+                if item is not TTS_SENTINEL:
+                    if item is None:
+                        finished = True
+                    else:
+                        seq_no, sentence, thinking = item
+                        if len(inflight) >= TTS_LOOKAHEAD:
+                            # 达并发上限：先等最早一个完成再继续，控制预生成数量
+                            await asyncio.wait(list(inflight.values()),
+                                               return_when=asyncio.FIRST_COMPLETED)
+                            _collect()
+                        meta[seq_no] = (sentence, thinking)
+                        inflight[seq_no] = asyncio.create_task(
+                            _gen_tts_audio(sentence))
+                _collect()
+                # 严格按 seq 顺序发送连续就绪的块（先到先播）
+                while next_send in results:
+                    sentence, thinking, b64, mime = results.pop(next_send)
+                    try:
+                        await _send_audio_chunk(next_send, sentence,
+                                                thinking, b64, mime)
+                    except Exception:
+                        pass
+                    next_send += 1
+                if finished and not inflight and not results:
+                    break
+        finally:
+            for t in inflight.values():
+                if not t.done():
+                    t.cancel()
+
+    async def _speak(text: str, thinking: bool = False):
+        """把一段文字送进 TTS 队列朗读（先渲染成口语化文本，不阻塞文本流）。
+
+        按句号/逗号等自然停顿分段朗读，避免整段一口气或按字符硬切。
+        """
+        nonlocal seq
+        if not text:
+            return
+        # 先渲染再读：Markdown → 口语化纯文本，避免语音念出 **、|、URL 等符号
+        sentence = _tts_plain_text(text)
+        if not sentence or len(sentence) < 2:
+            return
+        if ws is None or state.is_cancelled(session_id):
+            return
+        # 按句号/逗号/问号/叹号/分号/换行等自然停顿分段（标点留在段尾，读起来自然）
+        parts = re.split(r"(?<=[。！？!?；;，,\n…])", sentence)
+        for p in parts:
+            p = p.strip()
+            if len(p) < 2:
+                continue
+            seq += 1
+            await tts_q.put((seq, p, thinking))
+
+    async def flush(sentence: str):
+        """结论分句交给后台 TTS 队列（不阻塞文本流），音频按序发送。"""
+        await _speak(sentence)
+
+    tts_task = asyncio.create_task(_tts_worker())
+
+    async def _tts_finalize():
+        """等 TTS 队列全部发完后再补发 audio_end（后台独立执行）。
+
+        让「一轮对话完成」不再被语音播放拖住：主路径拿到 full_text 后立即
+        收尾（历史/状态就绪），audio_end 由本任务等所有音频分片发完后补发，
+        保证前端音频顺序仍严格「先分片后结束」，又不阻塞对话轮次。
+        """
+        try:
+            await tts_q.put(None)  # 通知 worker 无新任务
+            if tts_task:
+                await tts_task      # 等 worker 发完所有序列化的音频分片
+        except Exception:
+            pass
+        if state.is_cancelled(session_id):
+            return
+        await safe_send_json(ws, {
+            "type": "audio_end",
+            "session_id": session_id,
+            "full_text": full_text,
+            "tool_calls": tool_calls_made if tool_calls_made else None,
         })
 
     try:
         # 统一使用共享 Agent（游戏/非游戏模式共用同一实例，通过 game_mode 区分行为）
         agent = await get_shared_agent(state.user_id)
+        if resume_checkpoint is not None:
+            # 断点续跑：会话/上下文已固化在检查点中，直接续跑被打断的工具轮
+            cp_sid = str(resume_checkpoint.get("session_id") or "")
+            if cp_sid:
+                state.chat_session_id = cp_sid
+                if agent.memory:
+                    try:
+                        await agent.sync_memory_namespace()
+                        if await agent.memory.session_belongs_to_namespace(cp_sid):
+                            await agent.memory.set_session_id(cp_sid)
+                    except Exception as e:
+                        logger.warning(f"[Resume] 会话绑定失败: {e}")
+            stream = agent.resume_turn(resume_checkpoint)
+        else:
+            # 将记忆绑定到当前活动角色卡片的命名空间（跨卡片记忆隔离）；
+            # state 中的会话若不属于当前命名空间（如切卡后未刷新）则改用命名空间当前会话
+            if agent.memory:
+                await agent.sync_memory_namespace()
+                if state.chat_session_id and await agent.memory.session_belongs_to_namespace(state.chat_session_id):
+                    agent.memory.session_id = state.chat_session_id
+                else:
+                    state.chat_session_id = agent.memory.session_id
+
+            # 游戏模式：同步记忆到游戏引擎（用于持久化游戏事件），并获取游戏类型
+            game_mode = bool(state.game_engine and state.game_engine.active)
+            game_type = None
+            if game_mode:
+                if agent.memory and state.game_engine:
+                    state.game_engine.memory = agent.memory
+                if state.game_engine and state.game_engine.world:
+                    game_type = state.game_engine.world.game_key or None
+            # 游戏模式下用户直接输入沿用 'game' 来源标记（原行为），环境交互保持 'auto'
+            if msg_source == "chat" and game_mode:
+                msg_source = "game"
+
+            stream = agent.chat_stream(
+                user_text, history=history,
+                current_model=current_model,
+                current_background=current_background,
+                current_bgm=current_bgm,
+                game_context=game_context,
+                game_mode=game_mode,
+                game_type=game_type,
+                msg_source=msg_source,
+                current_anim=state.current_anim,
+                record_history=record_history,
+                proactive=proactive,
+            )
+
+        # 断点续跑事件附加标记，前端可据此区分恢复轮（普通轮不受影响）
+        is_resume = resume_checkpoint is not None
         # 将记忆绑定到当前活动角色卡片的命名空间（跨卡片记忆隔离）；
-        # state 中的会话若不属于当前命名空间（如切卡后未刷新）则改用命名空间当前会话
-        if agent.memory:
-            await agent.sync_memory_namespace()
-            if state.chat_session_id and await agent.memory.session_belongs_to_namespace(state.chat_session_id):
-                agent.memory.session_id = state.chat_session_id
-            else:
-                state.chat_session_id = agent.memory.session_id
-
-        # 游戏模式：同步记忆到游戏引擎（用于持久化游戏事件），并获取游戏类型
-        game_mode = bool(state.game_engine and state.game_engine.active)
-        game_type = None
-        if game_mode:
-            if agent.memory and state.game_engine:
-                state.game_engine.memory = agent.memory
-            if state.game_engine and state.game_engine.world:
-                game_type = state.game_engine.world.game_key or None
-        # 游戏模式下用户直接输入沿用 'game' 来源标记（原行为），环境交互保持 'auto'
-        if msg_source == "chat" and game_mode:
-            msg_source = "game"
-
-        async for event in agent.chat_stream(
-            user_text, history=history,
-            current_model=current_model,
-            current_background=current_background,
-            current_bgm=current_bgm,
-            game_context=game_context,
-            game_mode=game_mode,
-            game_type=game_type,
-            msg_source=msg_source,
-        ):
+        async for event in stream:
             if state.is_cancelled(session_id):
                 break
 
-            if isinstance(event, TextDelta):
+            if isinstance(event, StreamDelta):
+                # 实时文本：先积攒，超过阈值才冲刷进正文（避免工具轮过程话闪进闪出）
+                if event.text:
+                    held_stream += event.text
+                    if len(held_stream) >= STREAM_FLUSH_CHARS:
+                        await safe_send_json(ws, {
+                            "type": "stream_text",
+                            "session_id": session_id,
+                            "text": held_stream,
+                        })
+                        await flush(held_stream)
+                        held_stream = ""
+
+            elif isinstance(event, ReasoningDelta):
+                # 真实思维链（reasoning_content）：回复气泡底部的「思考中」指示。
+                # 节流：增量累积到发送间隔才推一次，只带尾部（避免逐字刷屏，
+                # 也避免超大思维链占满 WebSocket 带宽）；正文仍只留正式回答。
+                reasoning_total += event.text or ""
+                _now = time.monotonic()
+                if _now - reasoning_last_send >= REASONING_SEND_INTERVAL:
+                    reasoning_last_send = _now
+                    await safe_send_json(ws, {
+                        "type": "reasoning",
+                        "session_id": session_id,
+                        "text": reasoning_total[-REASONING_TAIL_LEN:],
+                    })
+
+            elif isinstance(event, FinalText):
+                # 最终全文：只入历史（展示/语音已实时流出）
+                full_text += event.text
+                # 本轮无工具调用：积攒的短文本是最终回复，冲刷进正文 + 语音
+                if held_stream:
+                    await safe_send_json(ws, {
+                        "type": "stream_text",
+                        "session_id": session_id,
+                        "text": held_stream,
+                    })
+                    await flush(held_stream)
+                    held_stream = ""
+
+            elif isinstance(event, TextDelta):
+                # 文本即时推送：不等语音，前端立刻把文字流出来
+                if event.text:
+                    await safe_send_json(ws, {
+                        "type": "stream_text",
+                        "session_id": session_id,
+                        "text": event.text,
+                    })
                 buffer += event.text
                 full_text += event.text
                 # 按句末标点切分
@@ -1570,21 +4646,41 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                         break
 
             elif isinstance(event, ToolCallStart):
+                # 本轮是工具轮：积攒的短文本是过程话，保留在正文里（语义连贯），
+                # 不再转思考段丢弃；叙述尾巴照常刷给语音
+                if buffer.strip():
+                    await flush(buffer)
+                    buffer = ""
+                if held_stream:
+                    await safe_send_json(ws, {
+                        "type": "stream_text",
+                        "session_id": session_id,
+                        "text": held_stream,
+                    })
+                    await flush(held_stream)
+                    held_stream = ""
                 tool_calls_made.append({"name": event.tool_name, "arguments": event.arguments})
                 await safe_send_json(ws, {
                     "type": "tool_call_start",
                     "session_id": session_id,
                     "tool_name": event.tool_name,
                     "arguments": event.arguments,
+                    "resume": is_resume,
                 })
+
+            elif isinstance(event, ThinkingDelta):
+                # 工具轮过程话 / 阶段进展：同样不再下发 thinking_text，
+                # 过程话已由 StreamDelta/ToolCallStart 走正文链路展示。
+                pass
 
             elif isinstance(event, ToolCallResult):
                 await safe_send_json(ws, {
                     "type": "tool_call_result",
                     "session_id": session_id,
                     "tool_name": event.tool_name,
-                    "result": event.result[:500],
+                    "result": _tool_result_preview(event.result),
                     "success": event.success,
+                    "resume": is_resume,
                 })
                 # 检测是否为屏幕控制工具，若是则转发给前端执行
                 if event.success:
@@ -1593,46 +4689,174 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                         if isinstance(r, dict) and r.get("__screen_command__"):
                             cmd = {"type": "screen_command", "tool": r["tool"], "args": r["args"]}
                             await safe_send_json(ws, cmd)
+                            # 停止类指令 → 联动收尾同类型的看护子智能体
+                            await _cancel_media_on_stop(ws, str(r["tool"]), r.get("args") or {})
                             logger.info(f"[ScreenCmd] 已发送: {r['tool']} {r['args']}")
                     except (json.JSONDecodeError, TypeError):
-                        pass  # 不是 JSON，忽略
+                        logger.warning(f"[ScreenCmd] 工具结果解析失败（可能被截断）: {str(event.result)[:120]!r}")
+                # DSH 桥接工具：注册待确认任务，前端弹确认卡片
+                if event.success:
+                    try:
+                        r = json.loads(event.result)
+                        if isinstance(r, dict) and r.get("__dsh_bridge__"):
+                            await request_harness_task(ws, r.get("task") or "", r.get("cwd"))
+                            logger.info(f"[Bridge] 已登记任务: {str(r.get('task'))[:60]}")
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"[Bridge] DSH 桥接 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
+                # 委派本机代码助手：转任务中心可视化执行
+                if event.success:
+                    try:
+                        r = json.loads(event.result)
+                        if isinstance(r, dict) and r.get("__codex_delegate__"):
+                            # 统一智能体身份：新工具传 agent（codex/opencode），旧工具传 tool（cx/ai）
+                            agent_id = (str(r.get("agent") or r.get("tool") or "")).lower().strip()
+                            tool = {"codex": "cx", "opencode": "ai",
+                                    "cx": "cx", "ai": "ai"}.get(agent_id, "cx")
+                            agent_name = {"cx": "Codex", "ai": "OpenCode"}.get(tool, agent_id)
+                            task_desc = str(r.get("task") or "").strip()
+                            tcfg = (codex_runner.AGENT_CFG.get("tools") or {}).get(tool)
+                            if tcfg and task_desc:
+                                asyncio.create_task(_run_codex_tool_task(ws, tool, tcfg, task_desc))
+                                await safe_send_json(ws, {"type": "codex_msg", "kind": "bg_started",
+                                                          "text": f"🧭 已提请 {agent_name} 确认任务（任务中心点「确认执行」后才会真正执行）"})
+                            else:
+                                logger.warning(f"[Delegate] 委派被丢弃：{agent_name} 未配置或 task 为空（len={len(task_desc)}）")
+                                await safe_send_json(ws, {"type": "codex_msg", "kind": "error",
+                                                          "text": f"⛔ 代码助手 {tool} 未配置或任务为空，请检查 codex_config.json"})
+                            logger.info(f"[Delegate] 已提请 {agent_name} 确认: len(task)={len(task_desc)} {task_desc[:60]}")
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"[Delegate] 委派 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
+                # 媒体子智能体（media watch）：music_play/video_play 带 watch=true 时返回 __media_watch__
+                if event.success:
+                    try:
+                        r = json.loads(event.result)
+                        if isinstance(r, dict) and r.get("__media_watch__"):
+                            await _spawn_media_worker(ws, state, r)
+                        elif isinstance(r, dict) and r.get("__media_watch_cancel__"):
+                            await _cancel_media_worker(ws, r)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"[MediaWorker] watch 标记 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
+                # 通用子智能体（sub-agents）：sub_agent_spawn 返回 __sub_agent_spawn__
+                if event.success:
+                    try:
+                        r = json.loads(event.result)
+                        if isinstance(r, dict) and r.get("__sub_agent_spawn__"):
+                            await _spawn_sub_agent(ws, state, r)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"[SubAgent] spawn 标记 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
 
+            elif isinstance(event, ToolCallProgress):
+                # 工具执行心跳：长任务（shell 长命令/文件搜索/媒体处理）持续告知用户仍在执行
+                await safe_send_json(ws, {
+                    "type": "tool_call_progress",
+                    "session_id": session_id,
+                    "tool_name": event.tool_name,
+                    "elapsed": int(event.elapsed or 0),
+                    "message": event.message or f"工具 {event.tool_name} 正在执行中……",
+                    "resume": is_resume,
+                })
+
+            elif isinstance(event, UsageEvent):
+                # LLM 用量事件：转发给前端实时展示（早于 audio_end 到达，符合前端时序）
+                await safe_send_json(ws, {
+                    "type": "usage",
+                    "session_id": session_id,
+                    "prompt_tokens": event.prompt_tokens,
+                    "completion_tokens": event.completion_tokens,
+                    "total_tokens": event.total_tokens,
+                    "rounds": event.rounds,
+                    "context_window": event.context_window,
+                    "cache_hit_tokens": getattr(event, "cache_hit_tokens", 0) or 0,
+                    "cache_miss_tokens": getattr(event, "cache_miss_tokens", 0) or 0,
+                })
+
+    except asyncio.CancelledError:
+        # 任务被用户插话/新回复强制取消（active_task.cancel()）：已生成的部分
+        # 内容补记历史，再向上传播取消——否则 AI 对自己刚说的话毫无印象
+        if tts_task:
+            tts_task.cancel()
+        _append_history_round(history, user_text, full_text, proactive, record_history)
+        # 回执中断事件：前端据此清队列、解除会话栅栏并复位状态徽章
+        await safe_send_json(ws, {"type": "interrupted", "session_id": session_id})
+        if tool_calls_made:
+            await safe_send_json(ws, {"type": "system_msg",
+                                      "text": "⏸ 任务已暂停，说『继续』可以接着干"})
+        raise
     except Exception as e:
+        if tts_task:
+            tts_task.cancel()
         logger.error(f"Agent 错误: {e}")
         await safe_send_json(ws, {"type": "error", "message": f"AI 出错了：{e}",
                             "session_id": session_id})
         state.last_response_done = time.time()
+        # 报错也补记已生成的部分，避免这一轮从短期记忆中消失——
+        # 否则用户接着问时 AI 对自己刚说过/做过的事毫无印象
+        try:
+            _append_history_round(history, user_text, full_text,
+                                  proactive, record_history)
+        except Exception:
+            pass
         return
 
     # 处理剩余尾巴
     if buffer.strip():
         await flush(buffer)
+    if held_stream:
+        # 最终回复尾巴（无工具轮）：冲刷进正文 + 语音
+        await safe_send_json(ws, {
+            "type": "stream_text",
+            "session_id": session_id,
+            "text": held_stream,
+        })
+        await flush(held_stream)
+        held_stream = ""
 
     if state.is_cancelled(session_id):
+        # 本次回复被用户插话/新输入打断：已生成的部分也补记历史，
+        # 保证用户搭话时 AI 记得自己刚说过的话
+        if tts_task:
+            tts_task.cancel()
+        _append_history_round(history, user_text, full_text, proactive, record_history)
+        # 兜底：流式生成器可能因 is_cancelled 提前 break 而正常收尾
+        # （不会抛 CancelledError 到 agent.chat_stream），这里显式把当前
+        # 轮次的断点标记为「已暂停」，保证用户说『继续』仍能恢复完整现场。
+        try:
+            from agent import mark_latest_ckpt_paused
+            mark_latest_ckpt_paused(state.user_id)
+        except Exception:
+            pass
         await safe_send_json(ws, {"type": "interrupted", "session_id": session_id})
+        if tool_calls_made:
+            await safe_send_json(ws, {"type": "system_msg",
+                                      "text": "⏸ 任务已暂停，说『继续』可以接着干"})
         state.last_response_done = time.time()
         return
 
     full_text = full_text.strip()
-    await safe_send_json(ws, {
-        "type": "audio_end",
-        "session_id": session_id,
-        "full_text": full_text,
-        "tool_calls": tool_calls_made if tool_calls_made else None,
-    })
+    # 语音播放独立化：audio_end 交给后台任务等所有音频发完再补发，
+    # 这里立刻收尾本轮（历史/状态），不再等语音全部播放完。
+    asyncio.create_task(_tts_finalize())
     state.last_response_done = time.time()
-    # 短期记忆（history）只记录用户直接输入；环境交互由记忆系统处理
-    if full_text and record_history:
-        history.append({"user": user_text, "ai": full_text})
-        # 防止长时间会话 history 无限增长导致内存泄漏（LLM 只用最后 10 条）
-        if len(history) > 200:
-            history[:] = history[-100:]
+    # 短期记忆：用户直接输入与 AI 主动说话均记录（主动说话以空 user 标记，
+    # 渲染层自动跳过空 user 轮次 → LLM 只看到「AI 说了一段话」）
+    _append_history_round(history, user_text, full_text, proactive, record_history,
+                          replace_last=is_resume)
+    # 子智能体/媒体完成汇报轮收尾：把「已完成」汇报立即固化为摘要，
+    # 防止后续主动对话仍读到过期的"进行中"摘要而自相矛盾
+    if msg_source == "auto" and str(user_text).startswith("【子智能体汇报"):
+        try:
+            if agent.memory:
+                await agent.memory.force_summarize(
+                    include_auto=True, auto_prefix=("【子智能体汇报",))
+        except Exception as e:
+            logger.warning(f"汇报轮次强制摘要失败（忽略）: {e}")
 
 
 async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSState,
                            game_context: Optional[str] = None,
                            allow_interrupt: bool = False,
                            proactive: bool = False,
+                           external_trigger: bool = False,
                            record_history: Optional[bool] = None,
                            msg_source: str = "chat"):
     """启动流式回复 task。
@@ -1643,6 +4867,10 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     proactive=True 表示非用户消息驱动的主动说话（RL调度/感知派发/
     环境快照等）——所有主动路径共用全局闸门 _last_proactive_speak，
     防止任何来源的"自言自语"式高频说话。返回 True 表示已启动回复。
+
+    external_trigger=True 表示外部触发（游戏事件/游戏结束/用户召唤等，
+    用户在场互动）—— 可突破用户活跃窗口守卫 ACTIVE_USER_GUARD；
+    否则用户 1 分钟内有主动对话/回复时拒绝主动说话。
 
     record_history: 是否记录到短期记忆。None 时默认 not proactive
         （主动说话=环境交互，不记录）；环境类调用点可显式传 False。
@@ -1660,6 +4888,12 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     if proactive:
         if state.active_task is not None and not state.active_task.done():
             return False  # AI 正在说话，主动路径不得打断
+        if not external_trigger:
+            # 用户活跃窗口守卫：用户 1 分钟内有主动对话/回复 → 禁止主动说话，
+            # 避免 AI 在用户活跃交流时不断插话"废话"。
+            # 仅外部触发（游戏事件/游戏结束/用户召唤等）可突破此窗口。
+            if time.time() - state.last_user_message_time < ACTIVE_USER_GUARD:
+                return False
         last_speak = getattr(state, "_last_proactive_speak", 0.0)
         if time.time() - last_speak < ACTIVE_SPEAK_COOLDOWN:
             return False  # 全局冷却期内，主动路径一律拒绝
@@ -1682,27 +4916,137 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
             current_background=state.current_background,
             current_bgm=state.current_bgm,
             game_context=game_context,
-            record_history=(not proactive) if record_history is None else record_history,
+            # 主动说话也记录短期记忆（历史）：AI 主动说的话必须是后续对话的上下文，
+            # 否则用户插话/搭话时 AI 对自己刚说过的话毫无印象。
+            # 纯环境噪音路径（环境快照等）由调用点显式传 record_history=False 排除。
+            record_history=True if record_history is None else record_history,
             msg_source=msg_source,
+            proactive=proactive,
         )
     )
     return True
 
 
-async def _apply_dispatch_result(ws: WebSocket, result, history: list, state: WSState):
+async def _kickoff_resume(ws, state, checkpoint: dict) -> bool:
+    """热重载/重启后：让角色自主恢复被打断的对话轮（断点续跑）。
+
+    ws 可能为 None（尚无客户端重连）——事件推送静默跳过，对话轮仍会在后台
+    跑完并落库，客户端重连后能看到完整结果。
+    """
+    cp_user = str(checkpoint.get("user_id") or "default")
+    if cp_user in _resume_inflight:
+        return False
+    cp_sid = str(checkpoint.get("session_id") or "")
+    try:
+        agent = await get_shared_agent(cp_user)
+        if agent.memory and cp_sid:
+            await agent.sync_memory_namespace()
+            if not await agent.memory.session_belongs_to_namespace(cp_sid):
+                # 角色卡片已切换：断点会话不属于当前命名空间，放弃恢复
+                from agent import clear_ckpt_slot
+                clear_ckpt_slot(cp_user, str(checkpoint.get("turn_id") or ""))
+                logger.warning(f"[Resume] 断点会话不属于当前角色卡片命名空间，放弃: {cp_sid}")
+                return False
+            await agent.memory.set_session_id(cp_sid)
+    except Exception as e:
+        logger.warning(f"[Resume] 断点会话校验失败: {e}")
+        return False
+
+    history = await _ensure_global_history()
+    if state is None:
+        state = WSState()
+    state.user_id = cp_user
+    state.chat_session_id = cp_sid
+    if ws is None or ws not in manager.active:
+        ws = None
+    _resume_inflight.add(cp_user)
+
+    def _run():
+        return handle_user_message_stream(
+            ws, str(checkpoint.get("user_message") or ""), history,
+            state.new_session(), state,
+            current_model=checkpoint.get("current_model"),
+            current_background=checkpoint.get("current_background"),
+            current_bgm=checkpoint.get("current_bgm"),
+            game_context=checkpoint.get("game_context"),
+            record_history=bool(checkpoint.get("record_history", True)),
+            msg_source=checkpoint.get("msg_source") or "chat",
+            proactive=bool(checkpoint.get("proactive", False)),
+            resume_checkpoint=checkpoint,
+        )
+
+    async def _run_wrap():
+        try:
+            await _run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[Resume] 对话轮恢复执行失败: {e}")
+        finally:
+            _resume_inflight.discard(cp_user)
+
+    state.cancel_current()
+    if state.active_task and not state.active_task.done():
+        state.active_task.cancel()
+    state.active_task = asyncio.create_task(_run_wrap())
+    logger.info(f"[Resume] 已启动对话轮自主恢复（用户={cp_user}, 会话={cp_sid}）")
+    return True
+
+
+async def _resume_pending_turns() -> None:
+    """启动后扫描对话轮断点并自主恢复（无客户端连接时静默完成，结果落记忆库）。"""
+    try:
+        from agent import list_turn_checkpoints, ckpt_is_fresh
+    except Exception as e:
+        logger.warning(f"[Resume] 断点扫描失败: {e}")
+        return
+    for cp in list_turn_checkpoints():
+        # 用户主动/被动暂停的断点不自动重放：等用户说『继续』再恢复，
+        # 避免服务重启后旧任务抢跑/与用户新指令冲突；只自动恢复进程被杀
+        # （未标记 paused）的崩溃断点。
+        if cp.get("paused"):
+            continue
+        # 只自动恢复新鲜窗口内的崩溃断点；过期的旧断点不重放
+        # （避免服务重启后把几天前的旧任务抢跑回来）
+        if not ckpt_is_fresh(cp):
+            continue
+        cp_user = str(cp.get("user_id") or "default")
+        if cp_user in _resume_inflight:
+            continue
+        try:
+            ws = _last_chat_conn.get("ws") if _last_chat_conn else None
+            state = _last_chat_conn.get("state") if _last_chat_conn else None
+            if ws is not None and ws not in manager.active:
+                ws, state = None, None
+            await _kickoff_resume(ws, state, cp)
+        except Exception as e:
+            logger.warning(f"[Resume] 对话轮恢复启动失败: {e}")
+
+
+async def _apply_dispatch_result(ws: WebSocket, result, history: list, state: WSState,
+                                 msg_type: Optional[str] = None):
     """统一应用感知调度结果。
 
     由 PerceptionDispatcher.dispatch() 返回的 DispatchResult 驱动：
     - behavior_cmd → 发送给前端执行
     - trigger_text + should_speak → 启动 LLM 回复
+
+    msg_type 用于判定外部触发：游戏事件（game_state）/ 游戏结束
+    （game_result）/ 用户召唤（proactive）以及游戏中的状态事件
+    （game_update）属于外部触发，用户在场互动，可突破活跃窗口守卫；
+    其余自动路径（大厅环境快照等）在用户活跃窗口内被抑制。
     """
     if result.behavior_cmd:
         await safe_send_json(ws, result.behavior_cmd)
     if result.should_speak and result.trigger_text:
+        external = result.category in (
+            EventCategory.DISCRETE, EventCategory.GAME_END, EventCategory.SUMMON,
+        ) or (result.category == EventCategory.PERIODIC and msg_type == "game_update")
         await _kickoff_response(
             ws, result.trigger_text, history, state,
             game_context=result.game_context,
             proactive=True,  # 感知派发属于主动说话，走全局闸门
+            external_trigger=external,  # 外部触发可突破用户活跃窗口
             msg_source="auto",  # 环境交互：由记忆系统处理，不进短期记忆
         )
 
@@ -1873,9 +5217,22 @@ async def _handle_rl_decision(ws: WebSocket, data: dict, state: WSState, history
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await manager.connect(ws)
-    history: list = []
+    # 先显式完成 WebSocket 握手再进入消息循环：
+    # 热重载/整进程重启瞬间，连接可能已处于半死状态，直接收消息会报
+    # "WebSocket is not connected. Need to call accept first" 并让前端永久卡在“连接中”。
+    # 握手失败就放弃该连接（前端有自动重连，3 秒超时后重试）。
+    try:
+        await ws.accept()
+    except Exception as e:
+        print(f"[WS] 握手失败，放弃连接: {e}")
+        return
+    manager.active.append(ws)
+    # 单系统模式：所有连接共享同一份全局历史（刷新/换设备不断档）
+    history: list = await _ensure_global_history()
     state = WSState()
+    state._ws_history = history  # 子智能体汇报等外部触发复用同一份短期记忆
+    _last_chat_conn["ws"] = ws
+    _last_chat_conn["state"] = state
     try:
         await safe_send_json(ws, {"type": "ready", "message": "连接成功"})
         while True:
@@ -1886,10 +5243,14 @@ async def websocket_endpoint(ws: WebSocket):
             # 基础设施消息始终放行；感知事件由 PerceptionDispatcher 内部自行保护
             _ALWAYS_ALLOW = {
                 "ping", "set_user", "list_sessions", "switch_session",
-                "new_session", "delete_session", "set_avatar",
+                "new_session", "delete_session", "search_sessions",
+                "rename_session", "pin_session", "archive_session",
+                "set_avatar",
                 "set_background", "set_bgm", "enter_game_mode",
+                "anim_state",  # 前端动作状态上报（说话时大白知道自己的当前动作）
                 "exit_game_mode", "interrupt", "rl_sync", "rl_decision",
                 "game_action_request", "game_reward",
+                "music_end", "music_stop", "video_stop",   # 媒体子智能体回报事件
             }
             _PERCEPTION_EVENTS = {
                 "game_state", "game_event", "game_update",
@@ -1906,6 +5267,19 @@ async def websocket_endpoint(ws: WebSocket):
                 if time.time() - state.last_response_done < _RESPONSE_COOLDOWN:
                     continue
 
+            # === 动作状态上报（前端播放/停止库动作时实时同步） ===
+            if mtype == "anim_state":
+                anim = msg.get("anim")
+                if isinstance(anim, dict):
+                    state.current_anim = {
+                        "name": str(anim.get("name") or "")[:60],
+                        "category": str(anim.get("category") or "")[:20],
+                        "emotion": str(anim.get("emotion") or "")[:20],
+                    }
+                else:
+                    state.current_anim = None
+                continue
+
             # === 心跳 ===
             if mtype == "ping":
                 await safe_send_json(ws, {"type": "pong"})
@@ -1913,23 +5287,37 @@ async def websocket_endpoint(ws: WebSocket):
 
             # === 用户身份设置 ===
             if mtype == "set_user":
-                state.user_id = msg.get("user_id", "default")
+                # 单系统模式：忽略各设备自己生成的 user_id，一律归一到统一身份，
+                # 保证所有网页端共享同一份记忆与对话
+                state.user_id = _unified_user_id()
                 # 预初始化该用户的 Agent
                 agent = await get_shared_agent(state.user_id)
                 # 绑定当前活动角色卡片的记忆命名空间（角色卡片独立记忆空间）
                 if agent.memory:
                     await agent.sync_memory_namespace()
                 state.chat_session_id = agent.memory.session_id if agent.memory else None
-                # 加载当前会话的历史消息并返回
-                history = await agent.get_history()
-                if len(history) > 200:
-                    history[:] = history[-100:]
+                # 全局共享历史：直接复用同一份列表，不按连接重建
+                history = await _ensure_global_history()
+                state._ws_history = history
                 await safe_send_json(ws, {
                     "type": "user_set",
                     "user_id": state.user_id,
                     "chat_session_id": state.chat_session_id,
                     "history": history,
                 })
+                # 热重载/重启后：若仍有未完成的对话轮断点，向当前连接流式恢复
+                try:
+                    from agent import load_turn_checkpoint, ckpt_is_fresh
+                    cp = load_turn_checkpoint(state.user_id)
+                    # 只自动恢复进程被杀（未标记 paused）的崩溃断点；
+                    # 用户暂停的断点等用户说『继续』，不在重连时抢跑
+                    # 且必须仍在新鲜窗口内，过期旧任务不重放
+                    if (cp and not cp.get("paused")
+                            and ckpt_is_fresh(cp)
+                            and state.user_id not in _resume_inflight):
+                        asyncio.create_task(_kickoff_resume(ws, state, cp))
+                except Exception as e:
+                    logger.warning(f"[Resume] 重连恢复触发失败: {e}")
                 continue
 
             # === 会话管理 ===
@@ -1937,8 +5325,22 @@ async def websocket_endpoint(ws: WebSocket):
                 agent = await get_shared_agent(state.user_id)
                 # 同步到当前活动角色卡片的记忆空间，确保会话列表只显示本卡片的历史
                 await agent.sync_memory_namespace()
-                sessions = await agent.get_sessions()
-                await safe_send_json(ws, {"type": "session_list", "sessions": sessions})
+                q = (msg.get("q") or "").strip()
+                include_archived = bool(msg.get("include_archived", False))
+                sessions = await agent.get_sessions(
+                    query=q or None, include_archived=include_archived)
+                await safe_send_json(ws, {
+                    "type": "session_list", "sessions": sessions, "query": q})
+                continue
+
+            if mtype == "search_sessions":
+                # 会话搜索（覆盖归档会话）：结果仍以 session_list 下发，前端复用渲染
+                agent = await get_shared_agent(state.user_id)
+                await agent.sync_memory_namespace()
+                q = (msg.get("q") or "").strip()
+                sessions = await agent.get_sessions(query=q or None)
+                await safe_send_json(ws, {
+                    "type": "session_list", "sessions": sessions, "query": q})
                 continue
 
             if mtype == "switch_session":
@@ -1952,13 +5354,16 @@ async def websocket_endpoint(ws: WebSocket):
                         continue
                     await agent.switch_session(sid)
                     state.chat_session_id = sid
-                    history = await agent.get_history()
-                    if len(history) > 200:
-                        history[:] = history[-100:]
+                    # 完整历史（最多 300 轮）供对话栏渲染；summary 为新会话摘要
+                    new_hist = await agent.get_session_history(sid, max_rounds=300)
+                    history[:] = new_hist          # 原地更新全局共享列表
+                    state._ws_history = history
+                    summary = await agent.get_session_summary(sid)
                     await safe_send_json(ws, {
                         "type": "session_switched",
                         "session_id": sid,
                         "history": history,
+                        "summary": summary,
                     })
                 continue
 
@@ -1971,11 +5376,53 @@ async def websocket_endpoint(ws: WebSocket):
                 agent.memory.session_id = None
                 await agent.memory.get_or_create_session()
                 state.chat_session_id = agent.memory.session_id
-                history = []
+                history[:] = []                    # 原地清空全局共享列表
+                state._ws_history = history
                 await safe_send_json(ws, {
                     "type": "session_created",
                     "session_id": state.chat_session_id,
                 })
+                continue
+
+            if mtype == "rename_session":
+                sid = msg.get("session_id", "")
+                title = (msg.get("title") or "").strip()
+                if sid and title:
+                    agent = await get_shared_agent(state.user_id)
+                    await agent.sync_memory_namespace()
+                    if await agent.memory.session_belongs_to_namespace(sid):
+                        await agent.rename_session(sid, title)
+                        await safe_send_json(ws, {
+                            "type": "session_renamed", "session_id": sid, "title": title[:60]})
+                continue
+
+            if mtype == "pin_session":
+                sid = msg.get("session_id", "")
+                pinned = bool(msg.get("pinned", True))
+                if sid:
+                    agent = await get_shared_agent(state.user_id)
+                    await agent.set_session_pinned(sid, pinned)
+                    await safe_send_json(ws, {
+                        "type": "session_pinned", "session_id": sid, "pinned": pinned})
+                continue
+
+            if mtype == "archive_session":
+                sid = msg.get("session_id", "")
+                archived = bool(msg.get("archived", True))
+                if sid:
+                    agent = await get_shared_agent(state.user_id)
+                    await agent.set_session_archived(sid, archived)
+                    if archived and sid == state.chat_session_id:
+                        # 归档即当前会话：对话栏与全局历史清空（下次发消息自动续新会话）
+                        state.chat_session_id = None
+                        history[:] = []
+                        state._ws_history = history
+                        await safe_send_json(ws, {
+                            "type": "session_archived", "session_id": sid,
+                            "archived": True, "active_changed": True})
+                    else:
+                        await safe_send_json(ws, {
+                            "type": "session_archived", "session_id": sid, "archived": archived})
                 continue
 
             if mtype == "delete_session":
@@ -1983,7 +5430,23 @@ async def websocket_endpoint(ws: WebSocket):
                 if sid:
                     agent = await get_shared_agent(state.user_id)
                     await agent.delete_session(sid)
-                    await safe_send_json(ws, {"type": "session_deleted", "session_id": sid})
+                    if sid == state.chat_session_id:
+                        # 删除的是当前会话：自动续新会话，避免对话栏停在已删会话上
+                        await agent.sync_memory_namespace()
+                        agent.memory.session_id = None
+                        await agent.memory.get_or_create_session()
+                        state.chat_session_id = agent.memory.session_id
+                        history[:] = []             # 原地清空全局共享列表
+                        state._ws_history = history
+                        await safe_send_json(ws, {
+                            "type": "session_deleted", "session_id": sid,
+                            "next_session_id": state.chat_session_id})
+                        await safe_send_json(ws, {
+                            "type": "session_created",
+                            "session_id": state.chat_session_id})
+                    else:
+                        await safe_send_json(ws, {
+                            "type": "session_deleted", "session_id": sid})
                 continue
 
             # === 当前形象与场景同步 ===
@@ -2146,7 +5609,7 @@ async def websocket_endpoint(ws: WebSocket):
                     last_active_speak=getattr(state, "_last_proactive_speak", 0),
                     active_speak_cooldown=ACTIVE_SPEAK_COOLDOWN,
                 )
-                await _apply_dispatch_result(ws, result, history, state)
+                await _apply_dispatch_result(ws, result, history, state, mtype)
                 continue
 
             if mtype == "ai_moving":
@@ -2154,8 +5617,29 @@ async def websocket_endpoint(ws: WebSocket):
                 state.ai_is_moving = msg.get("moving", False)
                 continue
 
-            # === 对话打断（已禁用：防止用户误触） ===
+            # === 媒体子智能体回报（前端播放事件 → 闭环看护 worker） ===
+            if mtype == "music_end":
+                # <audio> 单曲/歌单最后一首播完
+                asyncio.create_task(_handle_music_end(ws, msg))
+                continue
+
+            if mtype == "music_stop":
+                asyncio.create_task(_handle_music_stop(ws, msg))
+                continue
+
+            if mtype == "video_stop":
+                asyncio.create_task(_handle_video_stop(ws, msg))
+                continue
+
+            # === 对话打断（停止/按住说话/VAD 打断统一确认：取消任务并回执，
+            #      前端据此复位状态徽章，避免打断后一直卡在「说话中」） ===
             if mtype == "interrupt":
+                _interrupted_sid = state.current_session
+                state.cancel_current()
+                if state.active_task and not state.active_task.done():
+                    state.active_task.cancel()
+                await safe_send_json(ws, {"type": "interrupted",
+                                          "session_id": _interrupted_sid or ""})
                 continue
 
             # === AI 自主行为触发（跳舞/走动/游戏解说等） ===
@@ -2168,6 +5652,13 @@ async def websocket_endpoint(ws: WebSocket):
                 text = msg.get("content", "")
                 if not text.strip():
                     continue
+                # 用户活跃窗口守卫：大厅模式下，用户 1 分钟内有主动对话 →
+                # 抑制 AI 自主说话（好奇心自言自语/问候等），不"一直废话"；
+                # 游戏中解说/反应属于外部触发，放行。
+                in_game = bool(state.game_engine and state.game_engine.game_key)
+                if (not in_game
+                        and time.time() - state.last_user_message_time < ACTIVE_USER_GUARD):
+                    continue
                 gc = state.game_engine.get_game_context_for_ai() if state.game_engine else None
                 # 环境交互：不进短期记忆（history），由记忆系统处理
                 await _kickoff_response(ws, text, history, state, game_context=gc,
@@ -2178,6 +5669,9 @@ async def websocket_endpoint(ws: WebSocket):
                 text = msg.get("content", "")
                 if not text.strip():
                     continue
+                # ui=True 的系统点击消息不进短期记忆（由记忆系统按 auto 处理）
+                ui_auto = msg.get("ui") is True
+                # 自然语言统一交给主 Agent（harness 底座）；斜杠命令通道已移除
                 state.last_user_message_time = time.time()
                 state.last_response_done = time.time() + 86400
                 # 用户互动 → AI 好奇心涨
@@ -2202,10 +5696,6 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     logger.warning(f"RL强制路由记录失败: {e}")
                 gc = state.game_engine.get_game_context_for_ai() if state.game_engine else None
-                # ui=True 的消息是系统生成的点击/UI 互动文本（戳身体、换装、换背景等），
-                # 不是用户原话：保留互动信号（RL 奖励/AI 回应），但不记录短期记忆、
-                # 不提取用户记忆——重复点击不再污染记忆导致思维僵化
-                ui_auto = msg.get("ui") is True
                 await _kickoff_response(
                     ws, text, history, state, game_context=gc, allow_interrupt=True,
                     record_history=not ui_auto,
@@ -2268,28 +5758,73 @@ async def websocket_endpoint(ws: WebSocket):
                       f"魔数={audio_bytes[:8].hex()}, tmp={tmp_in.name}")
 
                 # 取消当前 AI 回复（语音输入必然打断 TTS 播放）
-                state.last_response_done = time.time() + 86400  # 标记用户管道活跃，禁止被动事件打断
-                state.cancel_current()
-                if state.active_task and not state.active_task.done():
-                    state.active_task.cancel()
-                await safe_send_json(ws, {"type": "listening"})
+                # 唤醒词待机模式例外：先识别再判定，未命中唤醒词不打断 AI 播报
+                is_wake_check = bool(msg.get("wake_check")) and bool(wake_config.get("enabled", True))
+                if not is_wake_check:
+                    state.last_response_done = time.time() + 86400  # 标记用户管道活跃，禁止被动事件打断
+                    state.cancel_current()
+                    if state.active_task and not state.active_task.done():
+                        state.active_task.cancel()
+                    await safe_send_json(ws, {"type": "listening"})
                 ok = False
-                try:
-                    ok = await asyncio.to_thread(convert_to_wav, tmp_in.name, tmp_wav)
-                except Exception as e:
-                    print(f"[STT] ffmpeg 异常: {e}")
                 text = ""
-                if ok:
-                    try:
+                try:
+                    # 第一遍：快速路径（仅裁剪静音，干净音频足够，速度快）
+                    ok = await asyncio.to_thread(convert_to_wav, tmp_in.name, tmp_wav, False)
+                    if ok:
                         text = await asyncio.to_thread(speech_to_text, tmp_wav)
-                    except Exception as e:
-                        print(f"[STT] 失败: {e}")
+                    # 第二遍：降噪路径（环境噪声大导致首轮识别失败时重试，提升准确率）
+                    if ok and not text:
+                        print("[STT] 首轮无结果，启用降噪滤波重试…")
+                        ok = await asyncio.to_thread(convert_to_wav, tmp_in.name, tmp_wav, True)
+                        if ok:
+                            text = await asyncio.to_thread(speech_to_text, tmp_wav)
+                except Exception as e:
+                    print(f"[STT] ffmpeg/识别异常: {e}")
                 # 清理临时文件
                 for p in (tmp_in.name, tmp_in.name.replace(".opus", ".webm"), tmp_wav):
                     try:
                         os.unlink(p)
                     except Exception:
                         pass
+
+                # ===== 唤醒词待机分支：只做唤醒判定，不进入对话管线 =====
+                if is_wake_check:
+                    matched_word = None
+                    if ok and text:
+                        t_match = time.time()
+                        # 复杂场景容错：云端识别失败自动降级本地后仍可命中；
+                        # 模糊匹配容忍近音字/漏字（见 match_wake_word）
+                        try:
+                            matched_word = await asyncio.to_thread(match_wake_word, text)
+                        except Exception as e:
+                            print(f"[Wake] 匹配异常: {e}")
+                        print(f"[Wake] 待机识别: '{text[:30]}' 命中={matched_word} "
+                              f"(耗时{time.time() - t_match:.2f}s)")
+                    if matched_word:
+                        # 命中唤醒词 → 打断当前播报并通知前端进入对话模式
+                        state._stt_fail_count = 0
+                        state._stt_cooldown_until = 0
+                        state.last_user_message_time = time.time()
+                        state.cancel_current()
+                        if state.active_task and not state.active_task.done():
+                            state.active_task.cancel()
+                        await safe_send_json(ws, {
+                            "type": "wake_ok",
+                            "word": matched_word,
+                            "transcript": text,
+                        })
+                    else:
+                        if not ok or not text:
+                            # 识别失败也计入冷却计数（防止噪声环境反复消耗资源），
+                            # 但不发送 restart_vad —— 待机模式允许静默失败重试
+                            state._stt_fail_count += 1
+                            if state._stt_fail_count >= STT_FAIL_MAX:
+                                state._stt_cooldown_until = now + STT_COOLDOWN
+                                print(f"[STT] 连续失败{state._stt_fail_count}次，暂停{STT_COOLDOWN}秒")
+                        await safe_send_json(ws, {"type": "wake_fail", "transcript": text})
+                    continue
+
                 # ffmpeg 处理成功但没有识别文本 vs 完全失败
                 if not ok:
                     # ffmpeg 转换失败（可能数据损坏），通知前端重建 VAD
@@ -2351,15 +5886,20 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(ws)
     except Exception as e:
+        # 重启/握手竞态下连接可能未真正建立：按断开处理，不打 traceback 刷屏
+        if "accept" in str(e) or "not connected" in str(e).lower():
+            print(f"[WS] 连接未建立/已失效，按断开处理: {e}")
+            manager.disconnect(ws)
+            return
         import traceback
         print(f"[WS] 错误: {e}")
         traceback.print_exc()
         manager.disconnect(ws)
     finally:
-        # 连接已关闭，取消该连接上可能仍在运行的 AI 回复任务
-        state.cancel_current()
-        if state.active_task and not state.active_task.done():
-            state.active_task.cancel()
+        # 单系统模式：连接关闭不取消回复任务——让 AI 把话说完、把结果写进记忆，
+        # 用户刷新/重新进入后能看到完整回复（safe_send_json 对已断连接静默降级）。
+        # 只有该连接自己后续重连前主动发起的新一轮会正常取代旧会话。
+        pass
 
 
 # ==================== 百科题库服务（寻宝游戏答题） ====================
@@ -2570,7 +6110,617 @@ def api_quiz_check(payload: dict):
     return {"code": 200, **result}
 
 
+# ==================== harness 管理 API（技能 / 插件 / 健康状态） ====================
+# 「大白」的稳定扩展层：技能与插件从这里热启停、热重载、查看状态。
+# 管理页面：GET /harness（web/harness.html）；所有改动即时生效并持久化。
+
+def _harness():
+    from harness import get_harness
+    return get_harness()
+
+
+def _hot_reload_ext_callback():
+    """技能/插件/工具定义文件变化 → 热重载 harness + 刷新全部共享 agent 工具。
+
+    由 hot_reload 守护线程调用（不阻塞事件循环）；失败只记录，不影响服务。
+    """
+    try:
+        info = _harness().reload_all()
+        n_refreshed = 0
+        for ag in list(_shared_agents.values()):
+            try:
+                ag.refresh_local_tools()
+                n_refreshed += 1
+            except Exception as e:
+                logger.warning(f"热重载刷新 agent 工具失败: {e}")
+        logger.info(
+            f"[HotReload] 技能/插件已热重载（技能 {info.get('skills')} 个、"
+            f"插件 {info.get('plugins')} 个），已刷新 {n_refreshed} 个 agent"
+        )
+    except Exception as e:
+        logger.warning(f"[HotReload] 技能/插件热重载失败: {e}")
+
+
+@app.get("/api/harness/status")
+async def api_harness_status():
+    """harness 运行时健康状态（技能/插件/工具数/最近事件）。"""
+    try:
+        return {"code": 200, **_harness().status()}
+    except Exception as e:
+        return JSONResponse({"code": 500, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/harness/reload")
+async def api_harness_reload():
+    """热重载全部技能与插件。"""
+    try:
+        info = _harness().reload_all()
+        return {"code": 200, "message": "已热重载全部技能与插件", **info}
+    except Exception as e:
+        return JSONResponse({"code": 500, "message": str(e)}, status_code=500)
+
+
+@app.get("/api/harness/runtime")
+async def api_harness_runtime():
+    """Agent 监督运行时快照：LLM/工具调用统计、熔断器、在途对话轮、token 用量。"""
+    try:
+        return {"code": 200, "runtime": _harness().runtime.snapshot()}
+    except Exception as e:
+        return JSONResponse({"code": 500, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/harness/runtime/reset")
+async def api_harness_runtime_reset(payload: dict):
+    """手动复位熔断器（body: {"name": "llm:chat" 或 "tool:music_search"}）。"""
+    name = str((payload or {}).get("name") or "").strip()
+    if not name:
+        return JSONResponse({"code": 400, "message": "缺少 name（如 llm:chat / tool:xxx）"}, status_code=400)
+    if _harness().runtime.reset_breaker(name):
+        return {"code": 200, "message": f"熔断器 {name} 已复位"}
+    return JSONResponse({"code": 404, "message": f"熔断器 {name} 不存在"}, status_code=404)
+
+
+# ---------- 任务系统（长任务 / 批量任务 / 队列） ----------
+
+@app.get("/api/harness/tasks")
+async def api_harness_tasks(state: str = "", kind: str = "", limit: int = 20):
+    """任务列表（可按状态/类型过滤）。"""
+    try:
+        h = _harness()
+        h.tasks.ensure_started()
+        return {"code": 200,
+                "tasks": h.tasks.list_tasks(state=state or None, kind=kind or None,
+                                            limit=max(1, min(int(limit), 100)))}
+    except Exception as e:
+        return JSONResponse({"code": 500, "message": str(e)}, status_code=500)
+
+
+@app.get("/api/harness/tasks/{task_id}")
+async def api_harness_task_detail(task_id: str):
+    """任务详情（含步骤/条目级状态与结果）。"""
+    st = _harness().tasks.status(task_id)
+    if st is None:
+        return JSONResponse({"code": 404, "message": f"任务 {task_id} 不存在"}, status_code=404)
+    return {"code": 200, "task": st}
+
+
+@app.post("/api/harness/tasks/{task_id}/cancel")
+async def api_harness_task_cancel(task_id: str):
+    if _harness().tasks.cancel(task_id):
+        return {"code": 200, "message": f"任务 {task_id} 已取消"}
+    return JSONResponse({"code": 404, "message": f"任务 {task_id} 不存在或已结束"}, status_code=404)
+
+
+@app.post("/api/harness/tasks/{task_id}/approve")
+@app.post("/api/harness/tasks/{task_id}/reject")
+async def api_harness_task_confirm(task_id: str, request: Request):
+    """批准/拒绝流程中等待确认的危险步骤。"""
+    action = request.url.path.rstrip("/").split("/")[-1]
+    payload = {}
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    note = str((payload or {}).get("note") or "")
+    ts = _harness().tasks
+    ok, msg = (ts.approve_step if action == "approve" else ts.reject_step)(task_id, note)
+    if ok:
+        return {"code": 200, "message": msg}
+    return JSONResponse({"code": 404, "message": msg}, status_code=404)
+
+
+@app.post("/api/harness/tasks/{task_id}/retry")
+async def api_harness_task_retry(task_id: str):
+    if _harness().tasks.retry(task_id):
+        return {"code": 200, "message": f"任务 {task_id} 已重试（保留已成功部分）"}
+    return JSONResponse({"code": 404, "message": f"任务 {task_id} 不存在或仍在运行"}, status_code=404)
+
+
+@app.get("/api/harness/queues")
+async def api_harness_queues():
+    """队列状态（worker 数 / 排队 / 运行中 / 暂停）。"""
+    h = _harness()
+    h.tasks.ensure_started()
+    return {"code": 200, "queues": h.tasks.queue_stats()}
+
+
+@app.post("/api/harness/queues/{name}/pause")
+@app.post("/api/harness/queues/{name}/resume")
+async def api_harness_queue_action(name: str, request: Request):
+    action = request.url.path.rstrip("/").split("/")[-1]
+    paused = action == "pause"
+    if _harness().tasks.pause_queue(name, paused):
+        return {"code": 200, "message": f"队列 {name} 已{'暂停' if paused else '恢复'}"}
+    return JSONResponse({"code": 404, "message": f"队列 {name} 不存在"}, status_code=404)
+
+
+@app.get("/api/harness/skills")
+async def api_harness_skills():
+    h = _harness()
+    h.ensure_loaded()
+    return {"code": 200, "skills": h.skills.list_info()}
+
+
+@app.post("/api/harness/skills/{name}/enable")
+async def api_harness_skill_enable(name: str):
+    if not _harness().skills.set_enabled(name, True):
+        return JSONResponse({"code": 404, "message": f"技能 {name} 不存在"}, status_code=404)
+    return {"code": 200, "message": f"技能 {name} 已启用"}
+
+
+@app.post("/api/harness/skills/{name}/disable")
+async def api_harness_skill_disable(name: str):
+    if not _harness().skills.set_enabled(name, False):
+        return JSONResponse({"code": 404, "message": f"技能 {name} 不存在"}, status_code=404)
+    return {"code": 200, "message": f"技能 {name} 已禁用"}
+
+
+@app.post("/api/harness/skills/{name}/reload")
+async def api_harness_skill_reload(name: str):
+    if not _harness().skills.reload(name):
+        return JSONResponse({"code": 404, "message": f"技能 {name} 不存在"}, status_code=404)
+    return {"code": 200, "message": f"技能 {name} 已重载"}
+
+
+@app.get("/api/harness/plugins")
+async def api_harness_plugins():
+    h = _harness()
+    h.ensure_loaded()
+    return {"code": 200, "plugins": h.plugins.list_info()}
+
+
+@app.post("/api/harness/plugins/{name}/enable")
+@app.post("/api/harness/plugins/{name}/disable")
+@app.post("/api/harness/plugins/{name}/reload")
+async def api_harness_plugin_action(name: str, request: Request):
+    """插件启用/禁用/重载（动作从 URL 尾部解析）。"""
+    action = request.url.path.rstrip("/").split("/")[-1]
+    h = _harness()
+    if action == "enable":
+        ok = h.plugins.set_enabled(name, True)
+    elif action == "disable":
+        ok = h.plugins.set_enabled(name, False)
+    else:
+        ok = h.plugins.reload(name)
+    if not ok:
+        return JSONResponse({"code": 404, "message": f"插件 {name} 不存在"}, status_code=404)
+    label = {"enable": "启用", "disable": "禁用", "reload": "重载"}.get(action, action)
+    return {"code": 200, "message": f"插件 {name} 已{label}"}
+
+
+# ---------- video 技能原生端点（能力来自 skills/media/video_lib.py，无外部服务） ----------
+# 前端与技能全部走这些同源相对路径（/api/video_hub/*），手机/局域网与桌面端统一可用。
+_VH_PASS_HEADERS = {"content-type", "content-length", "content-range",
+                    "accept-ranges", "etag", "last-modified", "cache-control"}
+
+
+_VIDEO_LIB_MTIME = {"ts": 0.0}
+_VIDEO_LIB_LOCK = threading.Lock()
+
+
+def _video_lib():
+    """加载 video 技能核心库（与技能共享同一模块实例：STREAMS/队列状态互通）。
+
+    video_lib.py 在 skills/ 下，改动只触发技能热重载（reload skill.py），
+    不会刷新 sys.modules 里的 video_lib 实例。这里按文件 mtime 自动
+    reload，改完 video_lib.py 后下一次 API 调用即生效，无需重启进程。
+    注意：reload 会重置 STREAMS/队列等模块级状态（正在播放的流会断）。"""
+    _p = str(Path(__file__).parent / "skills" / "media")
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+    import video_lib
+    try:
+        mtime = (Path(_p) / "video_lib.py").stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if mtime and mtime != _VIDEO_LIB_MTIME["ts"]:
+        with _VIDEO_LIB_LOCK:
+            if mtime != _VIDEO_LIB_MTIME["ts"]:
+                if _VIDEO_LIB_MTIME["ts"]:  # 0.0=进程首次加载，本就是最新代码
+                    importlib.reload(video_lib)
+                    logger.info("video_lib.py 已变更，自动重载完成")
+                _VIDEO_LIB_MTIME["ts"] = mtime
+    return video_lib
+
+
+@app.get("/api/video_hub/api/platforms")
+async def vh_platforms():
+    return {"platforms": _video_lib().PLATFORMS, "default": "all",
+            "sort_modes": [{"id": "relevance", "name": "相关性最高"},
+                           {"id": "hot", "name": "最热门"}]}
+
+
+@app.get("/api/video_hub/api/search")
+async def vh_search(q: str = "", platform: str = "all", sort: str = "relevance",
+                    limit: int = 12, page: int = 1):
+    q = q.strip()
+    if not q:
+        return JSONResponse({"error": "missing required param: q"}, status_code=400)
+    if q.startswith("http"):
+        return JSONResponse({"error": "this is a URL, use POST play with {\"url\": ...}"}, status_code=400)
+    limit = max(1, min(limit, 24))
+    page = max(1, min(page, 50))
+    try:
+        results = await asyncio.to_thread(_video_lib().search_videos,
+                                          q, platform, limit, sort, page)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"search failed: {e}"}, status_code=502)
+    return {"query": q, "platform": platform, "sort": sort,
+            "count": len(results), "page": page,
+            "has_more": len(results) >= limit, "results": results}
+
+
+@app.get("/api/video_hub/api/hot")
+async def vh_hot(platform: str = "all", limit: int = 12, page: int = 1):
+    """热门 / 推荐：无关键词即可用，按平台返回官网热门列表（字段与搜索结果一致）。"""
+    limit = max(1, min(limit, 24))
+    page = max(1, min(page, 50))
+    try:
+        results = await asyncio.to_thread(_video_lib().hot_videos,
+                                          platform, limit, page)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"hot fetch failed: {e}"}, status_code=502)
+    return {"platform": platform, "count": len(results), "page": page,
+            "has_more": len(results) >= limit, "results": results}
+
+
+# ---------- 缩略图代理：B站图床有 Referer 防盗链、XVideos 图床需走代理，
+# 浏览器直连外链都会失败，统一由后端按平台策略拉取转发（域名白名单防 SSRF） ----------
+_VH_THUMB_HOSTS = ("hdslb.com", "bilibili.com", "acfun.cn", "aixifan.com",
+                   "xvideos-cdn.com", "xvideos.com", "xnxx-cdn.com",
+                   "ytimg.com", "youtube.com", "googlevideo.com")
+
+
+def _vh_thumb_fetch(url: str):
+    from urllib.parse import urlparse
+    pu = urlparse(url)
+    host = (pu.hostname or "").lower()
+    if pu.scheme not in ("http", "https") or not host:
+        raise ValueError("bad url")
+    if not any(host == a or host.endswith("." + a) for a in _VH_THUMB_HOSTS):
+        raise PermissionError("host not allowed")
+    lib = _video_lib()
+    if "xvideos" in host or "xnxx" in host:
+        return lib._xv_get(url, timeout=10)  # 走 fq 代理
+    if "ytimg" in host or "youtube" in host or "googlevideo" in host:
+        return lib._xv_get(url, timeout=10)  # YouTube 图床走 fq 代理
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+    if "hdslb" in host or "bilibili" in host:
+        headers["Referer"] = "https://www.bilibili.com/"  # 图床防盗链
+    elif "acfun" in host or "aixifan" in host:
+        headers["Referer"] = "https://www.acfun.cn/"
+    import requests as _rq
+    return _rq.get(url, headers=headers, timeout=10)
+
+
+@app.get("/api/video_hub/thumb")
+async def vh_thumb(u: str = ""):
+    if not u:
+        return JSONResponse({"error": "missing required param: u"}, status_code=400)
+    try:
+        r = await asyncio.to_thread(_vh_thumb_fetch, u)
+    except (ValueError, PermissionError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"thumb fetch failed: {e}"}, status_code=502)
+    ct = (r.headers.get("content-type") or "").split(";")[0].strip()
+    if r.status_code != 200 or not ct.startswith("image/"):
+        return JSONResponse({"error": f"thumb http {r.status_code}"}, status_code=502)
+    return Response(content=r.content, media_type=ct,
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+async def _vh_json_body(request: Request) -> dict:
+    try:
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.post("/api/video_hub/api/play")
+async def vh_play(request: Request):
+    lib = _video_lib()
+    body = await _vh_json_body(request)
+    query = str(body.get("query") or "").strip()
+    url = str(body.get("url") or "").strip()
+    platform = body.get("platform") or "all"
+    sort = body.get("sort") or "relevance"
+    if not query and not url:
+        return JSONResponse({"error": "need 'query' in JSON body"}, status_code=400)
+    try:
+        if url:
+            entry = await asyncio.to_thread(lib.resolve_and_play, url,
+                                            bool(body.get("force")))
+        else:
+            entry = await asyncio.to_thread(lib.play_by_query, query, platform, sort)
+    except LookupError:
+        return JSONResponse({"error": f"no results for: {query}"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": f"resolve failed: {e}"}, status_code=502)
+    return entry
+
+
+@app.api_route("/api/video_hub/api/queue", methods=["GET", "POST", "DELETE"])
+async def vh_queue(request: Request):
+    lib = _video_lib()
+    if request.method == "GET":
+        return {"queue": await asyncio.to_thread(lib.queue_list)}
+    if request.method == "DELETE":
+        all_flag = request.query_params.get("all") == "1"
+        try:
+            i = None if all_flag else int(request.query_params.get("i", -1))
+        except ValueError:
+            return JSONResponse({"error": "i must be int"}, status_code=400)
+        await asyncio.to_thread(lib.queue_remove, i, all_flag)
+        return {"ok": True}
+    body = await _vh_json_body(request)
+    query = str(body.get("query") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not query and not url:
+        return JSONResponse({"error": "need 'query' or 'url'"}, status_code=400)
+    try:
+        entry, pos = await asyncio.to_thread(
+            lib.queue_add, url or None, query or None,
+            body.get("platform") or "all", body.get("sort") or "relevance")
+    except LookupError:
+        return JSONResponse({"error": f"no results for: {query}"}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"resolve failed: {e}"}, status_code=502)
+    return {"queued": entry, "position": pos}
+
+
+@app.post("/api/video_hub/api/ended")
+async def vh_ended(request: Request):
+    # 大屏视频播完：先闭环看护子智能体（worker_id 由前端在播完回报时带回），
+    # 再取队列下一部连播。
+    body = await _vh_json_body(request)
+    wid = str(body.get("worker_id") or "").strip()
+    if wid:
+        try:
+            mgr = _get_media_workers()
+            worker = mgr.get(wid)
+            if worker is not None:
+                await mgr.complete(wid, f"《{worker.title}》已经播放完毕。")
+        except Exception as e:
+            logger.warning(f"[MediaWorker] 视频播完回报处理失败: {e}")
+    return {"next": await asyncio.to_thread(_video_lib().pop_next)}
+
+
+@app.post("/api/video_hub/api/report")
+async def vh_report(request: Request):
+    body = await _vh_json_body(request)
+    await asyncio.to_thread(_video_lib().report, body)
+    return {"ok": True}
+
+
+@app.post("/api/video_hub/api/control")
+async def vh_control(request: Request):
+    body = await _vh_json_body(request)
+    action = str(body.get("action") or "")
+    try:
+        data = await asyncio.to_thread(_video_lib().control, action, body.get("value"))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return data if isinstance(data, dict) else {"ok": True}
+
+
+@app.get("/api/video_hub/api/status")
+async def vh_status():
+    return await asyncio.to_thread(_video_lib().public_state)
+
+
+# ---------- 视频收藏夹（分类 + 收藏，本地持久化到 video_favorites.json） ----------
+@app.get("/api/video_hub/api/favorites")
+async def vhf_list():
+    """列出全部分类与收藏视频。"""
+    return await asyncio.to_thread(video_fav_lib.list_all)
+
+
+@app.post("/api/video_hub/api/favorites/categories")
+async def vhf_create_category(request: Request):
+    """创建收藏分类。body: {"name": "..."}"""
+    body = await _vh_json_body(request)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "分类名不能为空"}, status_code=400)
+    try:
+        cat = await asyncio.to_thread(video_fav_lib.create_category, name)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "category": cat}
+
+
+@app.patch("/api/video_hub/api/favorites/categories/{cid}")
+async def vhf_rename_category(cid: str, request: Request):
+    """重命名收藏分类。body: {"name": "..."}"""
+    body = await _vh_json_body(request)
+    name = str(body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "分类名不能为空"}, status_code=400)
+    try:
+        cat = await asyncio.to_thread(video_fav_lib.rename_category, cid, name)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not cat:
+        return JSONResponse({"error": "分类不存在"}, status_code=404)
+    return {"ok": True, "category": cat}
+
+
+@app.delete("/api/video_hub/api/favorites/categories/{cid}")
+async def vhf_delete_category(cid: str):
+    """删除收藏分类；分类下视频自动归入「未分类」。"""
+    if not await asyncio.to_thread(video_fav_lib.delete_category, cid):
+        return JSONResponse({"error": "分类不存在"}, status_code=404)
+    return {"ok": True, "deleted": cid}
+
+
+@app.post("/api/video_hub/api/favorites")
+async def vhf_add(request: Request):
+    """收藏视频。body: {"video": {...}, "category_id"?: str|null}"""
+    body = await _vh_json_body(request)
+    video = body.get("video")
+    if not isinstance(video, dict):
+        return JSONResponse({"error": "缺少 video 字段"}, status_code=400)
+    category_id = body.get("category_id")
+    if category_id is not None:
+        category_id = str(category_id) or None
+    try:
+        out = await asyncio.to_thread(video_fav_lib.add_favorite, video, category_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, **out}
+
+
+@app.delete("/api/video_hub/api/favorites/{fid}")
+async def vhf_remove(fid: str):
+    """取消收藏。"""
+    if not await asyncio.to_thread(video_fav_lib.remove_favorite, fid):
+        return JSONResponse({"error": "收藏不存在"}, status_code=404)
+    return {"ok": True, "removed": fid}
+
+
+@app.post("/api/video_hub/api/favorites/{fid}/category")
+async def vhf_move(fid: str, request: Request):
+    """把收藏移到指定分类（category_id=null 归入未分类）。"""
+    body = await _vh_json_body(request)
+    category_id = body.get("category_id")
+    if category_id is not None:
+        category_id = str(category_id) or None
+    try:
+        moved = await asyncio.to_thread(video_fav_lib.move_favorite, fid, category_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if not moved:
+        return JSONResponse({"error": "收藏不存在"}, status_code=404)
+    return {"ok": True, "moved": fid}
+
+
+@app.get("/api/video_hub/proxy")
+def vh_proxy(request: Request, k: str = ""):
+    """direct 直链流：转发 Range 实现拖进度，注入 Referer/UA 绕过防盗链。"""
+    from fastapi.responses import StreamingResponse as _SR
+    import requests as _rq
+    try:
+        upstream = _video_lib().open_proxy(k, request.headers.get("range"))
+    except KeyError:
+        return JSONResponse({"error": "stream expired, re-play via video_play"}, status_code=404)
+    except _rq.RequestException as e:
+        return JSONResponse({"error": f"upstream failed: {e}"}, status_code=502)
+
+    passthrough = {kk: vv for kk, vv in upstream.headers.items()
+                   if kk.lower() in _VH_PASS_HEADERS}
+    if upstream.status_code in (200, 206):
+        passthrough["Accept-Ranges"] = "bytes"
+
+    def _stream():
+        try:
+            for chunk in upstream.iter_content(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return _SR(_stream(), status_code=upstream.status_code, headers=passthrough)
+
+
+@app.get("/api/video_hub/relay/{key}")
+def vh_relay(key: str, t: str = "", ss: float = 0.0):
+    """relay 实时合流（默认 -c copy 转封装，亚秒延迟）；
+    ?t=1 为转码兜底模式（源编码浏览器解不了时全转 h264+aac）；
+    ?ss=N 从第 N 秒起播（断流恢复的断点续播）。"""
+    from fastapi.responses import StreamingResponse as _SR
+    try:
+        proc, mime = _video_lib().start_relay(key, transcode=(t == "1"), ss=ss)
+    except KeyError:
+        return JSONResponse({"error": "stream expired, re-play via video_play"}, status_code=404)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=501)
+    except OSError as e:
+        return JSONResponse({"error": f"ffmpeg spawn failed: {e}"}, status_code=500)
+
+    def _stream():
+        # 根治 ffmpeg 进程泄漏：阻塞读会让生成器卡死在 read 上，
+        # 客户端断开时 finally 永远执行不到 → 进程变僵尸越积越多。
+        # 改为独立线程读 + 队列轮询：ffmpeg 卡住时生成器仍可被 close，
+        # finally 里的 kill 能及时执行，进程不再泄漏。
+        import queue as _q
+        q = _q.Queue(maxsize=64)
+
+        def _reader():
+            try:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        q.put(None)
+                        break
+                    q.put(chunk)
+            except Exception:
+                q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+        try:
+            while True:
+                try:
+                    chunk = q.get(timeout=1.0)
+                except _q.Empty:
+                    continue
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    return _SR(_stream(), media_type=mime, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/harness")
+async def harness_admin_page():
+    """harness 管理页面（技能/插件启停与热重载）。"""
+    from fastapi.responses import FileResponse as _FR
+    resp = _FR(str(WEB_DIR / "harness.html"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
 if __name__ == "__main__":
+    # Windows 控制台默认 GBK，emoji 会导致 UnicodeEncodeError 崩溃，强制 utf-8 容错
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
     import ssl
     ip = get_lan_ip()
 
@@ -2588,62 +6738,88 @@ if __name__ == "__main__":
     print("   3D 虚拟 AI 角色陪聊 服务器已启动")
     print("=" * 50)
     if use_https:
-        print(f"  本机访问 : https://127.0.0.1:8000")
-        print(f"  局域网   : https://{ip}:8000")
+        print(f"  本机访问 : https://127.0.0.1:{SERVER_PORT}")
+        print(f"  局域网   : https://{ip}:{SERVER_PORT}")
         if has_ipv6:
-            print(f"  IPv6    : https://[{ipv6}]:8000")
+            print(f"  IPv6    : https://[{ipv6}]:{SERVER_PORT}")
         print(f"  ⚠ 手机首次访问会提示证书不安全 → 点「高级」→「继续访问」")
         print(f"  ✅ HTTPS 模式：陀螺仪/VR模式传感器 API 已解锁")
     else:
-        print(f"  本机访问 : http://127.0.0.1:8000")
-        print(f"  局域网   : http://{ip}:8000")
+        print(f"  本机访问 : http://127.0.0.1:{SERVER_PORT}")
+        print(f"  局域网   : http://{ip}:{SERVER_PORT}")
         if has_ipv6:
-            print(f"  IPv6    : http://[{ipv6}]:8000")
+            print(f"  IPv6    : http://[{ipv6}]:{SERVER_PORT}")
     print(f"  手机请连接同一 Wi-Fi 后访问上述局域网地址")
     if has_ipv6:
         print(f"  ✅ IPv6 双栈监听已启用（IPv4 + IPv6 均可访问）")
     print("=" * 50 + "\n")
 
     # 静默 Windows asyncio WebSocket 断开时的 ConnectionResetError
-    # 方案1：事件循环异常处理器（捕获大部分异常）
+    # 方案1：事件循环异常处理器（兜底）
+    #   ⚠ 原来只对临时 new_event_loop() 设置处理器没用 —— uvicorn.run() 会再创建
+    #   自己的事件循环，那个循环没装处理器，异常照样打印。改用事件循环策略，
+    #   此后每个新建循环（含 uvicorn 实际使用的那个）都会自动挂上静默处理器。
     import asyncio as _asyncio
-    _loop = _asyncio.new_event_loop()
     def _silent_exc_handler(loop, context):
         exc = context.get('exception')
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
             return  # 客户端断开，正常情况，无需日志
         loop.default_exception_handler(context)
-    _loop.set_exception_handler(_silent_exc_handler)
-    _asyncio.set_event_loop(_loop)
 
-    # 方案2：补丁 _ProactorBasePipeTransport._call_connection_lost
-    # 解决 Windows ProactorEventLoop 在 socket shutdown 时的 ConnectionResetError
-    #
-    # ⚠ 修复：不能直接 return 跳过原始方法！原始方法负责 shutdown/close socket
-    # 并清理 transport（_called_connection_lost 标记）。短路会导致：
-    #   - socket 永不关闭 → 连接卡在 CLOSE_WAIT 泄漏
-    #   - Proactor 事件循环上残留 pending 的 overlapped 读操作 → 事件循环卡死，
-    #     此后所有 HTTP 请求（含 /api/character_cards）全部超时，游戏无法加载角色
-    # 正确做法：仍调用原始方法完成清理，仅将连接断开类异常静默吞掉。
     try:
         import asyncio.proactor_events as _pe
         _orig_call_lost = _pe._ProactorBasePipeTransport._call_connection_lost
+
         def _patched_call_lost(self, exc):
-            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, OSError)):
-                try:
-                    _orig_call_lost(self, exc)
-                except (ConnectionResetError, ConnectionAbortedError, OSError, Exception):
-                    pass  # 静默忽略，socket 仍被原始方法正确关闭
-                return
-            _orig_call_lost(self, exc)
+            try:
+                _orig_call_lost(self, exc)
+            except OSError:
+                # 为什么必须从两个分支都拦住：
+                # 本机 CPython 的 _call_connection_lost 在 finally 里执行
+                #   self._sock.shutdown(socket.SHUT_RDWR)   # 没有 try/except 保护
+                # 远端已强制断开时这里抛 WinError 10054（ConnectionResetError），
+                # 会中断 finally 中后续的 self._sock.close() 与
+                # _called_connection_lost = True，导致 socket 泄漏、Proactor 循环
+                # 残留 pending overlapped 读而卡死（所有 HTTP 请求超时）。
+                # 注意 exc 参数不一定是连接错误（正常断开时是 None），shutdown
+                # 的异常是它自己新抛的，所以不能只按 exc 的类型判断。
+                # 只吞异常不够，必须补齐被中断的清理。
+                if not getattr(self, '_called_connection_lost', False):
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+                    self._sock = None
+                    server = self._server
+                    if server is not None:
+                        try:
+                            server._detach(self)
+                        except Exception:
+                            pass
+                        self._server = None
+                    self._called_connection_lost = True
+
         _pe._ProactorBasePipeTransport._call_connection_lost = _patched_call_lost
+
+        # 兜底：让 uvicorn 实际使用的循环也带静默异常处理器（防漏网之鱼）
+        class _SilentLoopPolicy(_asyncio.DefaultEventLoopPolicy):
+            def new_event_loop(self):
+                loop = super().new_event_loop()
+                loop.set_exception_handler(_silent_exc_handler)
+                return loop
+        _asyncio.set_event_loop_policy(_SilentLoopPolicy())
     except Exception:
         pass  # 非 Windows 或版本差异，忽略
 
     # host="::" 启用 IPv6 双栈监听（IPv4 + IPv6 均可访问）
     host = "::" if has_ipv6 else "0.0.0.0"
+
+    # 热更新守护：核心 Python 变化自动重启；技能/插件变化自动热重载
+    # （settings.json 的 harness.hot_reload=false 可关闭）
+    start_hot_reload(on_ext_reload=_hot_reload_ext_callback)
+
     if use_https:
-        uvicorn.run(app, host=host, port=8000, log_level="warning",
+        uvicorn.run(app, host=host, port=SERVER_PORT, log_level="warning",
                     ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
     else:
-        uvicorn.run(app, host=host, port=8000, log_level="warning")
+        uvicorn.run(app, host=host, port=SERVER_PORT, log_level="warning")

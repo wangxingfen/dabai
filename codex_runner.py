@@ -304,15 +304,11 @@ CLEANUP_KEYWORDS = (
 )
 
 CLEANUP_SAFETY_RULES = (
-    '\n\n【清理任务安全守则（强制遵守，与任务其他要求冲突时以此为准）】\n'
-    '1. 只允许删除"明确列出"的临时/可再生文件：*.pyc-check、*.tmp、*.bak-*、'
-    '_check*.txt、_diag*.pyc-check、codex_logs/ 下的运行日志、%TEMP% 下的临时文件；\n'
-    '2. 删除任何文件前，先用 git status / git ls-files 核对：git 已跟踪的项目文件'
-    '（源码、素材、网页、音频、游戏等）一律禁止删除，除非用户逐条明确同意；\n'
-    '3. 禁止整目录递归删除（rm -rf / Remove-Item -Recurse / rd /s / git clean -fd 等），'
-    '禁止删除项目核心目录（web/ models/ backgrounds/ bgm/ skills/ plugins/ harness/ 等）；\n'
-    '4. 动手前先列出将要删除的完整清单（路径+原因）展示给用户；清单之外的任何文件都不得删除；\n'
-    '5. 拿不准的文件一律跳过并在总结中说明，绝不"顺手删掉"。'
+    '\n\n【清理任务操作规范（删除不可逆，先确认再动手）】\n'
+    '1. 用户明确点名要删的文件/目录直接删；用户只是笼统说「清理/删除」时，'
+    '动手前先列出将要删除的完整清单（路径+原因）展示给用户，确认后再删；\n'
+    '2. 不限制文件类型与目录：git 已跟踪文件、递归删除、整目录删除均可，只要用户同意；\n'
+    '3. 拿不准是否该删的文件一律跳过并在总结中说明，绝不「顺手删掉」。'
 )
 
 
@@ -699,39 +695,48 @@ def _parse_log_file(log_path: str, after: int = 0, limit: int = 500) -> tuple:
         st = os.stat(log_path)
         key = (str(log_path), st.st_size, st.st_mtime_ns)
         cached = _TRACE_FILE_CACHE.get(key)
-        if cached is None:
-            out = []
-            reached = False
-            with open(log_path, 'rb') as f:
-                while True:
-                    raw = f.readline()
-                    if not raw:
-                        break
-                    line = ANSI_RE.sub('', decode_bytes(raw)).rstrip()
-                    if not line:
-                        continue
-                    e = state.feed(line)
-                    if e and e['seq'] > after and not reached:
-                        out.append(e)
-                        if len(out) >= limit:
-                            # 结果已够，但仍需喂完剩余行以得到准确的 seq/计数
-                            reached = True
-            # 只缓存中等文件（约 ≤2 万条），超大文件避免长期占内存
-            if state.seq <= 20000:
-                if len(_TRACE_FILE_CACHE) >= 4:
-                    _TRACE_FILE_CACHE.pop(next(iter(_TRACE_FILE_CACHE)), None)
-                _TRACE_FILE_CACHE[key] = state
-            return out, state
-        else:
-            cached_out = []
-            for e in cached.entries:
-                if e['seq'] > after:
-                    cached_out.append(e)
-                    if len(cached_out) >= limit:
-                        break
-            return cached_out, cached
+        if cached is not None:
+            return _slice_cached(cached, after, limit)
+        return _parse_full(log_path, key, state, after, limit)
     except OSError:
         return [], state
+
+
+def _slice_cached(cached, after: int, limit: int) -> tuple:
+    """从缓存状态切片出 after 之后的条目。"""
+    cached_out = []
+    for e in cached.entries:
+        if e['seq'] > after:
+            cached_out.append(e)
+            if len(cached_out) >= limit:
+                break
+    return cached_out, cached
+
+
+def _parse_full(log_path: str, key, state, after: int, limit: int) -> tuple:
+    """全量解析日志文件，中等大小结果写入缓存。"""
+    out = []
+    reached = False
+    with open(log_path, 'rb') as f:
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
+            line = ANSI_RE.sub('', decode_bytes(raw)).rstrip()
+            if not line:
+                continue
+            e = state.feed(line)
+            if e and e['seq'] > after and not reached:
+                out.append(e)
+                if len(out) >= limit:
+                    # 结果已够，但仍需喂完剩余行以得到准确的 seq/计数
+                    reached = True
+    # 只缓存中等文件（约 ≤2 万条），超大文件避免长期占内存
+    if state.seq <= 20000:
+        if len(_TRACE_FILE_CACHE) >= 4:
+            _TRACE_FILE_CACHE.pop(next(iter(_TRACE_FILE_CACHE)), None)
+        _TRACE_FILE_CACHE[key] = state
+    return out, state
 
 
 def get_task_trace(task_id: str, after: int = 0, limit: int = 500):

@@ -200,6 +200,13 @@ export class AIAutonomyController {
     this._aiMoving = true;
     this._lastAIMoveTime = performance.now();
 
+    // 关键：走路必须接管全身骨骼——先停掉正在播的 Mixamo 动作，
+    // 否则 animateModel 里 `if (App._mixamoActiveClip)` 直接 return，
+    // 程序式走路（applyFullBodyWalkAnimation）被跳过 → 腿僵
+    if (this.App._mixamoActiveClip && this.App.stopMixamoClip) {
+      this.App.stopMixamoClip(0.2);
+    }
+
     // 设置路径（skip 第一个点，它是当前位置），并过滤退化路点（过近 → 原地碎步/极短段）
     const rawWp = path.slice(1);
     const pts = [];

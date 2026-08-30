@@ -314,7 +314,9 @@ class AgentRuntime:
             meter.timeouts += 1
             meter.failures += 1
             meter.breaker.record(False)
-            msg = f"工具 '{tool_name}' 执行超时（>{timeout or self._cfg['tool_timeout']}s）"
+            msg = (f"工具 '{tool_name}' 执行超时（>{timeout or self._cfg['tool_timeout']}s）。"
+                   "请勿原样重试同一命令：先检查原因（路径/网络/权限/是否真的需要这么久），"
+                   "换参数、换工具，或把长任务交给后台任务系统，避免重复堆积执行。")
             self._emit("error", msg)
             return msg, False
         except Exception as e:

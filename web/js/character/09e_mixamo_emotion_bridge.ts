@@ -126,18 +126,16 @@ export default (function init(App: AppKernel) {
     }
 
     if (clipName) {
-      // 情绪表达动作播完 → 释放 Mixamo 接管权，回到程序式动画
-      // （单次动作播完会自行清除 _mixamoActiveClip，
-      //   因此用「仍是本动作 或 已释放接管权」判断，避免被更新的动作打断）
+      // 单次表达动作：让它完整演完（duration）+ 自动进入尾收软着陆（tail），
+      // 此层只在兜底出手——finished 事件极罕见丢失时确保仍能交权回程序微动作。
+      // 兜底计时 = 完整演出时长 + 尾收间隔：绝不中途掐短正在完整播放的动作。
       const info = App.mixamoClips[clipName];
       if (info?.clip?.duration) {
-        // 释放上限 5s：Mixamo 部分单次动作原始时长很长（10~30s），
-        // 若按原始时长等待，角色会长时间保持同一个动作（“几十秒不动”）
+        const tailS = (App.ANIM_PLAY_PARAMS && App.ANIM_PLAY_PARAMS.tail) || 0.55;
         setTimeout(() => {
-          if (App._mixamoActiveClip === clipName || !App._mixamoActiveClip) {
-            App.stopMixamoClip();
-          }
-        }, Math.min(info.clip.duration, 5) * 1000);
+          const stillMine = App._mixamoActiveClip === clipName && !App._mixamoTailActive;
+          if (stillMine) App.stopMixamoClip();
+        }, info.clip.duration * 1000 + tailS * 1000);
       }
     }
     // 没有表达动作 → 保持程序式动画，不播放 Mixamo 待机

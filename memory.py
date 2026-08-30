@@ -17,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import re
 
 logger = logging.getLogger("memory")
 
@@ -32,47 +33,490 @@ RECENT_MESSAGE_COUNT = 10
 # 检索时返回的最大摘要数
 MAX_SUMMARIES = 3
 
+# 用户记忆类别（偏好记忆结构化：称呼 / 音乐 / 影片 / 城市 / 其他）
+PREFERENCE_CATEGORIES = ("称呼", "音乐", "影片", "城市", "工作", "习惯", "计划", "其他")
+# 主动回忆（按需相关性检索）默认参数；可在 settings.json 的 memory 段覆盖
+RECALL_ENABLED = True
+RECALL_TOP_K = 6
+RECALL_MAX_CHARS = 800
+# 相关回忆注入的最大估算 token（与 recall_max_chars 取更小者）
+RECALL_MAX_TOKENS = 200
+
+# 上下文打包（token 预算）默认参数；可在 settings.json 的 memory 段覆盖
+# 提示词预算 = context_window * token_budget_ratio（max_prompt_tokens > 0 时优先用固定值）
+CONTEXT_TOKEN_BUDGET_RATIO = 0.5
+MAX_PROMPT_TOKENS = 0
+# 记忆/摘要/近期消息在提示词预算中的分配比例（留给历史的剩余部分）
+MEMORY_BLOCK_RATIO = 0.35
+# 归档：0=不删除任何原始消息；>0 时定期删除「已关闭会话」中超过 N 天的原始消息
+# （摘要与长期记忆保留，检索不依赖已归档消息）。默认关闭，避免误删用户数据。
+ARCHIVE_KEEP_DAYS = 0
+ARCHIVE_MIN_INTERVAL_SEC = 6 * 3600
+# 长期记忆淘汰：超过 memory_evict_days 天、且按时间衰减后 importance 低于阈值、
+# 且长时间未被访问的记忆会被删除（仅当前命名空间；摘要与近期记忆不受影响）。
+MEMORY_EVICT_DAYS = 180
+MEMORY_EVICT_IMPORTANCE = 0.45
+MEMORY_EVICT_MIN_ACCESS_DAYS = 90
+# 时间衰减半衰期（天）：召回检索与长期记忆选择时，越久没被提到的内容权重越低
+RECALL_RECENCY_HALF_LIFE_DAYS = 14.0
+MEMORY_DECAY_HALF_LIFE_DAYS = 90.0
+# 长期记忆近重复合并的相似度阈值（2-gram Jaccard 加权）
+MEMORY_MERGE_SIMILARITY = 0.62
+# 长期记忆卫生节流：去重/淘汰/封顶每 N 秒最多跑一次（写路径热，读路径零成本）
+MEMORY_PRUNE_INTERVAL_SEC = 300
+# 每个命名空间长期记忆总量封顶（超出后按「有效重要度」淘汰最不重要的）
+MEMORY_CAP_PER_NAMESPACE = 120
+
+# 用于类别推断与关键词降级提取的常见模式（类别 -> 触发词）
+_CATEGORY_KEYWORDS = {
+    "音乐": ("歌", "音乐", "曲", "歌手", "唱", "听", "乐队", "歌单", "周杰伦", "毛不易", "邓紫棋",
+             "流行", "摇滚", "民谣", "古典", "钢琴", "曲子"),
+    "影片": ("电影", "影片", "剧", "番", "视频", "b站", "bilibili", "纪录片", "动画", "综艺", "追剧", "片单"),
+    "城市": ("住在", "城市", "老家", "家乡", "广州", "深圳", "上海", "北京", "杭州", "成都", "武汉",
+             "南京", "苏州", "西安", "重庆", "长沙", "厦门", "青岛"),
+    "称呼": ("称呼", "叫我", "喊我", "叫我主人", "昵称", "叫我宝宝", "叫我亲爱的"),
+    "工作": ("工作", "上班", "公司", "同事", "老板", "项目", "代码", "编程", "写代码", "加班", "出差",
+             "创业", "职业", "行业", "岗位", "升职", "跳槽"),
+    "习惯": ("习惯", "经常", "总是", "每天", "每周", "作息", "早起", "熬夜", "健身", "跑步", "运动",
+             "阅读", "看书", "打游戏", "玩游戏", "刷剧"),
+    "计划": ("计划", "打算", "准备", "决定", "约定", "约好", "周末", "明天", "下周", "下个月",
+             "放假", "旅行", "旅游", "去", "学", "考", "报名", "安排"),
+}
+
+# ==================== 分层记忆上下文打包（token 预算） ====================
+# 目标：短期窗口（最近 N 轮）+ 长期摘要 + 长期关键信息 + 检索召回，
+# 每层都受 token 预算约束；context_stats 表记录每轮 raw/packed/actual 用量，
+# 用于量化 token 节省（见 memory_benchmark.py）。
+# 总开关：False 时各打包函数回退为旧行为（不设 token 上限），保证可一键回滚。
+HIERARCHICAL_PACKING = True
+# 2026-08-29 工程上下文增强：此前预算过小（短期 1200 token ≈ 2 轮、摘要 200 token
+# ≈ 1 条 120 字），长工具任务里"刚做完的事下一轮就丢"，只能靠反复重读文件找回，
+# 实测单任务打到 60~107 轮工具调用。现按 128k 上下文窗口上调到能装下
+# 「最近 5~8 轮 + 自包含摘要 + 最近真实工具结果」的规模；仍远小于提示词预算。
+SHORT_TERM_MAX_TOKENS = 3000             # 短期窗口（最近轮次）预算
+SHORT_TERM_MAX_CHARS_PER_ROUND = 1200    # 单轮历史最大字符（超出截断加 …）
+SUMMARY_MAX_TOKENS = 800                 # 长期摘要块预算（累计式摘要自包含，最新一条优先全量）
+SUMMARY_MAX_CHARS_PER_ITEM = 600         # 单条摘要最大字符（与累计摘要 600 字上限一致）
+LONG_TERM_MAX_TOKENS = 300               # 常驻长期记忆块预算
+LONG_TERM_TOP_K = 4                      # 常驻长期记忆条数（稳定排序）
+RECALL_MAX_TOKENS = 400                  # 主动回忆预算（与 recall_max_chars 取更小者）
+# 最近任务执行摘要：每轮注入最近一次带工具执行的用户轮次的真实工具结果上限
+RECENT_WORK_MAX_CHARS = 1200
+RECORD_CONTEXT_STATS = True              # 每轮写入 context_stats
+
+# 用于类别推断与关键词降级提取的常见模式（类别 -> 触发词）
+_CATEGORY_KEYWORDS = {
+    "音乐": ("歌", "音乐", "曲", "歌手", "唱", "听", "乐队", "歌单", "周杰伦", "毛不易", "邓紫棋",
+             "流行", "摇滚", "民谣", "古典", "钢琴", "曲子"),
+    "影片": ("电影", "影片", "剧", "番", "视频", "b站", "bilibili", "纪录片", "动画", "综艺", "追剧", "片单"),
+    "城市": ("住在", "城市", "老家", "家乡", "广州", "深圳", "上海", "北京", "杭州", "成都", "武汉",
+             "南京", "苏州", "西安", "重庆", "长沙", "厦门", "青岛"),
+    "称呼": ("称呼", "叫我", "喊我", "叫我主人", "昵称", "叫我宝宝", "叫我亲爱的"),
+    "工作": ("工作", "上班", "公司", "同事", "老板", "项目", "代码", "编程", "写代码", "加班", "出差",
+             "创业", "职业", "行业", "岗位", "升职", "跳槽"),
+    "习惯": ("习惯", "经常", "总是", "每天", "每周", "作息", "早起", "熬夜", "健身", "跑步", "运动",
+             "阅读", "看书", "打游戏", "玩游戏", "刷剧"),
+    "计划": ("计划", "打算", "准备", "决定", "约定", "约好", "周末", "明天", "下周", "下个月",
+             "放假", "旅行", "旅游", "去", "学", "考", "报名", "安排"),
+}
+
+_CATEGORY_PATTERN = "|".join(re.escape(c) for c in PREFERENCE_CATEGORIES)
 
 _db_lock = threading.Lock()
 _db_local = threading.local()
+_last_archive_ts = 0.0  # 归档节流：模块级最近一次归档时间
+
+
+def estimate_tokens(text: str) -> int:
+    """轻量 token 估算（无依赖、无网络，用于预算控制与节省统计）。
+
+    中文按 ~1 token/字、英文/数字按 4 字符/token、标点按 2 字符/token 估算，
+    并加 10% 安全余量，避免预算被低估。真实 token 数以提供方 usage 为准，
+    两者之间的误差会通过 context_stats 表持续校准（见 record_context_stats）。
+    """
+    if not text:
+        return 0
+    import re as _re
+    s = str(text)
+    cjk = len(_re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf]", s))
+    rest = _re.sub(r"[\u4e00-\u9fff\u3400-\u4dbf]", "", s)
+    words = _re.findall(r"[A-Za-z0-9]+", rest)
+    rest_no_words = _re.sub(r"[A-Za-z0-9]+", "", rest)
+    punct = len(_re.sub(r"\s", "", rest_no_words))
+    est = cjk + sum((len(w) + 3) // 4 for w in words) + (punct + 1) // 2
+    return int(est * 1.1) + 1
+
+
+def _clean_think_markers(text: str) -> str:
+    """剔除模型输出里泄漏的 think 标记（如 `无</think>无`、<think>…</think>）。"""
+    if not text:
+        return text
+    s = re.sub(r"</?think[^>]*>", "", str(text), flags=re.IGNORECASE)
+    s = re.sub(r"^\s*(?:思考|推理|reasoning)\s*[:：]\s*", "", s)
+    return s.strip()
+
+
+# 记忆提取的噪音兜底：模型可能回复"无/同上"或空壳内容，一律不入库
+_MEMORY_NOISE = {
+    "无", "暂无", "同上", "没有", "无信息", "无新内容", "无新信息",
+    "没有新内容", "没有新信息", "没有透露", "未透露", "无。", "暂无。",
+}
+
+
+def _is_memory_noise(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if t in _MEMORY_NOISE:
+        return True
+    # "无无"、"无无无"、"同上同" 等思维链泄漏残留
+    if re.fullmatch(r"[无没同上暂无]{1,8}", t):
+        return True
+    # 纯标记残留（如 "无</think>无" 清洗后只剩"无无"）或长度过短，无信息量
+    if len(t) < 4 and not any(ch.isalnum() for ch in t):
+        return True
+    return False
+
+
+_SUMMARY_NOISE_RE = re.compile(
+    r"^\s*(?:\$ |[✅✔✘⚠🔍⛔]\s|\[exit=|```|--- 旧|\+\+\+ 新|"
+    r"index |diff --git |\d{4}-\d{2}-\d{2} |Traceback|Error code:)",
+    re.M,
+)
+
+
+def _clean_summary_noise(text: str) -> str:
+    """清洗摘要文本里的工具输出噪音（历史遗留的关键词降级摘要会混入原始命令/日志）。"""
+    if not text:
+        return text
+    lines = [ln for ln in str(text).split("\n") if ln.strip()]
+    kept = [ln for ln in lines if not _SUMMARY_NOISE_RE.match(ln)]
+    return "\n".join(kept).strip() or "(摘要内容缺失)"
+
+
+def _recency_factor(ts: float, half_life_days: float) -> float:
+    """按距今天数计算指数衰减系数：half_life 天后权重减半。"""
+    age_days = max(0.0, (time.time() - float(ts or 0)) / 86400.0)
+    return 2.0 ** (-age_days / max(1.0, half_life_days))
+
+
+# ==================== 分层记忆打包：纯函数（token 预算） ====================
+# 设计要点：
+# - 每层独立预算（short_term/summary/long_term/recall），调用方传入「新→旧」文本，
+#   从最新开始填入预算，超预算即停——保证"最近信息优先保留"。
+# - 层内按字符上限提前截断（如单轮历史 500 字符），避免一条超长消息独占整层预算。
+# - estimate_tokens 估算 token；真实用量由 context_stats 表持续校准。
+
+def _truncate_chars(text: str, max_chars: int) -> str:
+    """按字符上限截断并追加省略号。"""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + '…'
+
+
+def _pack_by_token_budget(texts: list, budget_tokens: int,
+                          max_chars_per_item: int = 0) -> tuple:
+    """按 token 预算挑选文本（输入新→旧，输出保持原序），至少保留第一条。
+
+    Returns:
+        (kept, tokens) kept=满足预算的文本列表（新→旧），tokens=实际估算 token。
+    """
+    kept, used = [], 0
+    for text in texts:
+        text = _truncate_chars(text, max_chars_per_item) if max_chars_per_item else text
+        if not text or not text.strip():
+            continue
+        t = estimate_tokens(text)
+        if kept and used + t > budget_tokens:
+            break
+        if not kept and used + t > budget_tokens:
+            # 第一条就超预算：硬截断到预算可容纳的字符（中文约 1 token/字）
+            text = _truncate_chars(text, max(16, budget_tokens))
+            t = estimate_tokens(text)
+        kept.append(text)
+        used += t
+    return kept, used
+
+
+def _pack_history_records(records: list, budget_tokens: int,
+                          max_chars_per_round: int = 0) -> list:
+    """按「轮」打包短期窗口历史（新→旧挑选，输出恢复旧→新）。
+
+    records: 旧→新的消息列表 [{"role","content", tool_calls?, tool_results?}...]。
+    先按轮分组（user 与其后的 assistant/tool 消息归为一轮，不拆散问答对）：
+    - 最新一轮整体保留：不受单轮字符上限截断，超 token 预算时才按预算硬截断，
+      保证「刚发生的事」完整进入下一轮上下文（修复长工具轮把上一轮挤掉的问题）；
+    - 旧轮按剩余预算由新到旧挑选，放不下的整轮跳过。
+    tool_calls/tool_results 结构原样保留（避免截断工具调用 JSON 导致
+    function-calling 历史失效）。
+    """
+    if not records:
+        return []
+    rounds = _group_history_rounds(records)
+    kept, used = [], 0
+    for idx, rnd in enumerate(reversed(rounds)):  # 新→旧
+        is_newest = idx == 0
+        # 最新一轮不截字符（超预算才硬截断）；旧轮仍按单轮上限截断
+        cap = 0 if is_newest else max_chars_per_round
+        packed, rnd_tokens = _pack_one_round(rnd, cap, budget_tokens, is_newest)
+        if not packed:
+            continue
+        if not is_newest and used + rnd_tokens > budget_tokens:
+            continue  # 旧轮放不下：整轮跳过，不拆散一问一答
+        kept = packed + kept
+        used += rnd_tokens
+        if is_newest and used >= budget_tokens:
+            # 最新一轮已吃满预算：旧轮不再注入，保证行为可预期
+            break
+    return kept
+
+
+def _group_history_rounds(records: list) -> list:
+    """把消息列表（旧→新）按轮分组。
+
+    user 消息开始新一轮，其后同轮的 assistant/tool 消息归入该轮；
+    无 user 的 assistant 消息（AI 主动发言）独立成轮。
+    """
+    rounds = []
+    current = None
+    for m in records:
+        if m.get("role") == "user":
+            current = [m]
+            rounds.append(current)
+        elif current is not None:
+            current.append(m)
+        else:
+            current = [m]
+            rounds.append(current)
+    return rounds
+
+
+def _pack_one_round(rnd: list, cap: int, budget_tokens: int,
+                    is_newest: bool) -> tuple:
+    """打包单轮消息，返回 (packed, tokens)。
+
+    cap>0 时截断 user/assistant 纯文本；最新一轮单条超预算时按剩余预算硬截断，
+    旧轮超预算即停（由调用方决定整轮跳过）。
+    """
+    packed, used = [], 0
+    for m in rnd:
+        content = m.get('content') or ''
+        if m.get('role') in ('user', 'assistant') and cap:
+            content = _truncate_chars(content, cap)
+        t = estimate_tokens(content)
+        if used + t > budget_tokens:
+            if is_newest and content and used < budget_tokens:
+                # 最新轮：截断本条到剩余预算，尽量保住问答内容
+                remain = max(16, budget_tokens - used)
+                content = _truncate_chars(content, remain)
+                t = estimate_tokens(content)
+                packed.append({**m, 'content': content})
+                used += t
+            break
+        packed.append({**m, 'content': content})
+        used += t
+    return packed, used
+
+
+def _format_recall_lines(items: list, max_chars: int, token_budget: int = 0) -> tuple:
+    """把召回项格式化为「- [来源] 文本」行，受字符上限与 token 预算双重约束。
+
+    Args:
+        items: recall_memories 的返回项（已按相关度排序）
+        max_chars: 字符上限（默认 recall_max_chars）
+        token_budget: token 预算（>0 时与 max_chars 取更严格者，强制生效）
+
+    Returns:
+        (lines, items_count)
+    """
+    seen, lines, used_chars, used_tokens = set(), [], 0, 0
+    for it in items:
+        text = (it.get('text') or '').strip().replace('\n', ' ')
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        tag = {"memory": '长期记忆', "summary": '历史摘要', "message": '此前对话'}.get(it.get('kind'), '记忆')
+        line = f'- [{tag}] {text[:80]}'
+        t = estimate_tokens(line)
+        if lines and used_chars + len(line) > max_chars:
+            break
+        if lines and token_budget > 0 and used_tokens + t > token_budget:
+            break
+        if token_budget > 0 and not lines and used_tokens + t > token_budget:
+            line = line[:max(16, token_budget)]
+            t = estimate_tokens(line)
+        lines.append(line)
+        used_chars += len(line)
+        used_tokens += t
+    return lines, len(items)
+
+
+def _connection_pairs_to_records(pairs: list) -> list:
+    """把服务端连接级历史 `[{"user":..,"ai":..}]`（旧→新）转成消息记录列表。
+
+    AI 主动说话轮次以空 user 标记：跳过空 user，
+    只保留 assistant 发言，让 LLM 看到「AI 之前主动说过这段话」而不是
+    空白的用户消息；用户搭话/插话时可基于此正确回应。
+    2026-08-30：同时跳过空 ai 轮次——被打断的轮次没有最终回复，
+    保留「用户:xxx / AI:」空对只会让模型以为 AI 什么都没做过。
+    """
+    records = []
+    for h in pairs or []:
+        if h.get("user"):
+            records.append({'role': 'user', 'content': h.get('user', '')})
+        ai = (h.get("ai") or "").strip()
+        if ai:
+            records.append({'role': 'assistant', 'content': ai})
+    return records
+
+
+def _row_has_tool_calls(row) -> bool:
+    """该消息行是否携带非空工具调用（用于识别工具循环里的中间 assistant 轮）。
+
+    兼容 sqlite3.Row 与 dict 两种行对象（Row 无 .get，用 [] 取值）。
+    """
+    try:
+        if hasattr(row, "get"):
+            tc = row.get("tool_calls")
+        else:
+            tc = row["tool_calls"]
+    except (KeyError, IndexError, TypeError):
+        tc = None
+    if not tc:
+        return False
+    try:
+        parsed = json.loads(tc) if isinstance(tc, str) else tc
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return bool(parsed)
+
+
+def _iter_turn_texts(rows: list) -> list:
+    """把消息行（旧→新）规整为 user/ai 轮次列表，返回 [{"user","ai"}, ...]。
+
+    - 跳过工具循环的中间 assistant 轮（带非空 tool_calls）与空消息，
+      只保留每轮最终回复，避免恢复历史时把"我先看看…"之类过程话当结论；
+    - AI 主动发言（无 user）保留为空白 user 轮次。
+    """
+    history = []
+    pending_user = None
+    pending_ai: list = []
+    for row in rows:
+        role = row.get("role")
+        if role == "user":
+            if pending_user is not None or pending_ai:
+                history.append({"user": pending_user or "", "ai": "\n".join(pending_ai)})
+            pending_user = (row.get("content") or "").strip()
+            pending_ai = []
+        elif role == "assistant":
+            if _row_has_tool_calls(row):
+                continue  # 中间工具轮：不是最终回复
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            if pending_user is not None:
+                pending_ai.append(content)
+            else:
+                # AI 主动说话轮次（无 user）：保留独立轮次
+                history.append({"user": "", "ai": content})
+    if pending_user is not None:
+        history.append({"user": pending_user, "ai": "\n".join(pending_ai)})
+    elif pending_ai:
+        history.append({"user": "", "ai": "\n".join(pending_ai)})
+    return history
+
+
+# SQLite 锁冲突容忍：连接/写操作/初始化遇 'database is locked' 时的重试次数与间隔
+_BUSY_RETRIES = 5
+_BUSY_SLEEP = 0.5
+
+
+def _is_busy_error(e: Exception) -> bool:
+    """判断异常是否为 SQLite 锁冲突（database is locked / database table is locked）。"""
+    return isinstance(e, sqlite3.OperationalError) and (
+        'locked' in str(e).lower() or 'busy' in str(e).lower()
+    )
+
+
+def _is_duplicate_column(e: Exception) -> bool:
+    """判断异常是否为 duplicate column name（迁移幂等：字段已存在属预期）。"""
+    return isinstance(e, sqlite3.OperationalError) and 'duplicate column' in str(e).lower()
+
+
+def _connect_db() -> sqlite3.Connection:
+    """创建数据库连接并应用 PRAGMA（WAL + busy_timeout）。
+
+    锁冲突时自动重试，不再让 'database is locked' 中断连接建立。
+    """
+    last_err = None
+    for attempt in range(1, _BUSY_RETRIES + 1):
+        try:
+            conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
+        except sqlite3.OperationalError as e:
+            last_err = e
+            if not _is_busy_error(e):
+                raise
+            logger.warning(f'SQLite 连接/PRAGMA 被锁（第 {attempt}/{_BUSY_RETRIES} 次）: {e}')
+            time.sleep(_BUSY_SLEEP)
+    raise last_err
+
 
 def _get_db() -> sqlite3.Connection:
     """获取数据库连接（线程安全 + 连接复用 + 超时等待 + 自动重连）。
 
     每个线程复用同一连接（threading.local），避免多连接写冲突。
-    写操作通过 _with_db_lock 串行化，彻底消除 'database is locked' 错误。
+    写操作通过 _with_db_lock 串行化；锁冲突时由 _connect_db 重试自愈。
     自动检测连接是否已关闭并重建。
     """
     conn = getattr(_db_local, 'conn', None)
-    # 检查连接是否有效（未关闭）
+    # 检查连接是否有效（未关闭；锁冲突视为失效，交由 _connect_db 重试重建）
     if conn is not None:
         try:
             conn.execute("SELECT 1")
         except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-            # 连接已关闭（如 _init_db 遗留的关闭状态），重建
-            conn = None
+            conn = None  # 连接已关闭（如 conn.close() 遗留）或已锁定，重建
     if conn is None:
-        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = _connect_db()
         _db_local.conn = conn
     return conn
 
+
 def _with_db_lock(func):
-    """装饰器：用全局锁串行化所有数据库写操作。"""
+    """装饰器：全局锁串行化所有数据库写操作；锁冲突自动回滚重试。"""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         with _db_lock:
-            return func(*args, **kwargs)
+            last_err = None
+            for attempt in range(1, _BUSY_RETRIES + 1):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if not _is_busy_error(e):
+                        raise
+                    last_err = e
+                    logger.warning(f'SQLite 写操作被锁（第 {attempt}/{_BUSY_RETRIES} 次）: {e}')
+                    conn = getattr(_db_local, 'conn', None)
+                    if conn is not None:
+                        try:
+                            conn.rollback()  # 回滚半途事务，避免脏状态带入重试
+                        except Exception:
+                            pass
+                    time.sleep(_BUSY_SLEEP)
+            raise last_err
     return wrapper
 
 
 def _init_db():
-    """初始化数据库表结构。"""
-    conn = _get_db()
-    conn.executescript("""
+    """初始化数据库表结构（幂等；锁冲突自动重试，避免并发初始化中断执行）。"""
+    for attempt in range(1, _BUSY_RETRIES + 1):
+        try:
+            conn = _get_db()
+            conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL DEFAULT 'default',
@@ -121,6 +565,7 @@ def _init_db():
             user_id TEXT NOT NULL,
             namespace TEXT NOT NULL DEFAULT 'default',
             memory_text TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
             source_session_id TEXT,
             importance REAL DEFAULT 0.5,
             created_at REAL NOT NULL,
@@ -129,33 +574,82 @@ def _init_db():
 
         CREATE INDEX IF NOT EXISTS idx_user_memories
             ON user_memories(user_id, importance DESC);
+
+        -- 上下文打包统计：衡量 token 节省与估算误差（每轮对话一条）
+        CREATE TABLE IF NOT EXISTS context_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            raw_tokens INTEGER DEFAULT 0,
+            packed_tokens INTEGER DEFAULT 0,
+            actual_prompt_tokens INTEGER DEFAULT 0,
+            history_rounds INTEGER DEFAULT 0,
+            summaries INTEGER DEFAULT 0,
+            memories INTEGER DEFAULT 0,
+            recall_items INTEGER DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_stats_ns
+            ON context_stats(namespace, created_at);
     """)
-    # 迁移：为旧数据库添加 source 字段
-    try:
-        conn.execute("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'chat'")
-    except sqlite3.OperationalError:
-        pass  # 字段已存在
-    # 迁移：为旧数据库添加 namespace 字段（角色卡片独立记忆空间）
-    for _tbl in ("sessions", "user_memories"):
-        try:
-            conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'")
-        except sqlite3.OperationalError:
-            pass  # 字段已存在
-    # namespace 相关索引（必须在 ALTER 添加列之后再建，否则旧库会报 no such column）
-    conn.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_sessions_ns
-            ON sessions(user_id, namespace, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_user_memories_ns
-            ON user_memories(user_id, namespace, importance DESC);
-    """)
-    conn.commit()
-    # 注意：不关闭连接 — _get_db() 使用 threading.local() 缓存了连接，
-    # 关闭会导致后续调用拿到已关闭的连接引发 "Cannot operate on a closed database"
-    # 连接在进程退出时自动释放
+            # 迁移：为旧数据库添加 source 字段（重复添加属预期，锁冲突如实抛出交由外层重试）
+            try:
+                conn.execute("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'chat'")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise
+                logger.debug(f'字段已存在(source)，跳过迁移: {e}')
+            # 迁移：为旧数据库添加 namespace 字段（角色卡片独立记忆空间）
+            for _tbl in ('sessions', 'user_memories'):
+                try:
+                    conn.execute(f'ALTER TABLE {_tbl} ADD COLUMN namespace TEXT NOT NULL DEFAULT \'default\'')
+                except sqlite3.OperationalError as e:
+                    if not _is_duplicate_column(e):
+                        raise
+                    logger.debug(f'字段已存在(namespace@{_tbl})，跳过迁移: {e}')
+            # 迁移：为旧数据库添加 category 字段（用户记忆分类：称呼/音乐/影片/城市/其他）
+            try:
+                conn.execute("ALTER TABLE user_memories ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
+            except sqlite3.OperationalError as e:
+                if not _is_duplicate_column(e):
+                    raise
+                logger.debug(f'字段已存在(category)，跳过迁移: {e}')
+            # 迁移：会话管理增强字段（archived 归档 / pinned 置顶，均幂等）
+            for _col, _dflt in (("archived", "0"), ("pinned", "0")):
+                try:
+                    conn.execute(f"ALTER TABLE sessions ADD COLUMN {_col} INTEGER NOT NULL DEFAULT {_dflt}")
+                except sqlite3.OperationalError as e:
+                    if not _is_duplicate_column(e):
+                        raise
+                    logger.debug(f'字段已存在({_col}@sessions)，跳过迁移: {e}')
+            # namespace 相关索引（必须在 ALTER 添加列之后再建，否则旧库会报 no such column）
+            conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_sessions_ns
+                    ON sessions(user_id, namespace, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_memories_ns
+                    ON user_memories(user_id, namespace, importance DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_memories_cat
+                    ON user_memories(user_id, namespace, category, importance DESC);
+            """)
+            conn.commit()
+            return  # 初始化成功
+        except sqlite3.OperationalError as e:
+            if not _is_busy_error(e):
+                logger.error(f'SQLite 数据库初始化失败（非锁冲突）: {e}')
+                raise
+            logger.warning(f'SQLite 数据库初始化被锁（第 {attempt}/{_BUSY_RETRIES} 次）: {e}')
+            time.sleep(_BUSY_SLEEP)
+    logger.error(f'SQLite 数据库初始化最终失败（连续 {_BUSY_RETRIES} 次锁冲突）')
+    # 不抛出：瞬时锁冲突不影响后续调用（写操作仍由 _with_db_lock 重试自愈）
 
 
-# 模块加载时自动初始化
-_init_db()
+# 模块加载时自动初始化（失败不阻断导入，避免 codex 执行时数据库被锁导致整体中断）
+try:
+    _init_db()
+except Exception as e:
+    logger.error(f'SQLite 初始化异常，继续以懒重试模式运行: {e}')
 
 
 class ChatMemory:
@@ -170,6 +664,7 @@ class ChatMemory:
         self.session_id = session_id
         self.namespace = namespace  # 记忆命名空间：无卡片='default'，角色卡片='role_card:<card_id>'
         self._message_count = 0  # 当前会话消息计数缓存
+        self._summary_lock = None  # 懒创建：串行化普通/强制摘要，避免重复覆盖同一区间
         self._llm_client = None  # 可选：用于 LLM 驱动的摘要生成和记忆提取
         self._llm_model = None
 
@@ -185,6 +680,31 @@ class ChatMemory:
         self._llm_client = client
         self._llm_model = model_name
 
+    async def _supervised_create(self, **kwargs):
+        """经 harness 监督运行时执行 LLM 调用（重试/超时/熔断/计量，渠道=memory）。
+
+        harness 不可用时退化为直接调用，原有降级逻辑（关键词摘要/提取）不受影响。
+        """
+        # 兜底：保证 role=tool 消息带 tool_call_id（与主智能体同一规范函数），
+        # 否则发给 OpenAI 兼容提供方会被 400（missing field tool_call_id）
+        try:
+            from agent import _normalize_tool_rounds
+            _msgs = kwargs.get("messages") or []
+            if _msgs:
+                kwargs = dict(kwargs)
+                kwargs["messages"] = _normalize_tool_rounds(_msgs)
+        except Exception:
+            pass
+        try:
+            from harness import get_harness
+            runtime = get_harness().runtime
+        except Exception:
+            runtime = None
+        if runtime is not None:
+            return await runtime.supervise_llm(
+                "memory", lambda: self._llm_client.chat.completions.create(**kwargs))
+        return await self._llm_client.chat.completions.create(**kwargs)
+
     async def get_or_create_session(self, title: str = "") -> str:
         """获取或创建当前用户的活动会话。
 
@@ -198,30 +718,53 @@ class ChatMemory:
         def _do():
             conn = _get_db()
             now = time.time()
-            # 查找近期活动会话（15 分钟内，仅限当前命名空间 —— 角色卡片记忆互不串扰）
-            recent = now - 900
-            row = conn.execute(
-                "SELECT id FROM sessions WHERE user_id=? AND namespace=? AND is_active=1 AND updated_at>? "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (self.user_id, self.namespace, recent),
-            ).fetchone()
-            if row:
-                self.session_id = row["id"]
+
+            def _adopt(sid: str):
+                """采用某个已有会话为当前会话（调用方已在锁内）。"""
+                self.session_id = sid
                 conn.execute(
-                    "UPDATE sessions SET updated_at=? WHERE id=?",
-                    (now, self.session_id),
+                    "UPDATE sessions SET updated_at=?, is_active=1 WHERE id=?",
+                    (now, sid),
                 )
+                conn.commit()
                 # 加载当前消息计数（环境交互消息不计入，与 add_message 保持一致）
                 cnt = conn.execute(
                     "SELECT COUNT(*) as cnt FROM messages "
                     "WHERE session_id=? AND source != 'auto'",
-                    (self.session_id,),
+                    (sid,),
                 ).fetchone()["cnt"]
-                conn.commit()
                 self._message_count = cnt
-                return self.session_id
+                return sid
 
-            # 创建新会话
+            # 1) 单系统模式：取「当前命名空间内所有身份里最近活跃」的会话——
+            #    服务重启/刷新后续上同一条对话；若属于旧的设备级身份（u_*），
+            #    自动接管（user_id 改为当前统一用户），历史对话无缝延续
+            row = conn.execute(
+                "SELECT id, user_id FROM sessions "
+                "WHERE namespace=? AND is_active=1 AND archived=0 "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (self.namespace,),
+            ).fetchone()
+            if row:
+                if row["user_id"] != self.user_id:
+                    conn.execute(
+                        "UPDATE sessions SET user_id=? WHERE id=?",
+                        (self.user_id, row["id"]),
+                    )
+                    conn.commit()
+                return _adopt(row["id"])
+            # 2) 兼容旧逻辑：近期活动会话（15 分钟内，仅限当前命名空间）
+            recent = now - 900
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE user_id=? AND namespace=? AND is_active=1 "
+                "AND archived=0 AND updated_at>? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (self.user_id, self.namespace, recent),
+            ).fetchone()
+            if row:
+                return _adopt(row["id"])
+
+            # 3) 创建新会话
             import uuid
             sid = uuid.uuid4().hex[:12]
             conn.execute(
@@ -236,16 +779,43 @@ class ChatMemory:
 
         return await asyncio.to_thread(_do)
 
+    async def create_new_session(self, title: str = "") -> str:
+        """强制创建全新会话（不复用近期活动会话）。
+
+        用于角色卡片人设变更：旧会话的历史消息会把人设带偏，
+        直接开新会话让新系统提示词立即生效。
+        """
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            now = time.time()
+            import uuid
+            sid = uuid.uuid4().hex[:12]
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, namespace, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sid, self.user_id, self.namespace,
+                 title or f"对话 {datetime.now():%m-%d %H:%M}", now, now),
+            )
+            conn.commit()
+            self.session_id = sid
+            self._message_count = 0
+            return sid
+        return await asyncio.to_thread(_do)
+
     async def set_session_id(self, session_id: str):
-        """手动设置会话 ID（用于恢复历史会话）。"""
+        """手动设置会话 ID（用于恢复历史会话）。
+
+        单系统模式：恢复旧设备身份的会话时自动接管（user_id 归一到当前统一用户）。
+        """
         self.session_id = session_id
         # 更新会话活动时间并加载当前消息计数
         @_with_db_lock
         def _do():
             conn = _get_db()
             conn.execute(
-                "UPDATE sessions SET updated_at=?, is_active=1 WHERE id=?",
-                (time.time(), session_id),
+                "UPDATE sessions SET updated_at=?, is_active=1, user_id=? WHERE id=?",
+                (time.time(), self.user_id, session_id),
             )
             cnt = conn.execute(
                 "SELECT COUNT(*) as cnt FROM messages "
@@ -255,6 +825,66 @@ class ChatMemory:
             conn.commit()
             return cnt
         self._message_count = await asyncio.to_thread(_do)
+
+    async def get_max_message_id(self) -> int:
+        """当前会话最新消息 id（0 = 无消息）。对话轮断点恢复的锚点用。"""
+        if not self.session_id:
+            return 0
+
+        def _do():
+            conn = _get_db()
+            row = conn.execute(
+                "SELECT MAX(id) AS mid FROM messages WHERE session_id=?",
+                (self.session_id,),
+            ).fetchone()
+            conn.close()
+            return int(row["mid"] or 0) if row else 0
+        return await asyncio.to_thread(_do)
+
+    async def delete_messages_after(self, anchor_id: int) -> None:
+        """删除当前会话中 id 大于锚点的消息（断点续跑幂等用）。
+
+        仅用于「被热重载打断的对话轮」恢复时，清理该轮可能已半写入的
+        assistant/tool 消息；锚点取自本轮开始（用户消息已落库之后），
+        因此锚点之后只可能是本中断轮自己的消息，删除后统一重放。
+        """
+        if not self.session_id or anchor_id < 0:
+            return
+
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            conn.execute(
+                "DELETE FROM messages WHERE session_id=? AND id>?",
+                (self.session_id, anchor_id),
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_do)
+
+    async def delete_messages_after_if(self, anchor_id: int, guard=None) -> bool:
+        """同 delete_messages_after，但删除前在数据库写锁内调用 guard()。
+
+        guard 返回 False 时放弃删除（返回 False）。用于断点续跑：把「断点仍
+        属于本轮」的校验与删除放进同一个临界区，避免并发新对话轮刚写入的用户
+        消息被误删。
+        """
+        if not self.session_id or anchor_id < 0:
+            return False
+
+        @_with_db_lock
+        def _do():
+            if guard is not None and not guard():
+                return False
+            conn = _get_db()
+            conn.execute(
+                "DELETE FROM messages WHERE session_id=? AND id>?",
+                (self.session_id, anchor_id),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        return await asyncio.to_thread(_do)
 
     async def session_belongs_to_namespace(self, session_id: str) -> bool:
         """判断会话是否属于当前命名空间（防止跨角色卡片切换/恢复串记忆）。"""
@@ -270,30 +900,155 @@ class ChatMemory:
             return bool(row and row["namespace"] == self.namespace)
         return await asyncio.to_thread(_do)
 
-    async def list_sessions(self, limit: int = 20) -> list:
-        """列出当前命名空间下用户的所有会话。"""
+    async def list_sessions(self, limit: int = 50, query: str = None,
+                            include_archived: bool = False) -> list:
+        """列出当前命名空间下的所有会话（含消息数/摘要/token 估算/置顶/归档）。
+
+        单系统模式：包含旧的设备级身份（u_*）会话，方便手动切回历史对话；
+        会话归属统一用户时会被自动接管。
+
+        Args:
+            limit: 返回条数上限
+            query: 非空时按标题或消息内容模糊搜索（LIKE，搜索覆盖归档会话）
+            include_archived: True 时包含已归档会话（纯列表默认排除）
+
+        Returns:
+            [{"id","title","created_at","updated_at","is_active","pinned","archived",
+              "message_count","approx_tokens","summary","is_current"}, ...]
+            排序：置顶优先，其次按最近活跃。
+        """
         def _do():
             conn = _get_db()
-            rows = conn.execute(
-                "SELECT id, title, created_at, updated_at, is_active "
-                "FROM sessions WHERE user_id=? AND namespace=? ORDER BY updated_at DESC LIMIT ?",
-                (self.user_id, self.namespace, limit),
-            ).fetchall()
-            sessions = [dict(r) for r in rows]
-            for s in sessions:
+            like = f"%{query}%" if query else None
+            sql = (
+                "SELECT s.id, s.title, s.created_at, s.updated_at, s.is_active, "
+                "s.pinned, s.archived, "
+                "COALESCE(m.cnt, 0) AS message_count, "
+                "COALESCE(m.chars, 0) AS content_chars, "
+                "(SELECT st.summary_text FROM summaries st "
+                " WHERE st.session_id = s.id "
+                " ORDER BY st.range_end DESC, st.id DESC LIMIT 1) AS summary "
+                "FROM sessions s "
+                "LEFT JOIN (SELECT session_id, COUNT(*) AS cnt, "
+                "SUM(LENGTH(content)) AS chars FROM messages "
+                "WHERE source != 'auto' GROUP BY session_id) m ON m.session_id = s.id "
+                "WHERE s.namespace=? "
+            )
+            params: list = [self.namespace]
+            # 搜索时覆盖归档会话（用户搜历史内容通常也包括归档）；纯列表才默认排除
+            if not include_archived and not like:
+                sql += "AND s.archived=0 "
+            if like:
+                sql += ("AND (s.title LIKE ? OR EXISTS (SELECT 1 FROM messages mm "
+                        "WHERE mm.session_id = s.id AND mm.source != 'auto' "
+                        "AND mm.content LIKE ?)) ")
+                params += [like, like]
+            sql += "ORDER BY s.pinned DESC, s.updated_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            sessions = []
+            for r in rows:
+                s = dict(r)
                 s["created_at"] = datetime.fromtimestamp(s["created_at"]).isoformat()
                 s["updated_at"] = datetime.fromtimestamp(s["updated_at"]).isoformat()
+                # token 估算：中英混合消息约 2 字符/token（沿用 estimate_tokens 的量级）
+                s["approx_tokens"] = int((s.pop("content_chars") or 0) / 2)
+                _sm = (s.get("summary") or "").strip()
+                s["summary"] = _sm[:120] + ("…" if len(_sm) > 120 else "")
+                s["is_current"] = (s["id"] == self.session_id)
+                sessions.append(s)
             conn.close()
             return sessions
         return await asyncio.to_thread(_do)
 
-    async def update_title(self, title: str):
-        """更新当前会话标题。"""
-        if not self.session_id:
+    async def get_session_history_pairs(self, session_id: str,
+                                        max_rounds: int = None) -> list:
+        """获取指定会话的完整 user/ai 轮次历史（回滚继承/前端渲染用）。
+
+        同一用户发言后的多条 assistant 消息合并为一条 ai 文本；工具循环的
+        中间轮（带工具调用）与空消息会被跳过，只保留每轮最终回复，
+        避免恢复出的历史是"我先看看…"之类的过程话而非结论。
+        AI 主动发言（无 user）保留为空白 user 轮次。
+
+        Returns:
+            [{"user": "...", "ai": "..."}, ...]
+        """
+        if not session_id:
+            return []
+
+        def _do():
+            conn = _get_db()
+            rows = conn.execute(
+                "SELECT role, content, tool_calls FROM messages "
+                "WHERE session_id=? AND (source != 'auto' OR role = 'assistant') "
+                "AND role IN ('user','assistant') ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            conn.close()
+            history = _iter_turn_texts([dict(r) for r in rows])
+            if max_rounds:
+                history = history[-max_rounds:]
+            return history
+        return await asyncio.to_thread(_do)
+
+    async def get_session_summary(self, session_id: str = None) -> str:
+        """获取指定会话（默认当前会话）的最新摘要文本。"""
+        sid = session_id or self.session_id
+        if not sid:
+            return ""
+
+        def _do():
+            conn = _get_db()
+            row = conn.execute(
+                "SELECT summary_text FROM summaries WHERE session_id=? "
+                "ORDER BY range_end DESC, id DESC LIMIT 1",
+                (sid,),
+            ).fetchone()
+            conn.close()
+            return row["summary_text"] if row else ""
+        return await asyncio.to_thread(_do)
+
+    async def update_title(self, title: str, session_id: str = None):
+        """更新会话标题（默认当前会话；可指定任意会话 ID 用于历史会话重命名）。"""
+        sid = session_id or self.session_id
+        if not sid or not title:
             return
         def _do():
             conn = _get_db()
-            conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, self.session_id))
+            conn.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_do)
+
+    @staticmethod
+    def _is_default_title(title: str) -> bool:
+        """判断是否为默认自动标题（'对话 MM-DD HH:MM'，即未手动重命名/未自动生成）。"""
+        return bool(title) and title.startswith("对话 ") and len(title) <= 20
+
+    async def set_session_pinned(self, session_id: str, pinned: bool = True):
+        """置顶 / 取消置顶指定会话（置顶会话在列表中优先展示）。"""
+        if not session_id:
+            return
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            conn.execute("UPDATE sessions SET pinned=? WHERE id=?", (1 if pinned else 0, session_id))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_do)
+
+    async def set_session_archived(self, session_id: str, archived: bool = True):
+        """归档 / 取消归档指定会话。
+
+        归档会话不出现在默认会话列表、不会被 get_or_create_session 自动复用；
+        消息与摘要仍在库中，取消归档后可完整恢复。
+        """
+        if not session_id:
+            return
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            conn.execute("UPDATE sessions SET archived=? WHERE id=?", (1 if archived else 0, session_id))
             conn.commit()
             conn.close()
         await asyncio.to_thread(_do)
@@ -337,6 +1092,19 @@ class ChatMemory:
                 "UPDATE sessions SET updated_at=? WHERE id=?",
                 (now, self.session_id),
             )
+            # 标题自动生成：首条用户消息到达且标题仍为默认格式时，
+            # 用消息前 24 字生成语义标题（锁内完成，避免额外并发）
+            if role == "user" and source == "chat":
+                _row = conn.execute(
+                    "SELECT title FROM sessions WHERE id=?", (self.session_id,),
+                ).fetchone()
+                if _row and self._is_default_title(_row["title"]):
+                    _text = (content or "").replace("\n", " ").strip()
+                    if _text:
+                        _title = _text[:24] + ("…" if len(_text) > 24 else "")
+                        conn.execute(
+                            "UPDATE sessions SET title=? WHERE id=?", (_title, self.session_id),
+                        )
             conn.commit()
             # 环境交互消息不计入摘要计数（避免高频快照触发无意义的摘要生成）
             if source != "auto":
@@ -354,31 +1122,144 @@ class ChatMemory:
         if self._message_count < SUMMARY_THRESHOLD:
             return
 
-        # 检查最新的摘要覆盖范围
-        def _get_last_summary_range():
+        async with self._get_summary_lock():
+            # 检查最新的摘要覆盖范围
+            def _get_last_summary_range():
+                conn = _get_db()
+                row = conn.execute(
+                    "SELECT range_end FROM summaries WHERE session_id=? ORDER BY range_end DESC LIMIT 1",
+                    (self.session_id,),
+                ).fetchone()
+                conn.close()
+                return row["range_end"] if row else 0
+
+            last_end = await asyncio.to_thread(_get_last_summary_range)
+
+            def _get_messages_since(start_id):
+                conn = _get_db()
+                rows = conn.execute(
+                    "SELECT id, role, content FROM messages "
+                    "WHERE session_id=? AND id > ? "
+                    "AND (source != 'auto' OR role = 'assistant') ORDER BY id",
+                    (self.session_id, start_id),
+                ).fetchall()
+                conn.close()
+                return [dict(r) for r in rows]
+
+            msgs = await asyncio.to_thread(_get_messages_since, last_end)
+            if len(msgs) >= SUMMARY_INTERVAL * 2:
+                await self._generate_summary(msgs)
+
+    def _get_summary_lock(self) -> asyncio.Lock:
+        """懒创建摘要生成锁（兼容无事件循环时构造实例的场景）。"""
+        if self._summary_lock is None:
+            self._summary_lock = asyncio.Lock()
+        return self._summary_lock
+
+    async def force_summarize(self, include_auto: bool = False,
+                              auto_prefix: tuple = ()) -> bool:
+        """强制生成一次增量摘要（跳过固定间隔），返回是否实际生成。
+
+        用途：一轮「带工具执行的任务」结束、或子智能体/媒体完成汇报后，
+        立即把"已完成"状态固化进摘要——否则后续主动对话会读到过期的
+        "进行中"摘要，与刚完成的执行结果自相矛盾。
+
+        Args:
+            include_auto: 是否把 auto 消息一并纳入摘要。默认只汇总用户直接
+                输入，避免高频环境快照噪音污染摘要。
+            auto_prefix: include_auto=True 时，仅纳入 content 以此前缀开头的
+                auto 消息（如「【子智能体汇报」）；其余 auto 噪音仍被排除。
+        """
+        if not self.session_id:
+            return False
+
+        async with self._get_summary_lock():
+            def _last_range():
+                conn = _get_db()
+                row = conn.execute(
+                    "SELECT MAX(range_end) AS m FROM summaries WHERE session_id=?",
+                    (self.session_id,),
+                ).fetchone()
+                conn.close()
+                return row["m"] if row and row["m"] is not None else 0
+
+            last_end = await asyncio.to_thread(_last_range)
+
+            def _get_msgs():
+                conn = _get_db()
+                if include_auto:
+                    conds = ["session_id=?", "id > ?"]
+                    params = [self.session_id, last_end]
+                    if auto_prefix:
+                        pref = []
+                        for p in auto_prefix:
+                            pref.append("content LIKE ?")
+                            params.append(str(p) + "%")
+                        conds.append("(source != 'auto' OR " + " OR ".join(pref) + ")")
+                    else:
+                        conds.append("source != 'auto'")
+                    rows = conn.execute(
+                        "SELECT id, role, content FROM messages WHERE " +
+                        " AND ".join(conds) + " ORDER BY id",
+                        params,
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, role, content FROM messages "
+                        "WHERE session_id=? AND id > ? "
+                        "AND source != 'auto' ORDER BY id",
+                        (self.session_id, last_end),
+                    ).fetchall()
+                conn.close()
+                return [dict(r) for r in rows]
+
+            msgs = await asyncio.to_thread(_get_msgs)
+            if not msgs:
+                return False
+            await self._generate_summary(msgs[-SUMMARY_INTERVAL * 2:])
+            return True
+
+    async def _has_unsaved_work_round(self) -> bool:
+        """未摘要区间内是否出现过「带工具执行或完成汇报」的内容。
+
+        用于上下文构建前发现"任务刚做完但摘要还停留在'进行中'"的情况，
+        触发一次强制摘要，保证后续对话（含系统自动触发的主动对话）
+        看到的摘要是最新的。
+
+        判定放宽：只要上次摘要之后有工具执行（tool 消息或带工具调用的
+        assistant 消息）或子智能体完成汇报，就视为存在未固化的"已完成"
+        状态，需要补摘要。不再要求区间最后一条必须是 assistant——
+        实际上一轮工具对话的末条往往是 tool 结果，旧判定会漏掉该场景，
+        导致下一轮继续读到过期的"进行中/被阻止"摘要而重复做事。
+        """
+        if not self.session_id:
+            return False
+
+        def _check():
             conn = _get_db()
             row = conn.execute(
-                "SELECT range_end FROM summaries WHERE session_id=? ORDER BY range_end DESC LIMIT 1",
+                "SELECT MAX(range_end) AS m FROM summaries WHERE session_id=?",
                 (self.session_id,),
             ).fetchone()
-            conn.close()
-            return row["range_end"] if row else 0
-
-        last_end = await asyncio.to_thread(_get_last_summary_range)
-
-        def _get_messages_since(start_id):
-            conn = _get_db()
+            last_end = row["m"] if row and row["m"] is not None else 0
             rows = conn.execute(
-                "SELECT id, role, content FROM messages "
-                "WHERE session_id=? AND id > ? AND source != 'auto' ORDER BY id",
-                (self.session_id, start_id),
+                "SELECT role, tool_calls, content FROM messages "
+                "WHERE session_id=? AND id > ? "
+                "AND (source != 'auto' OR content LIKE '【子智能体汇报%') "
+                "ORDER BY id",
+                (self.session_id, last_end),
             ).fetchall()
             conn.close()
-            return [dict(r) for r in rows]
+            rows = [dict(r) for r in rows]
+            if not rows:
+                return False
+            has_tool_work = any(r["role"] == "tool" for r in rows) or any(
+                _row_has_tool_calls(r) for r in rows)
+            has_report = any(
+                (r["content"] or "").startswith("【子智能体汇报") for r in rows)
+            return has_tool_work or has_report
 
-        msgs = await asyncio.to_thread(_get_messages_since, last_end)
-        if len(msgs) >= SUMMARY_INTERVAL * 2:
-            await self._generate_summary(msgs)
+        return await asyncio.to_thread(_check)
 
     async def _generate_summary(self, messages: list):
         """生成对话摘要并存储。优先使用 LLM，降级为关键词提取。
@@ -392,9 +1273,13 @@ class ChatMemory:
         # 构建简要对话文本
         dialog_text = ""
         for m in messages[-SUMMARY_INTERVAL * 2:]:
-            role_tag = "用户" if m["role"] == "user" else "AI"
+            content = (m["content"] or "").strip()
+            if not content:
+                continue  # 静默工具轮等空消息不参与摘要
+            # 工具结果单独标记（LLM 摘要可理解；关键词降级摘要据此过滤噪音）
+            role_tag = ("工具" if m["role"] == "tool"
+                        else ("用户" if m["role"] == "user" else "AI"))
             # 过滤纯游戏事件消息，避免摘要混入大量系统通知
-            content = m["content"]
             if m["role"] == "system" and content.startswith("[游戏]"):
                 dialog_text += f"事件: {content}\n"
             else:
@@ -411,9 +1296,9 @@ class ChatMemory:
         else:
             summary = self._keyword_summarize(dialog_text)
 
-        # 截断过长摘要
-        if len(summary) > 300:
-            summary = summary[:297] + "..."
+        # 截断过长摘要（累计式摘要上限：自包含覆盖全会话，单条可容 600 字）
+        if len(summary) > 600:
+            summary = summary[:597] + "..."
 
         @_with_db_lock
         def _save():
@@ -452,25 +1337,30 @@ class ChatMemory:
 
         Args:
             dialog_text: 本次需要总结的对话文本
-            prev_summary: 前一次摘要，用于增量式补充，避免重复
+            prev_summary: 前一次摘要，用于合并成自包含的最新摘要。
+
+        2026-08-29 改为「累计式」：输出 = 旧摘要 + 新内容的合并版，而不是只写增量。
+        这样最新一条摘要本身就覆盖全会话，不会因增量链断裂/“同上”而丢失早期信息
+        （此前工程任务中模型只看到 120 字增量，隔几轮就忘了任务初衷）。
         """
         system_msg = (
-            "你是对话摘要助手。请用1-3句中文提炼以下对话的**新发生**的关键内容："
-            "话题变迁、用户透露的新信息、重要决策或事件。"
-            "忽略日常寒暄和重复内容。"
+            "你是对话摘要助手。请把「旧摘要」与「新对话内容」合并成一份"
+            "**自包含的最新摘要**（4-8句中文）：保留旧摘要中仍然重要的信息，"
+            "并纳入新对话新增的关键内容——话题变迁、用户透露的新信息、"
+            "重要决策/事件、任务目标与当前进度。忽略日常寒暄和已过时的细节。"
         )
         if prev_summary:
             user_msg = (
-                f'【前一段对话的摘要】\n{prev_summary}\n\n'
+                f'【旧摘要】\n{prev_summary}\n\n'
                 f'【新对话内容】\n{dialog_text}\n\n'
-                f'请只补充前一段摘要中**没有**的新内容。如果新内容和前一段摘要完全重复或没有新信息，请回复"同上"。'
-                f'只输出补充内容，不要加任何前缀。'
+                f'请输出合并后的完整最新摘要：涵盖旧摘要中的重要信息与新对话的新增内容。'
+                f'如果新对话没有新信息，直接原样复用旧摘要。只输出摘要正文，不要任何前缀。'
             )
         else:
-            user_msg = f'请总结以下对话：\n{dialog_text}'
+            user_msg = f'请总结以下对话（4-8句中文，覆盖目标、进展与关键信息）：\n{dialog_text}'
 
         try:
-            response = await self._llm_client.chat.completions.create(
+            response = await self._supervised_create(
                 model=self._llm_model,
                 messages=[
                     {"role": "system", "content": system_msg},
@@ -502,7 +1392,11 @@ class ChatMemory:
             # 提取角色和内容
             if ": " not in line:
                 continue
-            _, content = line.split(": ", 1)
+            role, content = line.split(": ", 1)
+            # 跳过工具结果行（$ 命令、✅/✘ 输出、日志片段等原始噪音——
+            # 关键词降级摘要没有语义能力，硬拼只会污染上下文）
+            if role.strip() == "工具":
+                continue
             content = content.strip()
             # 跳过太短或纯寒暄的
             if len(content) < 6 or content in filler_words:
@@ -531,7 +1425,9 @@ class ChatMemory:
         if not self.session_id:
             return []
 
-        recent_n = recent_n or RECENT_MESSAGE_COUNT
+        # DB 主源路径需要更多消息才能覆盖「最近几轮 + 被打断轮的工具轮」，
+        # 预算仍由 short_term_max_tokens 兜底，不会无限膨胀
+        recent_n = recent_n or max(RECENT_MESSAGE_COUNT, 60)
 
         def _do():
             conn = _get_db()
@@ -557,11 +1453,13 @@ class ChatMemory:
                     })
 
             # 获取最近消息（排除环境交互消息：短期记忆只与用户直接输入有关，
-            # 环境交互内容由记忆系统兜底存储，不进 LLM 上下文避免重复内容僵化）
+            # 环境交互内容由记忆系统兜底存储，不进 LLM 上下文避免重复内容僵化。
+            # 2026-08-30 例外：AI 自己的结论若被标记为 auto（感知/UI 触发轮），
+            # 也必须保留——否则"上一轮自己说的结论"会被当成噪音丢掉。
             msg_rows = conn.execute(
                 "SELECT role, content, tool_calls, tool_results FROM messages "
-                "WHERE session_id=? AND source != 'auto' "
-                "ORDER BY created_at DESC LIMIT ?",
+                "WHERE session_id=? AND (source != 'auto' OR role = 'assistant') "
+                "ORDER BY id DESC LIMIT ?",
                 (self.session_id, recent_n),
             ).fetchall()[::-1]  # 反转为正序
 
@@ -588,6 +1486,9 @@ class ChatMemory:
     async def get_history_for_llm(self, max_messages: int = 10) -> list:
         """获取用于 LLM 上下文的历史消息（简化格式）。
 
+        只保留每轮最终回复（跳过工具循环的中间轮与空消息），并保证
+        取到足够多的原始消息再配对，避免长工具轮把历史挤没。
+
         Returns:
             [{"user": "...", "ai": "..."}, ...]  兼容现有的 history 格式
         """
@@ -597,36 +1498,67 @@ class ChatMemory:
         def _do():
             conn = _get_db()
             rows = conn.execute(
-                "SELECT role, content FROM messages "
-                "WHERE session_id=? AND source != 'auto' "
-                "ORDER BY created_at DESC LIMIT ?",
-                (self.session_id, max_messages * 2),
+                "SELECT role, content, tool_calls FROM messages "
+                "WHERE session_id=? AND (source != 'auto' OR role = 'assistant') "
+                "AND role IN ('user','assistant') "
+                "ORDER BY id DESC LIMIT ?",
+                (self.session_id, max(max_messages * 10, 200)),
             ).fetchall()[::-1]
             conn.close()
-
-            history = []
-            pending_user = None
-            for row in rows:
-                if row["role"] == "user":
-                    pending_user = row["content"]
-                elif row["role"] == "assistant" and pending_user is not None:
-                    history.append({"user": pending_user, "ai": row["content"]})
-                    pending_user = None
+            history = _iter_turn_texts([dict(r) for r in rows])
             return history[-max_messages:]  # 只保留最近 N 轮
 
         return await asyncio.to_thread(_do)
 
     # ==================== 用户长期记忆 ====================
 
-    async def save_user_memory(self, memory_text: str, importance: float = 0.5):
+    @staticmethod
+    def infer_category(text: str) -> str:
+        """根据文本内容推断用户记忆类别（称呼/音乐/影片/城市/其他）。
+
+        优先检查显式标记（LLM 提取时可能带 [称呼] 之类前缀），其次关键词匹配。
+        """
+        if not text:
+            return "其他"
+        text_l = text.lower()
+        for cat in PREFERENCE_CATEGORIES:
+            if ("[" + cat + "]") in text or ("[" + cat + "]") in text_l:
+                return cat
+        for cat, kws in _CATEGORY_KEYWORDS.items():
+            for kw in kws:
+                if kw in text_l:
+                    return cat
+        return "其他"
+
+    @staticmethod
+    def strip_category_marker(text: str) -> str:
+        """去掉记忆中可能残留的类别标记前缀，只保留内容本身。"""
+        import re as _re
+        m = _re.match(r"^\s*(?:\[|【)\s*(称呼|音乐|影片|城市|其他)\s*(?:\]|】)\s*(.*)$", text, _re.S)
+        if m and m.group(2).strip():
+            return m.group(2).strip()
+        return text
+
+    async def save_user_memory(self, memory_text: str, importance: float = 0.5,
+                               category: str = None):
         """保存用户相关的长期记忆片段。
 
         若已存在相同内容的记忆，则只更新重要性和访问时间，避免重复入库。
 
+        入库前统一过滤噪音：空内容、模型思维链泄漏（<think>/</think> 残留）、
+        "无/同上"等无信息量回复一律丢弃，防止垃圾记忆污染长期记忆层。
+
         Args:
             memory_text: 记忆内容
             importance: 重要性评分 (0.0-1.0)
+            category: 记忆类别（称呼/音乐/影片/城市/其他）；None 时自动推断。
         """
+        memory_text = self.strip_category_marker(memory_text or "").strip()
+        memory_text = _clean_think_markers(memory_text)
+        if _is_memory_noise(memory_text):
+            return
+        category = category or self.infer_category(memory_text)
+
         @_with_db_lock
         def _do():
             conn = _get_db()
@@ -637,31 +1569,45 @@ class ChatMemory:
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE user_memories SET importance=?, last_accessed=?, source_session_id=? "
+                    "UPDATE user_memories SET importance=?, last_accessed=?, source_session_id=?, category=? "
                     "WHERE id=?",
-                    (max(importance, 0.5), now, self.session_id, existing["id"]),
+                    (max(importance, 0.5), now, self.session_id, category, existing["id"]),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO user_memories (user_id, namespace, memory_text, source_session_id, "
-                    "importance, created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (self.user_id, self.namespace, memory_text, self.session_id, importance, now, now),
+                    "INSERT INTO user_memories (user_id, namespace, memory_text, category, source_session_id, "
+                    "importance, created_at, last_accessed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (self.user_id, self.namespace, memory_text, category, self.session_id,
+                     importance, now, now),
                 )
             conn.commit()
 
         await asyncio.to_thread(_do)
 
-    async def get_user_memories(self, limit: int = 5) -> list:
-        """获取当前命名空间下用户最重要的长期记忆片段。"""
+    async def get_user_memories(self, limit: int = 5, category: str = None) -> list:
+        """获取当前命名空间下用户最重要的长期记忆片段。
+
+        Args:
+            limit: 返回条数上限
+            category: 按类别过滤（称呼/音乐/影片/城市/其他）；None=返回全部
+        """
         @_with_db_lock
         def _do():
             conn = _get_db()
             now = time.time()
-            rows = conn.execute(
-                "SELECT id, memory_text, importance FROM user_memories "
-                "WHERE user_id=? AND namespace=? ORDER BY importance DESC, last_accessed DESC LIMIT ?",
-                (self.user_id, self.namespace, limit),
-            ).fetchall()
+            sql = (
+                # 稳定排序：不用 last_accessed（读取即刷新，顺序每轮重洗会让
+                # LLM 前缀缓存每轮全失效）；importance 优先、id 作确定性次序
+                "SELECT id, memory_text, importance, category FROM user_memories "
+                "WHERE user_id=? AND namespace=?"
+                + (" AND category=?" if category else "")
+                + " ORDER BY importance DESC, id DESC LIMIT ?"
+            )
+            params = [self.user_id, self.namespace]
+            if category:
+                params.append(category)
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
             # 更新访问时间
             if rows:
                 ids = [r["id"] for r in rows]
@@ -707,9 +1653,11 @@ class ChatMemory:
             f'AI: {ai_response[:300]}\n\n'
             f'请只输出用户明确透露的信息，每行一条、简洁短句，不要编号或加前缀；'
             f'拿不准的信息不要输出。如果没有，只回复"无"。'
+            f'如某条信息可归类为以下任一类，请在行首用方括号标注类别：'
+            f'[称呼]、[音乐]、[影片]、[城市]；无法归类的不用标注。'
         )
         try:
-            response = await self._llm_client.chat.completions.create(
+            response = await self._supervised_create(
                 model=self._llm_model,
                 messages=[
                     {"role": "system", "content": "你是严格的记忆提取助手。只提取用户本人明确陈述或确认的真实信息，绝不采信 AI 对用户的描述、推测或虚构设定。"},
@@ -719,12 +1667,14 @@ class ChatMemory:
                 max_tokens=150,
             )
             content = response.choices[0].message.content.strip()
-            if content and content != "无":
+            content = _clean_think_markers(content)
+            if content and content not in _MEMORY_NOISE:
                 for line in content.split("\n"):
                     line = line.strip()
-                    if line and len(line) > 2:
+                    line = _clean_think_markers(line)
+                    if line and len(line) > 2 and not _is_memory_noise(line):
                         await self.save_user_memory(line, importance=0.7)
-                        logger.info(f"LLM 提取用户记忆: {line}")
+                        logger.info(f"LLM 提取用户记忆({ChatMemory.infer_category(line)}): {line}")
         except Exception as e:
             logger.warning(f"LLM 记忆提取失败，降级为关键词提取: {e}")
             self._keyword_extract_memories(user_message, ai_response)
@@ -757,6 +1707,502 @@ class ChatMemory:
             _asyncio.create_task(_save())
         except Exception:
             pass
+
+
+    # ==================== 主动回忆（按需相关性检索） ====================
+
+    @staticmethod
+    def _tokenize(text: str) -> set:
+        """轻量中文分词：按 2-gram 取连续 CJK 片段 + 英文单词小写。
+
+        不引入 jieba 等外部依赖（降低部署成本），2-gram 对中文短句关键词匹配足够。
+        """
+        import re as _re
+        tokens = set()
+        # 英文/数字单词
+        for w in _re.findall(r"[A-Za-z0-9]+", text or ""):
+            w = w.lower()
+            if len(w) >= 2:
+                tokens.add(w)
+        # 中文 2-gram（连续汉字段）
+        for seg in _re.findall(r"[\u4e00-\u9fff]+", text or ""):
+            if len(seg) == 1:
+                tokens.add(seg)
+            for i in range(len(seg) - 1):
+                tokens.add(seg[i:i + 2])
+        return tokens
+
+    def _recall_settings(self) -> dict:
+        """读取主动回忆配置（settings.json 的 memory 段），失败用默认值。"""
+        try:
+            with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            mem = (cfg.get("memory") or {}) or {}
+            return {
+                "recall_enabled": bool(mem.get("recall_enabled", RECALL_ENABLED)),
+                "recall_top_k": int(mem.get("recall_top_k", RECALL_TOP_K) or RECALL_TOP_K),
+                "recall_max_chars": int(mem.get("recall_max_chars", RECALL_MAX_CHARS) or RECALL_MAX_CHARS),
+            }
+        except Exception:
+            return {"recall_enabled": RECALL_ENABLED,
+                    "recall_top_k": RECALL_TOP_K,
+                    "recall_max_chars": RECALL_MAX_CHARS}
+
+    def _hierarchical_settings(self) -> dict:
+        """读取分层记忆打包配置（settings.json -> memory 段覆盖，失败用默认值）。"""
+        try:
+            with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            mem = (cfg.get("memory") or {}) or {}
+        except Exception:
+            mem = {}
+        defaults = {
+            'hierarchical_packing': HIERARCHICAL_PACKING,
+            'short_term_max_tokens': SHORT_TERM_MAX_TOKENS,
+            'short_term_max_chars_per_round': SHORT_TERM_MAX_CHARS_PER_ROUND,
+            'summary_max_tokens': SUMMARY_MAX_TOKENS,
+            'summary_max_chars_per_item': SUMMARY_MAX_CHARS_PER_ITEM,
+            'long_term_max_tokens': LONG_TERM_MAX_TOKENS,
+            'long_term_top_k': LONG_TERM_TOP_K,
+            'recall_max_tokens': RECALL_MAX_TOKENS,
+            'record_stats': RECORD_CONTEXT_STATS,
+        }
+        out = {}
+        for k, default in defaults.items():
+            v = mem.get(k, default)
+            out[k] = bool(v) if k in ('hierarchical_packing', 'record_stats') else int(v)
+        return out
+
+    async def recall_memories(self, query: str, limit: int = None,
+                              include_messages: bool = True,
+                              include_summaries: bool = True) -> list:
+        """按当前用户消息检索相关记忆（主动回忆）。
+
+        在长期记忆表 + 历史摘要 + 近期对话消息中做关键词相关性检索，
+        返回按相关度排序的记忆片段。检索不到相关内容时返回空列表。
+
+        Args:
+            query: 用户当前消息（用于提取关键词）
+            limit: 返回条数上限（默认取配置 recall_top_k）
+            include_messages: 是否检索近期对话消息（主动回忆最近说过的话）
+            include_summaries: 是否检索历史摘要
+
+        Returns:
+            [{"kind": "memory"|"summary"|"message", "text": str, "score": float, "category": str}, ...]
+        """
+        cfg = self._recall_settings()
+        if not cfg["recall_enabled"]:
+            return []
+        limit = limit or cfg["recall_top_k"]
+        q = (query or "").strip()
+        if not q or len(q) < 2:
+            return []
+        q_tokens = self._tokenize(q)
+        if not q_tokens:
+            return []
+
+        def _do():
+            conn = _get_db()
+            results = []
+
+            def _score(text: str) -> float:
+                if not text:
+                    return 0.0
+                t = self._tokenize(text)
+                if not t:
+                    return 0.0
+                inter = len(t & q_tokens)
+                if inter == 0:
+                    return 0.0
+                # 相关度 = 命中 token 数 / 查询 token 数（覆盖率），弱惩罚长文本
+                cov = inter / (len(q_tokens) + 2)
+                return cov
+
+            # 1) 长期用户记忆（importance 加权）
+            try:
+                rows = conn.execute(
+                    "SELECT memory_text, importance, category FROM user_memories "
+                    "WHERE user_id=? AND namespace=? ORDER BY importance DESC, id DESC LIMIT 100",
+                    (self.user_id, self.namespace),
+                ).fetchall()
+                for r in rows:
+                    base = _score(r["memory_text"])
+                    if base > 0:
+                        score = base * (0.6 + 0.4 * float(r["importance"] or 0.5))
+                        results.append({"kind": "memory", "text": r["memory_text"],
+                                        "score": score,
+                                        "category": r["category"] or "其他"})
+            except Exception:
+                pass
+
+            # 2) 历史摘要（跨会话，最多取最近 50 条）
+            if include_summaries:
+                try:
+                    srows = conn.execute(
+                        "SELECT s.summary_text, s.created_at FROM summaries s "
+                        "JOIN sessions se ON s.session_id = se.id "
+                        "WHERE se.user_id=? AND se.namespace=? "
+                        "ORDER BY s.created_at DESC LIMIT 50",
+                        (self.user_id, self.namespace),
+                    ).fetchall()
+                    for r in srows:
+                        base = _score(r["summary_text"])
+                        if base > 0:
+                            results.append({"kind": "summary", "text": r["summary_text"],
+                                            "score": base * 0.85, "category": "其他"})
+                except Exception:
+                    pass
+
+            # 3) 近期对话消息（主动回忆最近说过的话；排除环境交互 auto）
+            if include_messages:
+                try:
+                    mrows = conn.execute(
+                        "SELECT m.role, m.content FROM messages m "
+                        "JOIN sessions se ON m.session_id = se.id "
+                        "WHERE se.user_id=? AND se.namespace=? AND m.source != 'auto' "
+                        "ORDER BY m.created_at DESC LIMIT 200",
+                        (self.user_id, self.namespace),
+                    ).fetchall()
+                    seen = set()
+                    for r in mrows:
+                        text = (r["content"] or "").strip()
+                        if not text or text in seen:
+                            continue
+                        base = _score(text)
+                        if base > 0:
+                            seen.add(text)
+                            results.append({"kind": "message", "text": text,
+                                            "score": base * 0.7, "category": "其他"})
+                except Exception:
+                    pass
+
+            conn.close()
+            results.sort(key=lambda x: x["score"], reverse=True)
+            return results[:limit]
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.warning(f"主动回忆检索失败: {e}")
+            return []
+
+    async def build_recall_block(self, query: str) -> Optional[str]:
+        """构建按需注入的『相关回忆』文本片段（预算受限，防止上下文膨胀）。
+
+        分层打包开启时，除字符上限外额外受 recall_max_tokens（token 预算）约束，
+        两者取更严格者强制生效。无相关内容时返回 None（调用方不注入额外消息）。
+        """
+        cfg = self._recall_settings()
+        if not cfg["recall_enabled"]:
+            return None
+        items = await self.recall_memories(query)
+        if not items:
+            return None
+        hcfg = self._hierarchical_settings()
+        token_budget = hcfg['recall_max_tokens'] if hcfg['hierarchical_packing'] else 0
+        lines, _ = _format_recall_lines(items, cfg["recall_max_chars"], token_budget)
+        if not lines:
+            return None
+        head = "【相关回忆·按需注入】根据当前话题检索到的相关记忆，供你自然引用（无需刻意复述）：\n"
+        return head + "\n".join(lines)
+
+    # ==================== 分层记忆上下文打包（token 预算） ====================
+
+    async def get_recent_work_digest(self, max_chars: int = None) -> Optional[str]:
+        """最近一次「带工具执行的用户轮次」的真实工具结果摘要。
+
+        修复"刚做完的事转头就忘"：连接级历史只保留每轮最终回复，工具轮的
+        真实执行结果只存在于消息库；本方法把最近一次带工具轮次的
+        「目标 + 实际调用的工具 + 截断后的真实结果」原样取回，
+        每轮注入上下文，模型不再需要靠重读文件来回忆自己做过什么。
+
+        从最近 8 个用户轮次中从新到旧找第一个含工具结果的轮次；
+        没有工具轮时返回 None（不注入，保持上下文精简）。
+
+        Returns:
+            带标题的工具结果文本块，或 None。
+        """
+        if not self.session_id:
+            return None
+        max_chars = max_chars or RECENT_WORK_MAX_CHARS
+
+        def _do():
+            conn = _get_db()
+            rows = conn.execute(
+                "SELECT role, content, tool_calls FROM messages "
+                "WHERE session_id=? AND (source != 'auto' OR role != 'user') "
+                "ORDER BY id DESC LIMIT 120",
+                (self.session_id,),
+            ).fetchall()
+            conn.close()
+            return [dict(r) for r in rows][::-1]  # 旧→新
+
+        rows = await asyncio.to_thread(_do)
+        if not rows:
+            return None
+
+        # 按用户消息切轮次（与 _group_history_rounds 同语义）
+        rounds = []
+        cur = None
+        for m in rows:
+            if m.get("role") == "user":
+                cur = [m]
+                rounds.append(cur)
+            elif cur is not None:
+                cur.append(m)
+            else:
+                cur = [m]
+                rounds.append(cur)
+
+        for rnd in reversed(rounds[-8:]):
+            tool_msgs = [m for m in rnd if m.get("role") == "tool"]
+            if not tool_msgs:
+                continue
+            names = []
+            for m in rnd:
+                if m.get("role") == "assistant" and m.get("tool_calls"):
+                    try:
+                        tcs = json.loads(m["tool_calls"])
+                        names += [str((tc.get("function") or {}).get("name") or "?")
+                                  for tc in tcs]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            goal = next((str(m.get("content") or "") for m in rnd
+                         if m.get("role") == "user"), "")
+            goal = goal.strip().replace("\n", " ")
+            if len(goal) > 120:
+                goal = goal[:117] + "…"
+            digest = []
+            for i, m in enumerate(tool_msgs[:8]):
+                nm = names[i] if i < len(names) else "工具"
+                c = (str(m.get("content") or "").strip()
+                     .replace("\r", " ").replace("\n", " "))
+                if not c:
+                    continue
+                if len(c) > 160:
+                    c = c[:157] + "…"
+                digest.append(f"- {nm}: {c}")
+            if not digest:
+                continue
+            block = ("【最近一次任务执行（真实工具结果，请以此为准，不必重复读取）】"
+                     f"目标：{goal}\n" + "\n".join(digest))
+            if len(block) > max_chars:
+                block = block[:max_chars] + "…"
+            return block
+        return None
+
+    async def build_hierarchical_context(self, query: str = None,
+                                         connection_history: list = None,
+                                         recent_n: int = None) -> dict:
+        """打包本轮 LLM 的记忆类上下文：短期窗口 + 长期摘要 + 常驻长期记忆 + 按需召回。
+
+        四层独立受 token 预算约束（预算参数见 _hierarchical_settings）：
+        - 短期窗口：最近轮次，新→旧挑选直到满 short_term_max_tokens，单轮超长截到
+          short_term_max_chars_per_round（历史天然\"记住最近\"）；
+        - 长期摘要：只带最新 summary_max_tokens 的增量摘要；
+        - 长期关键信息：最高 importance 的 long_term_top_k 条常驻记忆；
+        - 按需召回：检索出的相关片段，recall_max_tokens 强制封顶。
+
+        hierarchical_packing=false 时完全回退到旧行为（各层不设 token 上限），
+        agent.py 组装逻辑不变，实现一键软回滚。
+
+        Args:
+            query: 当前用户消息（主动回忆的检索词）
+            connection_history: 服务端连接级历史 [{"user","ai"}...]（旧→新）；
+                None 时从记忆库读取最近消息作为短期窗口来源。
+            recent_n: 从记忆库读取的最近消息数上限（默认 RECENT_MESSAGE_COUNT）。
+
+        Returns:
+            {
+              "summary_block": 摘要块文本或 None,
+              "memory_block": 常驻长期记忆块文本或 None,
+              "recall_block": 主动回忆块文本或 None,
+              "work_block": 最近任务执行（真实工具结果）块文本或 None,
+              "history": 打包后的历史消息列表（旧→新，含 tool 结构）,
+              "stats": {"raw_tokens","packed_tokens","history_rounds",
+                        "summaries","memories","recall_items"} 或 None（record_stats=false）
+            }
+        """
+        if not self.session_id:
+            return {"summary_block": None, "memory_block": None, "recall_block": None,
+                    "work_block": None,
+                    "history": [], "stats": None}
+        # 防过期摘要：未摘要区间里若有一轮"带工具执行/完成汇报且已收尾"的对话
+        # （例如任务刚做完、还没到固定摘要间隔），先补一次摘要再组装上下文。
+        # 否则后续主动对话会读到过期的"进行中"摘要，与刚完成的执行结果自相矛盾。
+        try:
+            if await self._has_unsaved_work_round():
+                await self.force_summarize(
+                    include_auto=True, auto_prefix=("【子智能体汇报",))
+        except Exception as e:
+            logger.warning(f"上下文构建前补摘要失败（忽略）: {e}")
+        hcfg = self._hierarchical_settings()
+        enabled = hcfg["hierarchical_packing"]
+        record = bool(hcfg["record_stats"])
+        # DB 主源路径需要更多消息才能覆盖「最近几轮 + 被打断轮的工具轮」，
+        # 预算仍由 short_term_max_tokens 兜底，不会无限膨胀
+        recent_n = recent_n or max(RECENT_MESSAGE_COUNT, 60)
+
+        def _read():
+            conn = _get_db()
+            srows = conn.execute(
+                "SELECT summary_text FROM summaries WHERE session_id=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (self.session_id, MAX_SUMMARIES),
+            ).fetchall()
+            mrows = conn.execute(
+                "SELECT role, content, tool_calls, tool_results FROM messages "
+                "WHERE session_id=? AND (source != 'auto' OR role = 'assistant') "
+                "ORDER BY id DESC LIMIT ?",
+                (self.session_id, 100),
+            ).fetchall()[::-1]  # 反转为旧→新，给打包器足够挑选
+            mem_rows = conn.execute(
+                "SELECT memory_text FROM user_memories WHERE user_id=? AND namespace=? "
+                "ORDER BY importance DESC, id DESC LIMIT ?",
+                (self.user_id, self.namespace, max(hcfg['long_term_top_k'], 8)),
+            ).fetchall()
+            conn.close()
+            return srows, mrows, mem_rows
+
+        srows, mrows, mem_rows = await asyncio.to_thread(_read)
+
+        # ---- 摘要层 ----
+        summary_texts = [_clean_summary_noise(r["summary_text"]) for r in srows]
+        if enabled:
+            kept_s, _ = _pack_by_token_budget(
+                summary_texts, hcfg['summary_max_tokens'], hcfg['summary_max_chars_per_item'])
+            n_summaries = len(kept_s)
+            summary_block = ("以下是之前的对话摘要：\n" + "；".join(kept_s)) if kept_s else None
+        else:
+            combined = "；".join(summary_texts)
+            if len(combined) > 600:
+                combined = combined[:597] + "..."
+            n_summaries = len(summary_texts)
+            summary_block = ("以下是之前的对话摘要：\n" + combined) if combined else None
+
+        # ---- 常驻长期记忆层 ----
+        mem_lines = [f"- {m['memory_text']}" for m in mem_rows[:hcfg['long_term_top_k']]]
+        if enabled and mem_lines:
+            kept_m, _ = _pack_by_token_budget(mem_lines, hcfg['long_term_max_tokens'])
+            mem_lines = kept_m
+        n_memories = len(mem_lines)
+        memory_block = ("【关于用户的长期记忆（你之前了解到的用户信息，"
+                        "请自然地在对话中体现）】\n" + "\n".join(mem_lines)) if mem_lines else None
+
+        # ---- 按需召回层 ----
+        recall_lines, recall_items_count = [], 0
+        cfg = self._recall_settings()
+        if cfg["recall_enabled"] and query and len(query.strip()) >= 2:
+            items = await self.recall_memories(query)
+            if items:
+                recall_lines, recall_items_count = _format_recall_lines(
+                    items, cfg["recall_max_chars"],
+                    hcfg['recall_max_tokens'] if enabled else 0)
+        head = ("【相关回忆·按需注入】根据当前话题检索到的相关记忆，"
+                "供你自然引用（无需刻意复述）：\n") if recall_lines else None
+        recall_block = head + "\n".join(recall_lines) if recall_lines else None
+
+        # ---- 最近任务执行层（真实工具结果，动态尾巴） ----
+        work_block = None
+        try:
+            work_block = await self.get_recent_work_digest()
+        except Exception as e:
+            logger.warning(f"注入最近任务执行结果失败（忽略）: {e}")
+
+        # ---- 短期窗口 ----
+        # 2026-08-30 修复「打断丢上下文」：主源改用消息库（含工具轮真实结果）。
+        # 连接级历史只存每轮最终回复，被打断的轮次没有最终回复 → 下一轮只剩
+        # 「用户:xxx / AI:(空)」，正在做的工具工作全部丢失。改从 DB 取最近
+        # 消息后，打断现场的工具执行会原样进入下一轮上下文。
+        if connection_history is not None and not mrows:
+            raw_records = _connection_pairs_to_records(connection_history)
+        else:
+            # DB 的 tool_calls/tool_results 是 JSON 字符串，必须反序列化为 list，
+            # 否则打包后原样进 LLM 请求，sglang 等提供方会以 400 拒绝
+            # （tool_calls 应为 list 却收到 str）。
+            def _parse_json_field(v):
+                if v is None:
+                    return None
+                if isinstance(v, str):
+                    try:
+                        return json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        return None
+                return v
+
+            raw_records = [
+                {"role": r["role"], "content": r["content"],
+                 "tool_calls": _parse_json_field(r["tool_calls"]),
+                 "tool_results": _parse_json_field(r["tool_results"])}
+                for r in mrows[-recent_n:]] if enabled else [
+                {"role": r["role"], "content": r["content"]}
+                for r in mrows[-recent_n:]]
+        if enabled:
+            history = _pack_history_records(
+                raw_records, hcfg['short_term_max_tokens'],
+                hcfg['short_term_max_chars_per_round'])
+        else:
+            history = raw_records
+        n_rounds = sum(1 for m in history if m.get("role") == "user")
+
+        # ---- 量化统计（旧规则 vs 分层预算）----
+        if not record:
+            stats = None
+        else:
+            # 旧规则基线：完整短期窗口 + 3 条摘要合并 600 字 + top-2 记忆 + 召回 800 字
+            def _legacy_blocks():
+                s_legacy = ("以下是之前的对话摘要：\n" + "；".join(summary_texts[:MAX_SUMMARIES]))[:600]
+                m_legacy = "；".join(f"- {m['memory_text']}" for m in mem_rows[:2])
+                r_legacy = ""
+                if recall_lines:
+                    r_legacy = head + "\n".join(recall_lines)
+                return s_legacy, m_legacy, r_legacy
+
+            s_legacy, m_legacy, r_legacy = _legacy_blocks()
+            raw_tokens = (estimate_tokens(s_legacy) + estimate_tokens(m_legacy)
+                          + estimate_tokens(r_legacy)
+                          + sum(estimate_tokens(m.get('content') or '')
+                                for m in raw_records))
+            packed_tokens = (estimate_tokens(summary_block or '')
+                             + estimate_tokens(memory_block or '')
+                             + estimate_tokens(recall_block or '')
+                             + estimate_tokens(work_block or '')
+                             + sum(estimate_tokens(m.get('content') or '')
+                                   for m in history))
+            stats = {
+                "raw_tokens": raw_tokens,
+                "packed_tokens": packed_tokens,
+                "history_rounds": n_rounds,
+                "summaries": n_summaries,
+                "memories": n_memories,
+                "recall_items": recall_items_count,
+            }
+
+        return {"summary_block": summary_block, "memory_block": memory_block,
+                "recall_block": recall_block, "work_block": work_block,
+                "history": history, "stats": stats}
+
+    async def record_context_stats(self, stats: dict, actual_prompt_tokens: int = 0):
+        """写入一轮对话的上下文用量（context_stats 表），用于量化 token 节省。"""
+        if not stats:
+            return
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            conn.execute(
+                "INSERT INTO context_stats (session_id, namespace, raw_tokens, packed_tokens, "
+                "actual_prompt_tokens, history_rounds, summaries, memories, recall_items, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.session_id, self.namespace, stats.get("raw_tokens", 0),
+                 stats.get("packed_tokens", 0), actual_prompt_tokens,
+                 stats.get("history_rounds", 0), stats.get("summaries", 0),
+                 stats.get("memories", 0), stats.get("recall_items", 0), time.time()),
+            )
+            conn.commit()
+        try:
+            await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.warning(f"记录 context_stats 失败: {e}")
 
     # ==================== 清理 ====================
 

@@ -87,7 +87,7 @@ export default (function init(App: AppKernel) {
       App.vrmBones = {};
       if (App.vrm.humanoid) {
         const h = App.vrm.humanoid;
-        const want = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head', 'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand', 'leftUpperLeg', 'rightUpperLeg', 'leftLowerLeg', 'rightLowerLeg'];
+        const want = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head', 'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm', 'leftHand', 'rightHand', 'leftUpperLeg', 'rightUpperLeg', 'leftLowerLeg', 'rightLowerLeg', 'leftFoot', 'rightFoot'];
         for (const boneName of want) {
           const bone = h.getNormalizedBoneNode(boneName);
           if (bone) App.vrmBones[boneName] = bone;

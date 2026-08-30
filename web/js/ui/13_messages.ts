@@ -64,29 +64,178 @@ export default (function init(App: AppKernel) {
     return out;
   }
 
-  // 把文本渲染进消息元素：媒体链接内联成 <img>/<video>，普通网址转可点击链接，其余转义
+  // ---------- 轻量 Markdown 渲染（结构化展示 AI 回复） ----------
+  // 支持：**加粗** / *斜体* / `行内代码` / ```代码块``` / # 标题 /
+  // - 无序列表 / 1. 有序列表 / > 引用 / | 表格 | / [链接](url) / 普通网址 / 分隔线。
+  // 全程先 HTML 转义再转换，杜绝注入。
+  function inlineMd(s: string): string {
+    let t = escHtml(s);
+    const codes: string[] = [];
+    const links: string[] = [];
+    // 行内代码（先保护，避免被加粗/斜体/链接规则破坏）
+    t = t.replace(/`([^`\n]+)`/g, (_m, c) => {
+      codes.push('<code class="md-ic">' + c + '</code>');
+      return '\uE000' + (codes.length - 1) + '\uE001';
+    });
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    // [文字](网址) 链接（先保护，避免被下面的裸网址规则二次包裹）
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_m, txt, url) => {
+      links.push('<a class="md-link" href="' + url + '" target="_blank" rel="noopener">' + txt + '</a>');
+      return '\uE002' + (links.length - 1) + '\uE003';
+    });
+    // 裸网址链接化
+    t = t.replace(/https?:\/\/[^\s<>\u3000\uff08\uff09]+/g,
+      '<a class="md-link" href="$&" target="_blank" rel="noopener">$&</a>');
+    t = t.replace(/\uE002(\d+)\uE003/g, (_m, n) => links[Number(n)] || '');
+    t = t.replace(/\uE000(\d+)\uE001/g, (_m, n) => codes[Number(n)] || '');
+    // 行内换行（由段落/引用/列表续行以 \n 传入）转成 <br>
+    t = t.replace(/\n/g, '<br>');
+    return t;
+  }
+
+  function mdToHtml(src: string): string {
+    if (!src) return '';
+    const lines = src.replace(/\r\n?/g, '\n').split('\n');
+    const out: string[] = [];
+    let inCode = false;
+    let codeLang = '';
+    const codeBuf: string[] = [];
+    const flushCode = () => {
+      if (codeBuf.length) {
+        const cls = codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '';
+        out.push('<pre class="md-code"><code' + cls + '>' + codeBuf.join('\n') + '</code></pre>');
+        codeBuf.length = 0;
+      }
+      codeLang = '';
+      inCode = false;
+    };
+    let para: string[] = [];
+    const flushPara = () => {
+      if (para.length) {
+        out.push('<p class="md-p">' + inlineMd(para.join('\n')) + '</p>');
+        para.length = 0;
+      }
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const fm = line.match(/^```([\w+#-]*)\s*$/);
+      if (fm) {
+        if (inCode) flushCode();
+        else { flushPara(); inCode = true; codeLang = fm[1] || ''; }
+        continue;
+      }
+      if (inCode) { codeBuf.push(escHtml(line)); continue; }
+      const t = line.trim();
+      if (!t) { flushPara(); continue; }
+      // 表格：连续 | 行，第二行为分隔线
+      if (/^\|.*\|$/.test(t) && lines[i + 1] && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
+        flushPara();
+        const rows: string[][] = [];
+        let j = i;
+        while (j < lines.length && /^\|.*\|$/.test(lines[j].trim())) {
+          rows.push(lines[j].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
+          j++;
+        }
+        if (rows.length >= 2) {
+          out.push('<table class="md-table"><thead><tr>' +
+            rows[0].map(c => '<th>' + inlineMd(c) + '</th>').join('') +
+            '</tr></thead>' + (rows.length > 2 ? '<tbody>' + rows.slice(2).map(r =>
+              '<tr>' + r.map(c => '<td>' + inlineMd(c) + '</td>').join('') + '</tr>').join('') + '</tbody>' : '') +
+            '</table>');
+        } else {
+          out.push('<p class="md-p">' + inlineMd(t) + '</p>');
+        }
+        i = j - 1;
+        continue;
+      }
+      // 标题
+      const hm = t.match(/^(#{1,4})\s+(.*)$/);
+      if (hm) {
+        flushPara();
+        const lv = hm[1].length;
+        out.push('<h' + lv + ' class="md-h md-h' + lv + '">' + inlineMd(hm[2]) + '</h' + lv + '>');
+        continue;
+      }
+      // 引用
+      if (t.startsWith('>')) {
+        flushPara();
+        const q: string[] = [t.replace(/^>\s?/, '')];
+        while (i + 1 < lines.length && lines[i + 1].trim().startsWith('>')) {
+          i++;
+          q.push(lines[i].trim().replace(/^>\s?/, ''));
+        }
+        out.push('<blockquote class="md-quote">' + inlineMd(q.join('\n')) + '</blockquote>');
+        continue;
+      }
+      // 无序列表（吸收后续缩进续行）
+      const um = t.match(/^([-*+])\s+(.*)$/);
+      if (um) {
+        flushPara();
+        const items: string[] = [um[2]];
+        while (i + 1 < lines.length) {
+          const nt = lines[i + 1].trim();
+          const nm = nt.match(/^([-*+])\s+(.*)$/);
+          if (nm) { items.push(nm[2]); i++; continue; }
+          if (/^\d+\.\s+/.test(nt) || nt.startsWith('>') || nt.startsWith('#')
+              || nt.startsWith('```')) break;
+          if (nt) { items[items.length - 1] += '\n' + nt; i++; continue; }
+          break;
+        }
+        out.push('<ul class="md-ul">' + items.map(x => '<li>' + inlineMd(x) + '</li>').join('') + '</ul>');
+        continue;
+      }
+      // 有序列表
+      const om = t.match(/^(\d+)\.\s+(.*)$/);
+      if (om) {
+        flushPara();
+        const items: string[] = [om[2]];
+        while (i + 1 < lines.length) {
+          const nt = lines[i + 1].trim();
+          const nm = nt.match(/^(\d+)\.\s+(.*)$/);
+          if (nm) { items.push(nm[2]); i++; continue; }
+          if (/^[-*+]\s+/.test(nt) || nt.startsWith('>') || nt.startsWith('#')
+              || nt.startsWith('```')) break;
+          if (nt) { items[items.length - 1] += '\n' + nt; i++; continue; }
+          break;
+        }
+        out.push('<ol class="md-ol">' + items.map(x => '<li>' + inlineMd(x) + '</li>').join('') + '</ol>');
+        continue;
+      }
+      // 分隔线
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) { flushPara(); out.push('<hr class="md-hr">'); continue; }
+      para.push(line);
+    }
+    flushCode();
+    flushPara();
+    return out.join('\n');
+  }
+
+  // 公开给音频/流式模块：正文与思维链共用同一套实时 Markdown 渲染
+  App.mdToHtml = mdToHtml;
+
+  // 把文本渲染进消息元素：Markdown 结构化 + 媒体链接内联成 <img>/<video>，其余转义
   App.renderMsgMedia = function renderMsgMedia(el: HTMLElement | null, text: string) {
     if (!el) return;
     if (!text) { el.textContent = ''; return; }
     const urls = App.extractMediaUrls(text);
-    if (!urls.length && !/(https?:\/\/)/i.test(text)) { el.textContent = text; return; }
-    let html = '';
-    let last = 0;
-    MEDIA_URL_RE.lastIndex = 0;
-    let m;
-    while ((m = MEDIA_URL_RE.exec(text)) !== null) {
-      const url = String(m[0]).replace(MEDIA_TRAIL_RE, '');
-      if (!urls.includes(url)) continue;
+    let html = mdToHtml(text);
+    // 媒体链接：把渲染出的普通链接升级成内联 <img>/<video>
+    for (const url of urls) {
       const attrs = 'src="' + escHtml(url) + '"';
       const failFallback = 'this.style.display=\'none\';this.parentNode.classList.add(\'media-failed\')';
       const media = isVideoUrl(url)
         ? '<video class="msg-media msg-media-video" ' + attrs + ' controls playsinline preload="metadata" onerror="' + failFallback + '"></video>'
         : '<img class="msg-media msg-media-img" ' + attrs + ' alt="' + escHtml(url) + '" loading="lazy" referrerpolicy="no-referrer" onerror="' + failFallback + '">';
-      html += linkifySegment(text.slice(last, m.index)) +
-        '<a class="msg-media-link" href="' + escHtml(url) + '" target="_blank" rel="noopener" title="' + escHtml(url) + '">' + media + '</a>';
-      last = m.index + m[0].length;
+      const wrapped = '<a class="msg-media-link" href="' + escHtml(url) + '" target="_blank" rel="noopener" title="' + escHtml(url) + '">' + media + '</a>';
+      // 优先替换 mdToHtml 生成的普通链接（href 与文案均为转义后的 URL）
+      const linkHtml = '<a class="md-link" href="' + escHtml(url) + '" target="_blank" rel="noopener">' + escHtml(url) + '</a>';
+      if (html.includes(linkHtml)) {
+        html = html.split(linkHtml).join(wrapped);
+      } else if (html.includes(escHtml(url))) {
+        html = html.split(escHtml(url)).join(wrapped);
+      }
     }
-    html += linkifySegment(text.slice(last));
     el.innerHTML = html;
   };
 
@@ -251,14 +400,14 @@ export default (function init(App: AppKernel) {
   };
 
   /* ============================================================
-   *  回合气泡：思考 → 工具调用 → 回复 内联成一条 AI 气泡
-   *  一轮回复（thinking 开始 → audio_end 收尾）的全部过程
-   *  都连续呈现在同一气泡内，避免独立卡片刷屏。
-   *  - 思考段：默认折叠成「🧠 思考中…」摘要，点击展开完整过程；
-   *  - 工具段：默认折叠，工具链模块（31_tool_chain）往里追加步骤；
-   *  - 文本段：最终回复流式写入 .turn-text，不覆盖思考/工具内容。
+   *  回合气泡：正文 + 内联工具块（编程工具式）
+   *  一轮回复的正文按 Markdown 分段展示；工具调用以可展开的小块内联在
+   *  对应正文段后面（不叫工具链、不编号），展开可见参数/结果/详细步骤；
+   *  思考/推理内容一律不展示。
    * ============================================================ */
   App._turnMsgEl = null;
+  let segEl: HTMLElement | null = null;  // 当前正文段（流式写入目标）
+  let segSealed = false;                 // 当前正文段已封存（其后已有工具块）
 
   /** 新一轮回复开始：创建（或复用逻辑上最新的）回合气泡 */
   App.beginTurnBubble = function beginTurnBubble(sessionId?: string | null) {
@@ -266,28 +415,11 @@ export default (function init(App: AppKernel) {
     const el = document.createElement('div');
     el.className = 'msg ai turn';
     el.dataset.session = sessionId || '';
-    el.innerHTML =
-      '<div class="turn-sec turn-think">' +
-        '<button type="button" class="turn-head turn-think-head" aria-expanded="false">' +
-          '<span class="turn-ic">🧠</span>' +
-          '<span class="turn-title turn-think-title">思考中…</span>' +
-          '<span class="turn-sub turn-think-sub"><span class="turn-spin">⟳</span>思考中</span>' +
-          '<span class="turn-caret">▾</span>' +
-        '</button>' +
-        '<div class="turn-body turn-think-body" hidden></div>' +
-      '</div>' +
-      '<div class="turn-sec turn-tools">' +
-        '<button type="button" class="turn-head turn-tools-head" aria-expanded="false" hidden>' +
-          '<span class="turn-ic">🛠</span>' +
-          '<span class="turn-title turn-tools-title">工具调用</span>' +
-          '<span class="turn-sub turn-tools-state"></span>' +
-          '<span class="turn-caret">▾</span>' +
-        '</button>' +
-        '<div class="turn-body turn-tools-body" hidden></div>' +
-      '</div>' +
-      '<div class="turn-text"></div>';
+    el.innerHTML = '<div class="turn-seg"></div>';
     App.messagesEl!.appendChild(el);
     App._turnMsgEl = el;
+    segEl = el.querySelector('.turn-seg') as HTMLElement;
+    segSealed = false;
     App._trimMessages();
     App.bumpNewMsg(el);
     App.scrollToBottom();
@@ -295,44 +427,149 @@ export default (function init(App: AppKernel) {
     return el;
   };
 
-  /** 思考内容增量追加（后端 thinking.text 到达时持续更新） */
-  App.appendTurnThinking = function appendTurnThinking(text: string) {
+  /** 获取当前正文段；已封存或缺失则新建一段，追加到气泡末尾 */
+  App.ensureTurnSeg = function ensureTurnSeg(): HTMLElement | null {
     const b = App._turnMsgEl;
-    if (!b || !document.body.contains(b)) return;
-    const body = b.querySelector('.turn-think-body');
-    if (!body) return;
-    if (text) {
-      body.textContent = (body.textContent || '') + text;
-      const sub = b.querySelector('.turn-think-sub');
-      if (sub) {
-        const brief = String(text).replace(/[\r\n]+/g, ' ').trim();
-        const max = 56;
-        const shown = brief.length > max ? brief.slice(0, max) + '…' : brief;
-        sub.innerHTML = '<span class="turn-spin">⟳</span>' + escHtml(shown);
+    if (!b || !document.body.contains(b)) return null;
+    if (!segEl || !document.body.contains(segEl) || segSealed) {
+      segEl = document.createElement('div');
+      segEl.className = 'turn-seg';
+      b.appendChild(segEl);
+      segSealed = false;
+    }
+    return segEl;
+  };
+
+  /** 封存当前正文段：工具块将插入其后，后续正文另起一段 */
+  App.sealTurnSeg = function sealTurnSeg() {
+    if (segEl && document.body.contains(segEl)) {
+      const raw = segEl.dataset.raw || '';
+      if (!raw.trim()) {
+        // 封存的是空段（工具先于正文到达）：移除，避免空占位
+        segEl.remove();
+        segEl = null;
+      } else if (App.renderMsgMedia) {
+        // 段落已完整：渲染最终 Markdown（流式期间保持纯文本，避免半截语法乱码）
+        App.renderMsgMedia(segEl, raw);
       }
     }
+    segSealed = true;
+  };
+
+  /** 旧 thinking_text 通道：保留为空操作（新链路走 reasoning 事件） */
+  App.appendTurnThinking = function appendTurnThinking(_text: string) {};
+
+  /** 思考中实时指示：回复气泡底部一行持续更新的 reasoning_content 尾段。
+   *
+   *  服务端已节流（~250ms / 只推尾部 180 字），这里只做轻量文本更新，
+   *  不 Markdown、不朗读、不进正文；正文开始流式或整轮收尾时清除。
+   *  推理先于 thinking 到达时兜底创建回合气泡，避免指示无处安放。
+   */
+  let reasoningEl: HTMLElement | null = null;
+  App.handleReasoning = function handleReasoning(text: string, sessionId?: string | null) {
+    if (!text) return;
+    const b = App._turnMsgEl;
+    if (!b || !document.body.contains(b)) {
+      if (!App.beginTurnBubble) return;
+      App.beginTurnBubble(sessionId || null);
+    }
+    const bubble = App._turnMsgEl;
+    if (!bubble || !document.body.contains(bubble)) return;
+    if (!reasoningEl || !document.body.contains(reasoningEl)) {
+      reasoningEl = document.createElement('div');
+      reasoningEl.className = 'turn-reasoning';
+      reasoningEl.innerHTML =
+        '<span class="turn-reasoning-dot"></span>' +
+        '<span class="turn-reasoning-label">思考中</span>' +
+        '<span class="turn-reasoning-text"></span>';
+      bubble.appendChild(reasoningEl);
+    }
+    const txt = reasoningEl.querySelector('.turn-reasoning-text') as HTMLElement | null;
+    if (txt) txt.textContent = text;
+    App.scrollToBottom();
+  };
+  App.clearReasoningLine = function clearReasoningLine() {
+    if (reasoningEl && document.body.contains(reasoningEl)) reasoningEl.remove();
+    reasoningEl = null;
+  };
+
+  /* ============================================================
+   *  长时间无响应看门狗：工具/思考期间没有任何实时事件
+   *  （推理增量 / 工具心跳 / 正文流式）时，在回复气泡底部提示可能卡住，
+   *  并提供一键中断（中断后说『继续』可恢复完整现场）。
+   * ============================================================ */
+  const STUCK_AFTER_MS = 25_000;      // 连续这么久无任何事件 → 提示
+  const WATCH_INTERVAL_MS = 5_000;    // 看门狗轮询间隔
+  const TOOL_MAX_MS = 5 * 60_000;     // 单个工具跑/排队超过 5 分钟 → 提示
+  let stuckEl: HTMLElement | null = null;
+  let stuckWatchStarted = false;
+
+  App.noteTurnActivity = function noteTurnActivity() {
+    App._lastTurnActivity = Date.now();
+    App.clearStuckHint();
+  };
+
+  App.clearStuckHint = function clearStuckHint() {
+    if (stuckEl && document.body.contains(stuckEl)) stuckEl.remove();
+    stuckEl = null;
+  };
+
+  App.maybeWarnStuck = function maybeWarnStuck() {
+    const b = App._turnMsgEl;
+    const active = !!(App.currentReplySession
+      || (b && document.body.contains(b) && b.classList.contains('streaming'))
+      || App.currentState === App.State.THINKING
+      || App.currentState === App.State.SPEAKING);
+    if (!active) {
+      App.clearStuckHint();
+      return;
+    }
+    const idle = Date.now() - (App._lastTurnActivity || 0);
+    const toolRunning = Date.now() - (App._toolRunningSince || 0);
+    const toolTooLong = App._toolRunningSince > 0 && toolRunning > TOOL_MAX_MS;
+    if (idle < STUCK_AFTER_MS && !toolTooLong) {
+      App.clearStuckHint();
+      return;
+    }
+    const warnText = toolTooLong
+      ? '工具已运行 ' + Math.floor(toolRunning / 1000) + ' 秒仍无结果，可能卡住'
+      : '已 ' + Math.floor(idle / 1000) + ' 秒无响应，可能卡住';
+    if (stuckEl && document.body.contains(stuckEl)) {
+      const txt = stuckEl.querySelector('.turn-stuck-text');
+      if (txt) txt.textContent = warnText;
+      return;
+    }
+    if (!b || !document.body.contains(b)) return;
+    stuckEl = document.createElement('div');
+    stuckEl.className = 'turn-stuck';
+    stuckEl.innerHTML =
+      '<span class="turn-stuck-icon">⚠</span>' +
+      '<span class="turn-stuck-text">' + warnText + '</span>' +
+      '<button class="turn-stuck-btn" type="button" title="中断当前回复，之后说『继续』可恢复">中断后说『继续』恢复</button>';
+    const btn = stuckEl.querySelector('.turn-stuck-btn');
+    if (btn) btn.addEventListener('click', () => {
+      if (App.triggerInterrupt) App.triggerInterrupt();
+    });
+    b.appendChild(stuckEl);
     App.scrollToBottom();
   };
 
-  /** 整轮收尾：思考段由「思考中…」变「思考过程」，中断时标记气泡 */
+  if (!stuckWatchStarted) {
+    stuckWatchStarted = true;
+    window.setInterval(() => App.maybeWarnStuck(), WATCH_INTERVAL_MS);
+  }
+
+  /** 整轮收尾：把所有正文段渲染成完整 Markdown + 中断标记 */
   App.finishTurn = function finishTurn(interrupted?: boolean) {
     const b = App._turnMsgEl;
     if (!b || !document.body.contains(b)) return;
-    const th = b.querySelector('.turn-think-head');
-    if (th) {
-      const title = th.querySelector('.turn-think-title');
-      const sub = th.querySelector('.turn-think-sub');
-      if (title && title.textContent === '思考中…') title.textContent = '思考过程';
-      if (sub) {
-        sub.classList.remove('spinning');
-        sub.textContent = interrupted ? '已中断' : '';
-      }
-    }
-    if (interrupted) {
-      b.classList.add('interrupted');
-      const ts = b.querySelector('.turn-tools-state');
-      if (ts) ts.textContent = '已中断';
-    }
+    if (interrupted) b.classList.add('interrupted');
+    if (App.clearReasoningLine) App.clearReasoningLine();
+    if (App.clearStuckHint) App.clearStuckHint();
+    b.querySelectorAll('.turn-seg').forEach((s) => {
+      const raw = (s as HTMLElement).dataset.raw || '';
+      if (raw && App.renderMsgMedia) App.renderMsgMedia(s as HTMLElement, raw);
+    });
   };
 
   /** 回复文本落点：回合气泡 → .turn-text；普通气泡 → 气泡本身 */
@@ -342,24 +579,35 @@ export default (function init(App: AppKernel) {
       : App._turnMsgEl;
     if (!el) return null;
     if (el.classList && el.classList.contains('turn')) {
-      return el.querySelector('.turn-text') as HTMLElement | null;
+      return (App.ensureTurnSeg ? App.ensureTurnSeg() : null);
     }
     return el;
   };
 
-  /** 流式过程文本写入（不覆盖思考/工具段） */
+  /** 流式正文写入：增量纯文本追加（避免全文重复堆叠、半截 Markdown 乱码）；
+   *  段落封存 / 整轮收尾时再渲染完整 Markdown */
   App.setTurnStreamText = function setTurnStreamText(text: string) {
     const el = App.turnTextContainer();
     if (!el) return;
-    el.textContent = text;
+    const raw = (el.dataset.raw || '') + text;
+    el.dataset.raw = raw;
+    el.textContent = raw;
   };
 
-  /** 最终回复全文渲染（媒体链接内联等，落到 .turn-text） */
+  /** 最终回复全文渲染：流式时正文已完整显示，audio_end 的全文只含结论，
+   *  不覆盖正文，避免丢掉过程段落与内联工具块；仅正文为空时兜底写入 */
   App.renderTurnText = function renderTurnText(text: string) {
-    const el = App.turnTextContainer();
-    if (!el) return;
-    if (App.renderMsgMedia) App.renderMsgMedia(el, text);
-    else el.textContent = text;
+    const b = App._turnMsgEl;
+    if (!b || !document.body.contains(b)) return;
+    let hasText = false;
+    b.querySelectorAll('.turn-seg').forEach((s) => {
+      if ((s.textContent || '').trim()) hasText = true;
+    });
+    if (!hasText && text) {
+      const el = App.turnTextContainer();
+      if (el && App.renderMsgMedia) App.renderMsgMedia(el, text);
+      else if (el) el.textContent = text;
+    }
   };
 
   /* ============================================================
@@ -414,11 +662,13 @@ export default (function init(App: AppKernel) {
   // 复制按钮点击（事件委托：清空/裁剪消息也不会泄漏监听器）
   App.messagesEl!.addEventListener('click', (e) => {
     const target = e.target as HTMLElement;
-    // 回合气泡折叠段：点头部展开/收起思考 / 工具调用
+    // 回合气泡折叠段：点头部展开/收起推理 / 工具模块
     const turnHead = target.closest && target.closest('.turn-head') as HTMLElement | null;
     if (turnHead) {
       const sec = turnHead.parentElement;
       if (sec) {
+        // 用户手动操作过（展开或折叠）：该段后续内容不再自动开合，尊重用户状态
+        sec.dataset.userManaged = '1';
         const body = sec.querySelector('.turn-body') as HTMLElement | null;
         if (body) {
           body.hidden = !body.hidden;
@@ -505,7 +755,7 @@ export default (function init(App: AppKernel) {
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
     return String(n);
   };
-  App._tokenStats = { context: 0, completion: 0, total: 0, rounds: 0, msgs: 0 };
+  App._tokenStats = { context: 0, completion: 0, total: 0, rounds: 0, msgs: 0, cache_hit: 0, cache_miss: 0 };
   try {
     const saved = JSON.parse(localStorage.getItem(TOKEN_STATS_KEY) || 'null');
     if (saved && typeof saved === 'object') Object.assign(App._tokenStats, saved);
@@ -513,11 +763,14 @@ export default (function init(App: AppKernel) {
   App._lastUsage = null;
   App.handleUsageMessage = function handleUsageMessage(msg: UsageMessage) {
     App._lastUsage = msg;
+    // 输入/输出分开累计：context 是「实际接受的上下文输入」逐轮累加，不再覆盖
+    App._tokenStats.context += msg.prompt_tokens || 0;
     App._tokenStats.completion += msg.completion_tokens || 0;
     App._tokenStats.total += msg.total_tokens || 0;
     App._tokenStats.rounds += msg.rounds || 0;
     App._tokenStats.msgs += 1;
-    App._tokenStats.context = msg.prompt_tokens || 0; // 覆盖为最近值
+    App._tokenStats.cache_hit += msg.cache_hit_tokens || 0;
+    App._tokenStats.cache_miss += msg.cache_miss_tokens || 0;
     try {
       localStorage.setItem(TOKEN_STATS_KEY, JSON.stringify(App._tokenStats));
     } catch (e) {}
@@ -540,21 +793,38 @@ export default (function init(App: AppKernel) {
     const meter = document.getElementById('chat-token-meter');
     if (!meter) return;
     const u = App._lastUsage;
+    const st = App._tokenStats;
+    const hit = st.cache_hit || 0;
+    const miss = st.cache_miss || 0;
+    const cachePct = (hit + miss) > 0 ? Math.round((hit / (hit + miss)) * 1000) / 10 : 0;
+    const cacheTxt = cachePct > 0
+      ? '\n缓存命中 ' + cachePct + '%（' + App.fmtTokens(hit) + ' / ' + App.fmtTokens(hit + miss) + '）'
+      : '';
     if (u) {
       const win = u.context_window || 0;
-      meter.textContent = '上下文 ' + App.fmtTokens(u.prompt_tokens || 0) +
-        (win > 0 ? '/' + App.fmtTokens(win) : '') +
-        ' · 本轮 ' + App.fmtTokens(u.total_tokens || 0);
+      // 本轮：输入 / 输出 分开显示，缓存命中率直接上屏
       const pct = win > 0 ? Math.round(((u.prompt_tokens || 0) / win) * 1000) / 10 : 0;
-      meter.title = '上下文占用 ' + pct + '%（输入 ' + App.fmtTokens(u.prompt_tokens || 0) +
-        ' / 输出 ' + App.fmtTokens(u.completion_tokens || 0) + '）· 累计 ' +
-        App.fmtTokens(App._tokenStats.total) + ' tokens · 回复 ' + App._tokenStats.msgs + ' 条';
+      const cacheBadge = cachePct > 0 ? ' · ⛁' + cachePct + '%' : '';
+      meter.textContent = '输入 ' + App.fmtTokens(u.prompt_tokens || 0) +
+        ' · 输出 ' + App.fmtTokens(u.completion_tokens || 0) + cacheBadge;
+      meter.title = '本轮 输入 ' + App.fmtTokens(u.prompt_tokens || 0) +
+        ' / 输出 ' + App.fmtTokens(u.completion_tokens || 0) +
+        ' · 上下文占用 ' + pct + '%' +
+        (win > 0 ? '（窗口 ' + App.fmtTokens(win) + '）' : '') +
+        '\n累计 输入 ' + App.fmtTokens(st.context) +
+        ' / 输出 ' + App.fmtTokens(st.completion) +
+        ' · 共 ' + App.fmtTokens(st.total) + ' tokens · ' + st.msgs + ' 条回复' +
+        cacheTxt;
       return;
     }
-    if (App._tokenStats.total > 0) {
-      meter.textContent = '累计 ' + App.fmtTokens(App._tokenStats.total) + ' tokens';
-      meter.title = '累计 ' + App.fmtTokens(App._tokenStats.total) + ' tokens · 回复 ' +
-        App._tokenStats.msgs + ' 条';
+    if (st.total > 0) {
+      const cacheBadge = cachePct > 0 ? ' · ⛁' + cachePct + '%' : '';
+      meter.textContent = '累计 输入 ' + App.fmtTokens(st.context) +
+        ' / 输出 ' + App.fmtTokens(st.completion) + cacheBadge;
+      meter.title = '累计 输入 ' + App.fmtTokens(st.context) +
+        ' / 输出 ' + App.fmtTokens(st.completion) +
+        ' · 共 ' + App.fmtTokens(st.total) + ' tokens · ' + st.msgs + ' 条回复' +
+        cacheTxt;
       return;
     }
     meter.textContent = '—';
@@ -562,10 +832,17 @@ export default (function init(App: AppKernel) {
   const tokenMeterEl = document.getElementById('chat-token-meter');
   if (tokenMeterEl) tokenMeterEl.addEventListener('click', () => {
     const u = App._lastUsage;
+    const st = App._tokenStats;
     const win = u && u.context_window ? u.context_window : 0;
-    const ctx = u ? App.fmtTokens(u.prompt_tokens || 0) : App.fmtTokens(App._tokenStats.context);
-    App.showToast('累计 tokens：' + App.fmtTokens(App._tokenStats.total) +
-      ' · 上下文 ' + ctx + (win > 0 ? '/' + App.fmtTokens(win) : ''));
+    const ctx = u ? App.fmtTokens(u.prompt_tokens || 0) : App.fmtTokens(st.context);
+    const hit = st.cache_hit || 0;
+    const miss = st.cache_miss || 0;
+    const cachePct = (hit + miss) > 0 ? Math.round((hit / (hit + miss)) * 1000) / 10 : 0;
+    App.showToast('累计 输入 ' + App.fmtTokens(st.context) +
+      ' / 输出 ' + App.fmtTokens(st.completion) +
+      ' · 共 ' + App.fmtTokens(st.total) + ' tokens' +
+      ' · 本轮输入 ' + ctx + (win > 0 ? '/' + App.fmtTokens(win) : '') +
+      (cachePct > 0 ? ' · 缓存命中 ' + cachePct + '%' : ''));
   });
   App.updateTokenMeter(); // 让持久化数据上屏
 

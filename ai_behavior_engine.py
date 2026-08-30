@@ -103,7 +103,7 @@ class AIBehaviorEngine:
 
         self._consecutive_wanders: int = 0
         self._consecutive_idles: int = 0
-        self._last_glance_time: float = 0   # 上次好奇张望时间（小女友人设）
+        self._last_glance_time: float = 0   # 上次好奇张望时间
         self.MAX_CONSECUTIVE_WANDERS = 2    # 正常模式下允许连续多次漫步（更活泼）
 
         # 焦虑踱步（被冷落太久时长时间乱走，象征焦虑与无聊）
@@ -216,8 +216,8 @@ class AIBehaviorEngine:
                     self._record(decision)
                     return decision
 
-        # 规则 3.5：小女友式好奇张望（用户在场时，先好奇地看恋人一眼）
-        # —— 充满好奇心的小女友：比起远处的 POI，更好奇"恋人在干什么"
+        # 规则 3.5：好奇张望（用户在场时，先好奇地看看用户在做什么）
+        # —— 比起远处的 POI，更好奇"用户在干什么"（语气按当前角色人设自然演绎）
         if context.user_engaged and self.perception.curiosity.should_explore():
             decision = self._decide_curious_glance()
             if decision:
@@ -226,7 +226,7 @@ class AIBehaviorEngine:
 
         # 规则 3.6：掌握用户实际位置且距离较远 → 走向用户
         # —— 快照中的 user（摄像机）位置给了 AI 真实的空间参考：
-        #    恋人（FPV 走动时）离远了，就主动走过去陪在Ta身边
+        #    用户（FPV 走动时）离远了，就主动走过去陪在对方身边
         if (context.user_known and context.user_distance > 4.0
                 and self.perception.curiosity.should_explore()):
             decision = self._decide_go_to_user(context)
@@ -432,12 +432,12 @@ class AIBehaviorEngine:
             confidence=0.6,
         )
 
-    # 小女友式好奇张望：好奇地歪头看对方在做什么（小动作 + 俏皮嘀咕）
+    # 好奇张望：好奇地看看用户在做什么（小动作 + 俏皮嘀咕；不预设恋爱关系，语气由人设决定）
     _CURIOUS_GLANCES = (
-        "（你好奇地歪着头，偷偷瞄了一眼恋人，小声嘀咕：'诶，你在干嘛呀～'）",
-        "（你像小仓鼠一样好奇地凑近两步，眨巴着眼睛想看清恋人在做什么）",
-        "（你假装四处张望，目光却总是不经意地飘向恋人那边，嘴角悄悄翘起来）",
-        "（你背着手踮起脚尖，伸长脖子想看看恋人那边有什么好玩的）",
+        "（你好奇地歪着头，偷偷瞄了一眼用户，小声嘀咕：'诶，你在做什么呀～'）",
+        "（你像只好奇的小动物一样凑近两步，眨巴着眼睛想看清用户在做什么）",
+        "（你假装四处张望，目光却总是不经意地飘向用户那边，嘴角悄悄翘起来）",
+        "（你背着手踮起脚尖，伸长脖子想看看用户那边有什么好玩的）",
     )
 
     def _decide_curious_glance(self) -> Optional[BehaviorDecision]:
@@ -448,7 +448,7 @@ class AIBehaviorEngine:
         self._consecutive_idles = 0
         return BehaviorDecision(
             behavior=BehaviorType.IDLE_ACTION,
-            reason="好奇张望恋人",
+            reason="好奇张望用户",
             speak_text=random.choice(self._CURIOUS_GLANCES),
             confidence=0.75,
         )
@@ -475,8 +475,8 @@ class AIBehaviorEngine:
             reason=f"走向用户（{direc} {dist:.1f}m）",
             target_x=env.user_x, target_z=env.user_z,
             target_label="用户身边",
-            speak_text=(f"（你注意到恋人在你{direc}约{dist:.1f}米处，"
-                        f"决定走过去陪在Ta身边。用一句话自然地表达想去找Ta。）"),
+            speak_text=(f"（你注意到用户在你{direc}约{dist:.1f}米处，"
+                        f"决定主动走过去陪在对方身边。用一句话自然地表达想去找Ta。）"),
             confidence=0.7,
         )
 

@@ -76,7 +76,10 @@ export default (function init(App: AppKernel) {
         '<button id="task-center-close" class="task-center-close">×</button>' +
       '</div>' +
       '<div class="task-center-body">' +
-        '<div id="task-center-list" class="task-center-list"></div>' +
+        '<div class="task-center-side">' +
+          '<div class="task-center-toolbar"><button id="task-center-clear" class="task-center-clear">🗑 清除已完成</button></div>' +
+          '<div id="task-center-list" class="task-center-list"></div>' +
+        '</div>' +
         '<div id="task-center-detail" class="task-center-detail">' +
           '<div class="task-detail-empty">选择左侧任务查看进度与日志</div>' +
         '</div>' +
@@ -84,6 +87,19 @@ export default (function init(App: AppKernel) {
       '<div id="task-center-hint" class="task-center-hint"></div>';
     document.body.appendChild(panel);
     document.getElementById('task-center-close')!.addEventListener('click', () => App.closeTaskCenter());
+    document.getElementById('task-center-clear')!.addEventListener('click', () => {
+      fetch('/api/tasks/clear', { method: 'POST' }).then(r => r.json()).then((d: any) => {
+        if (d && d.ok) {
+          tasks = tasks.filter(t => !['done', 'error', 'cancelled'].includes(t.status || ''));
+          detailMap.clear();
+          selectedId = null;
+          renderList();
+          const wrap = document.getElementById('task-center-detail');
+          if (wrap) wrap.innerHTML = '<div class="task-detail-empty">选择左侧任务查看进度与日志</div>';
+          if (App.showToast) App.showToast('已清除 ' + (d.cleared || 0) + ' 个已完成任务');
+        }
+      }).catch(() => {});
+    });
   }
 
   // ---------- 打开 / 关闭 / 轮询 ----------
@@ -211,7 +227,8 @@ export default (function init(App: AppKernel) {
         '<div class="task-row-meta">' +
           '<span class="task-chip ' + meta.cls + '">' + meta.icon + ' ' + esc(meta.label) + '</span>' +
           '<span class="task-agent-name" style="color:' + ag.color + '">' + esc(ag.name || '') + '</span>' +
-        '</div>';
+        '</div>' +
+        (typeof t.progress === 'number' ? '<div class="task-row-progress"><div class="task-row-progress-fill" style="width:' + Math.max(0, Math.min(100, t.progress)) + '%"></div></div>' : '');
       row.addEventListener('click', () => {
         selectedId = t.id;
         renderList();
@@ -380,7 +397,7 @@ export default (function init(App: AppKernel) {
 
     if (t.brief) {
       const brief = el('div', 'task-detail-brief');
-      brief.textContent = t.brief;
+      brief.innerHTML = App.mdToHtml ? App.mdToHtml(String(t.brief)) : esc(t.brief);
       wrap.appendChild(brief);
     }
 
@@ -390,7 +407,8 @@ export default (function init(App: AppKernel) {
       for (const s of t.steps) {
         const row = el('div', 'task-step');
         row.innerHTML = '<span class="task-step-dot"></span><span></span>';
-        row.lastChild!.textContent = s;
+        const stepText = row.lastElementChild as HTMLElement;
+        if (stepText) stepText.innerHTML = App.mdToHtml ? App.mdToHtml(String(s)) : esc(s);
         stepsBox.appendChild(row);
       }
       wrap.appendChild(stepsBox);
@@ -420,6 +438,7 @@ export default (function init(App: AppKernel) {
     ensureTaskTrace(wrap, t);
 
     if (t.status === 'done' && t.result) {
+      const resBox = el('div', 'task-result-box');
       const resEl = el('div', 'task-result');
       if (App.renderMsgMedia) {
         App.renderMsgMedia(resEl, String(t.result).slice(0, 20000));
@@ -430,10 +449,22 @@ export default (function init(App: AppKernel) {
       } else {
         resEl.textContent = String(t.result).slice(0, 20000);
       }
-      wrap.appendChild(resEl);
+      resBox.appendChild(resEl);
+      const fullRes = String(t.result || '');
+      if (fullRes.length > 800) {
+        const moreBtn = el('button', 'task-btn-act task-btn-ghost task-more-btn', '展开全文');
+        moreBtn.addEventListener('click', () => {
+          resEl.classList.toggle('expanded');
+          moreBtn.textContent = resEl.classList.contains('expanded') ? '收起' : '展开全文';
+        });
+        resBox.appendChild(moreBtn);
+      }
+      wrap.appendChild(resBox);
     }
     if (t.status === 'error' && t.error) {
-      wrap.appendChild(el('div', 'task-error', String(t.error).slice(0, 2000)));
+      const errEl = el('div', 'task-error');
+      errEl.innerHTML = App.mdToHtml ? App.mdToHtml(String(t.error).slice(0, 2000)) : esc(String(t.error).slice(0, 2000));
+      wrap.appendChild(errEl);
     }
 
     const actions = el('div', 'task-actions');

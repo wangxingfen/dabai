@@ -18,6 +18,7 @@
     "@babel/parser": "^8.0.4",
     "@babel/traverse": "^8.0.4",
     "@babel/types": "^8.0.4",
+    "@gltf-transform/cli": "^4.4.2",
     "@pixiv/three-vrm": "3.4.2",
     "@types/three": "^0.160.0",
     "@types/webxr": "0.5.24",

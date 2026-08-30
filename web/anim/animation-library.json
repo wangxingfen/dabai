@@ -43,6 +43,20 @@
           "emotion": "shy",
           "loop": true,
           "description": "害羞待机，身体微扭"
+        },
+        {
+          "name": "idle_think",
+          "file": "idle/Idle_Thinking.fbx",
+          "emotion": "thoughtful",
+          "loop": true,
+          "description": "思考待机，托腮沉思"
+        },
+        {
+          "name": "idle_flex",
+          "file": "idle/Flexing.fbx",
+          "emotion": "proud",
+          "loop": true,
+          "description": "秀肌肉待机"
         }
       ]
     },
@@ -112,6 +126,48 @@
           "emotion": "angry",
           "loop": true,
           "description": "抱臂"
+        },
+        {
+          "name": "salute",
+          "file": "gesture/Salute.fbx",
+          "emotion": "proud",
+          "loop": false,
+          "description": "敬礼"
+        },
+        {
+          "name": "shrug",
+          "file": "gesture/Shrug.fbx",
+          "emotion": "thoughtful",
+          "loop": false,
+          "description": "耸肩无奈"
+        },
+        {
+          "name": "praying",
+          "file": "gesture/Praying.fbx",
+          "emotion": "calm",
+          "loop": false,
+          "description": "祈祷"
+        },
+        {
+          "name": "jazz_hands",
+          "file": "gesture/Jazz_Hands.fbx",
+          "emotion": "excited",
+          "loop": false,
+          "description": "爵士手惊喜"
+        },
+        {
+          "name": "stop_gesture",
+          "file": "gesture/Stop.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "停止手势"
+        },
+        {
+          "name": "phone_call",
+          "file": "gesture/Phone_Call.fbx",
+          "emotion": "neutral",
+          "loop": false,
+          "description": "打电话"
         }
       ]
     },
@@ -188,6 +244,34 @@
           "emotion": "love",
           "loop": false,
           "description": "飞吻"
+        },
+        {
+          "name": "happy_jump",
+          "file": "emotion/Happy_Jump.fbx",
+          "emotion": "happy",
+          "loop": false,
+          "description": "开心蹦跳"
+        },
+        {
+          "name": "dizzy",
+          "file": "emotion/Dizzy.fbx",
+          "emotion": "tired",
+          "loop": false,
+          "description": "头晕目眩"
+        },
+        {
+          "name": "scared",
+          "file": "emotion/Scared.fbx",
+          "emotion": "surprised",
+          "loop": false,
+          "description": "害怕发抖"
+        },
+        {
+          "name": "excited_jump",
+          "file": "emotion/Excited_Jump.fbx",
+          "emotion": "excited",
+          "loop": false,
+          "description": "兴奋跳跃"
         }
       ]
     },
@@ -243,6 +327,34 @@
           "emotion": "neutral",
           "loop": false,
           "description": "向右转"
+        },
+        {
+          "name": "walk_aggressive",
+          "file": "walk/Walking_Aggressive.fbx",
+          "emotion": "angry",
+          "loop": true,
+          "description": "霸气走路"
+        },
+        {
+          "name": "walk_cool",
+          "file": "walk/Walking_Cool.fbx",
+          "emotion": "cool",
+          "loop": true,
+          "description": "酷拽走路"
+        },
+        {
+          "name": "jump",
+          "file": "walk/Jump.fbx",
+          "emotion": "excited",
+          "loop": false,
+          "description": "跳跃"
+        },
+        {
+          "name": "sneak",
+          "file": "walk/Sneaking.fbx",
+          "emotion": "thoughtful",
+          "loop": true,
+          "description": "潜行"
         }
       ]
     },
@@ -306,7 +418,6 @@
           "loop": true,
           "description": "萨尔萨舞"
         },
-        
         {
           "name": "dance_gangnam",
           "file": "dance/Gangnam_Style.fbx",
@@ -328,13 +439,40 @@
           "loop": true,
           "description": "太空步"
         },
-        
         {
           "name": "dance_belly",
           "file": "dance/Belly_Dancing.fbx",
           "emotion": "playful",
           "loop": true,
           "description": "肚皮舞"
+        },
+        {
+          "name": "dance_twerk",
+          "file": "dance/Twerk.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "电臀舞"
+        },
+        {
+          "name": "dance_tango",
+          "file": "dance/Tango.fbx",
+          "emotion": "passionate",
+          "loop": true,
+          "description": "探戈"
+        },
+        {
+          "name": "dance_waltz",
+          "file": "dance/Waltz.fbx",
+          "emotion": "elegant",
+          "loop": true,
+          "description": "华尔兹"
+        },
+        {
+          "name": "dance_floss",
+          "file": "dance/Floss.fbx",
+          "emotion": "playful",
+          "loop": true,
+          "description": "Floss 舞"
         }
       ]
     },
@@ -383,91 +521,143 @@
           "emotion": "tired",
           "loop": true,
           "description": "躺下"
+        },
+        {
+          "name": "pose_hero",
+          "file": "pose/Hero_Pose.fbx",
+          "emotion": "proud",
+          "loop": true,
+          "description": "英雄姿势"
+        },
+        {
+          "name": "pose_victory",
+          "file": "pose/Victory_Pose.fbx",
+          "emotion": "excited",
+          "loop": true,
+          "description": "胜利姿势"
+        },
+        {
+          "name": "pose_meditate",
+          "file": "pose/Meditation.fbx",
+          "emotion": "calm",
+          "loop": true,
+          "description": "冥想打坐"
         }
       ]
     }
   },
   "emotionMap": {
     "happy": [
-      "idle_happy",
       "laugh",
+      "happy_jump",
       "dance_twist",
-      "walk_happy",
+      "wave",
       "yes_gesture",
-      "wave"
+      "walk_happy",
+      "idle_happy"
     ],
     "excited": [
       "victory_cheer",
+      "excited_jump",
+      "jump",
+      "jazz_hands",
+      "pose_victory",
       "clap",
-      "run",
       "dance_hiphop",
       "dance_breakdance",
-      "dance_salsa"
+      "dance_salsa",
+      "run"
     ],
     "sad": [
-      "idle_sad",
       "cry",
       "kneel",
+      "no_gesture",
       "walk_sad",
-      "no_gesture"
+      "idle_sad"
     ],
     "angry": [
-      "idle_angry",
-      "arms_crossed"
+      "arms_crossed",
+      "walk_aggressive",
+      "idle_angry"
     ],
     "surprised": [
-      "surprise_react"
+      "surprise_react",
+      "scared",
+      "point"
     ],
     "shy": [
-      "idle_shy",
+      "shy_back",
       "pose_shy",
-      "shy_back"
+      "idle_shy"
     ],
     "thoughtful": [
-      "scratch_head"
+      "scratch_head",
+      "shrug",
+      "idle_think",
+      "sneak",
+      "arms_crossed"
     ],
     "tired": [
       "sigh_deep",
       "yawn",
+      "dizzy",
       "lie_down"
     ],
     "calm": [
+      "praying",
+      "pose_meditate",
       "sit_chair",
       "sit_floor"
     ],
     "proud": [
+      "salute",
+      "thumbs_up",
+      "pose_hero",
       "pose_cool",
-      "thumbs_up"
+      "idle_flex"
     ],
     "playful": [
+      "taunt",
       "dance_silly",
       "dance_macarena",
       "dance_chicken",
-      "taunt",
-      "come_here",
       "dance_gangnam",
-      "dance_belly"
+      "dance_belly",
+      "dance_twerk",
+      "dance_floss",
+      "come_here"
     ],
     "love": [
-      "blow_kiss"
+      "blow_kiss",
+      "come_here"
     ],
     "neutral": [
+      "bow_respect",
+      "point",
+      "stop_gesture",
+      "phone_call",
       "idle_normal",
       "walk_normal",
-      "point",
-      "bow_respect",
       "walk_backwards",
       "turn_left",
       "turn_right"
     ],
     "elegant": [
-      "dance_ballet"
+      "dance_ballet",
+      "dance_waltz",
+      "bow_respect"
     ],
     "passionate": [
+      "dance_hiphop",
+      "dance_tango",
+      "wave",
+      "victory_cheer",
+      "come_here"
     ],
     "cool": [
       "dance_robot",
-      "dance_moonwalk"
+      "dance_moonwalk",
+      "walk_cool"
     ]
   }
 }

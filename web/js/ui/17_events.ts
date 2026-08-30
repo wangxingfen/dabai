@@ -109,8 +109,13 @@ export default (function init(App: AppKernel) {
         const target = (App.voiceMode === 'auto' || App.voiceMode === 'wake') ? 'press' : 'auto';
         App.setVoiceMode(target);
       });
-      // 同步初始状态
-      if (App.voiceMode === 'auto') voiceModeBtn.classList.add('active');
+      // 同步初始状态：首次点击后统一切入唤醒待机（见下方 once 监听），
+      // 因此初始一律高亮「唤醒待机」；仅用户明确选过按住说话时不高亮任何按钮
+      const savedMode = localStorage.getItem('dabai.voiceMode');
+      if (savedMode !== 'press') {
+        const wakeBtn0 = App.$('wake-mode-btn');
+        if (wakeBtn0) wakeBtn0.classList.add('active');
+      }
     }
 
     // 唤醒词待机按钮：开启后说唤醒词（如「大白」）才进入对话，防误触
@@ -340,7 +345,11 @@ export default (function init(App: AppKernel) {
       setTimeout(App.onResize, 350);
     });
 
-    // 聊天框初始化保持默认收缩，用户点击切换按钮时展开
+    // 聊天框初始收起隐藏（index.html 初始带 collapsed），切换按钮归位；
+    // 点按钮展开到 38% 时按钮才上移（shifted），避免遮挡输入框
+    if (!document.getElementById('chat-panel')!.classList.contains('collapsed')) {
+      App.chatToggle!.classList.add('shifted');
+    }
 
     // 拖拽导入到舞台
     let dragCounter = 0;

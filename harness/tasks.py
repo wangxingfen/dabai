@@ -226,7 +226,7 @@ class Task:
         if not brief:
             d["error"] = self.error
             d["result"] = _shrink(self.result, deep=4)
-            d["action"] = _shrink(self.action, deep=2)
+            d["action"] = _shrink(self.action, deep=3)
         return d
 
 
@@ -1455,6 +1455,10 @@ class TaskSystem:
         cap = int(self._cfg["template_result_max"])
 
         def sub(text: str) -> str:
+            global TEMPLATE_RE
+            if TEMPLATE_RE is None:
+                import re
+                TEMPLATE_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-\u4e00-\u9fff]+)\.result\s*\}\}")
             def repl(m):
                 sid = m.group(1)
                 if sid not in states:
@@ -1583,6 +1587,20 @@ class TaskSystem:
                 self._tasks.pop(tid, None)
 
     # ==================== 控制与查询 ====================
+
+    def clear_finished(self) -> int:
+        """批量清除所有终态任务（succeeded/failed/cancelled），返回清除数量。
+
+        同时清理内存与持久化日志（harness_tasks.json），避免任务中心
+        「清除已完成」后轮询刷新又恢复。
+        """
+        finished = [tid for tid, t in self._tasks.items()
+                    if t.state in TERMINAL]
+        for tid in finished:
+            self._tasks.pop(tid, None)
+        if finished:
+            self._save_journal()
+        return len(finished)
 
     def cancel(self, task_id: str) -> bool:
         t = self._tasks.get(str(task_id))

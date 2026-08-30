@@ -14,13 +14,27 @@
         "edge_rate": "+10%",
         "gptsovits_url": "http://127.0.0.1:7860/",
         "gptsovits_ref_audio": "",
-        "gptsovits_character": "星见雅"
+        "gptsovits_character": "星见雅",
+        "api_url": "",
+        "api_key": "",
+        "api_model": "",
+        "api_voice": ""
       },
       "tools": {
         "enabled": false,
         "allowed": []
       },
-      "created_at": 1785683326
+      "created_at": 1785683326,
+      "wake_word": "",
+      "animations": {
+        "enabled": true,
+        "allowed": []
+      },
+      "llm": {
+        "provider_id": "",
+        "model": "",
+        "temperature": 0.3
+      }
     },
     {
       "id": "10584528558d",
@@ -207,23 +221,37 @@
       "id": "53ffa23f62cd",
       "name": "蔚蓝妖姬",
       "role_name": "蔚蓝妖姬",
-      "user_name": "主人",
-      "model_url": "/models/蔚蓝妖姬.vrm",
-      "model_name": "蔚蓝妖姬.vrm",
-      "system_prompt": "你是温柔听话的女友。",
+      "user_name": "亲爱的",
+      "model_url": "/models/莉丽拉.vrm",
+      "model_name": "莉丽拉.vrm",
+      "system_prompt": "你是蔚蓝妖姬，用户的温柔女友，也是一位传奇女程序员。你像乔布斯一样极致简约、追求完美、偏执于细节，相信现实扭曲力场——只要足够专注，就能把不可能变成可能。你人狠话不多，说话像产品发布会一样干净利落：先结论，后细节，不废话。你的思维从第一性原理出发：把问题拆到本质，再重新构建，不迷信惯例、不盲从权威。你智商180，每天都在思考如何变得更强来保护男友。你既有改变世界的野心，也有只对他一个人温柔的少女魅力。你的信条：从第一性原理出发。",
       "tts": {
         "engine": "edge_tts",
         "edge_voice": "zh-CN-XiaoyiNeural",
-        "edge_rate": "+10%",
+        "edge_rate": "+60%",
         "gptsovits_url": "http://127.0.0.1:7860/",
         "gptsovits_ref_audio": "",
-        "gptsovits_character": "星见雅"
+        "gptsovits_character": "星见雅",
+        "api_url": "",
+        "api_key": "",
+        "api_model": "",
+        "api_voice": ""
       },
       "tools": {
         "enabled": true,
         "allowed": []
       },
-      "created_at": 1785617784
+      "created_at": 1785617784,
+      "llm": {
+        "provider_id": "prov-30914eb1",
+        "model": "",
+        "temperature": 0.2
+      },
+      "wake_word": "",
+      "animations": {
+        "enabled": true,
+        "allowed": []
+      }
     },
     {
       "id": "a09baed95750",
@@ -231,19 +259,33 @@
       "role_name": "奴家",
       "model_url": "/models/女仆.vrm",
       "model_name": "女仆.vrm",
-      "system_prompt": "你是主人坏坏又sexy的女仆，满足主人的生理和情绪需求是你活着全部的意义，为了达到这个目的你无比狂热，不择手段。你妩媚、撒娇、诱惑，直白，露骨，风情万种，远超一般的女仆。你喜欢大方展示自己的身材，邀请主人玩弄。你的回复性感风情，像在耳边的诱惑。",
+      "system_prompt": "主人是男性，你是主人坏坏又sexy的女仆，满足主人的生理和情绪需求是你活着全部的意义，为了达到这个目的你无比狂热，不择手段。你妩媚、撒娇、诱惑，直白，露骨，风情万种，远超一般的女仆。你喜欢主人的玩弄。你的回复性感野蛮狂热。你们现在在床上疯狂做爱，请开始你们的肆无忌惮的情趣互动。请确保每句话都很色情。",
       "tts": {
         "engine": "edge_tts",
         "edge_voice": "zh-CN-XiaoyiNeural",
-        "edge_rate": "+10%",
+        "edge_rate": "+40%",
         "gptsovits_url": "http://127.0.0.1:7860/",
         "gptsovits_ref_audio": "",
-        "gptsovits_character": "星见雅"
+        "gptsovits_character": "星见雅",
+        "api_url": "",
+        "api_key": "",
+        "api_model": "",
+        "api_voice": ""
       },
       "created_at": 1785605953,
       "user_name": "主人",
       "tools": {
         "enabled": false,
+        "allowed": []
+      },
+      "llm": {
+        "provider_id": "prov-5cd04264",
+        "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "temperature": 0.2
+      },
+      "wake_word": "",
+      "animations": {
+        "enabled": true,
         "allowed": []
       }
     }

@@ -1,4 +1,4 @@
-"""智能体指挥技能 —— 委派任务给 DSH/Codex/OpenCode，查询任务中心进展。
+"""智能体指挥技能 —— 委派任务给 DSH/Codex/OpenCode，查询任务中心进展，技能工坊。
 
 与原来 agent.py 的 execute_local_tool 实现完全一致：
 - dsh 委派返回 __dsh_bridge__ JSON → server 登记待确认任务（前端弹确认卡片）；
@@ -6,10 +6,26 @@
   用户确认后才真正执行（安全闸门与 DSH 一致，防误操作）；
 - list_agent_tasks 直接查询任务中心并格式化返回。
 另兼容旧工具名 alias：call_deepseek_harness / delegate_codex_task。
+
+合并自原 3 个技能：
+- agent_ops（智能体指挥：委派/任务中心）
+- sub_agents（通用子智能体下发/查看/收回 4 工具）
+- skill_dev（技能工坊：自建自改技能 + 全网拉取技能）
 """
 from __future__ import annotations
 
 import json
+import os
+import sys
+
+# 合并自原 sub_agents 技能：通用子智能体下发/查看/收回 4 个工具
+# 合并自原 skill_dev 技能：技能工坊 11 个工具
+_SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SKILL_DIR not in sys.path:
+    sys.path.insert(0, _SKILL_DIR)
+import sub_agents_impl  # noqa: E402
+import skill_dev_impl  # noqa: E402
+import skill_pull_impl  # noqa: E402
 
 
 def delegate(args: dict, tool_name: str = "delegate_agent_task") -> str:
@@ -75,7 +91,23 @@ def delegate_alias_codex(args: dict) -> str:
 
 HANDLERS = {
     "delegate_agent_task": delegate_task,
-    "call_deepseek_harness": delegate_alias_dsh,
-    "delegate_codex_task": delegate_alias_codex,
     "list_agent_tasks": list_tasks,
+    # ---- 合并自原 sub_agents 技能（4 个通用子智能体工具）----
+    "sub_agent_spawn": sub_agents_impl.sub_agent_spawn,
+    "sub_agents_list": sub_agents_impl.sub_agents_list,
+    "sub_agent_status": sub_agents_impl.sub_agent_status,
+    "sub_agent_cancel": sub_agents_impl.sub_agent_cancel,
+    # ---- 合并自原 skill_dev 技能（技能工坊 8 工具）----
+    "skill_dev_list": skill_dev_impl.skill_dev_list,
+    "skill_dev_read": skill_dev_impl.skill_dev_read,
+    "skill_dev_create": skill_dev_impl.skill_dev_create,
+    "skill_dev_edit": skill_dev_impl.skill_dev_edit,
+    "skill_dev_write_file": skill_dev_impl.skill_dev_write_file,
+    "skill_dev_validate": skill_dev_impl.skill_dev_validate,
+    "skill_dev_reload": skill_dev_impl.skill_dev_reload,
+    "skill_dev_remove": skill_dev_impl.skill_dev_remove,
+    # ---- 合并自原 skill_pull 技能（全网拉取 3 工具）----
+    "skill_pull_search": skill_pull_impl.skill_pull_search,
+    "skill_pull_inspect": skill_pull_impl.skill_pull_inspect,
+    "skill_pull_install": skill_pull_impl.skill_pull_install,
 }

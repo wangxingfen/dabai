@@ -83,11 +83,16 @@ export default (function init(App: AppKernel) {
     // 服务端可能在 LLM 结束后一次性推完所有分片（TTS 批量完成），
     // 若在分片到达时就拼接，气泡会瞬间显示整段回复，视觉上"不跟随语音"。
     if (chunk.text) {
-      App.currentReplyText += chunk.text;
-      // 回合气泡：只写 .turn-text（思考/工具段不被 textContent 清掉）；普通气泡整条写
-      if (App.pendingAIMsgEl) {
-        if (App.setTurnStreamText) App.setTurnStreamText(App.currentReplyText);
-        else App.pendingAIMsgEl.textContent = App.currentReplyText;
+      // 即时文本流（stream_text）已接管主消息区：audio_chunk 的文本只驱动
+      // 跟随语音的浮动气泡；旧服务端（无 stream_text）仍由音频逐句揭示文字
+      // 思考语音（thinking）只播放/显示气泡，绝不拼进主回复文本
+      if (!App._streamTextOn && !chunk.thinking) {
+        App.currentReplyText += chunk.text;
+        // 回合气泡：只写 .turn-text（思考/工具段不被 textContent 清掉）；普通气泡整条写
+        if (App.pendingAIMsgEl) {
+          if (App.setTurnStreamText) App.setTurnStreamText(chunk.text);
+          else App.pendingAIMsgEl.textContent = App.currentReplyText;
+        }
       }
       // 气泡与语音一一对应：只显示本句正在说的分句文本（chunk.text），不累积整段回复；
       // 换句播放时气泡文本整体刷新，聊天区消息仍按整段累积（App.currentReplyText）
@@ -106,7 +111,9 @@ export default (function init(App: AppKernel) {
     }
     App.ensureAudioCtx();
     App.setState(App.State.SPEAKING);
-    App.showSubtitle(App.currentReplyText);
+    // 字幕跟随语音当前句；旧服务端无即时文本流时仍显示累积文本
+    if (chunk.thinking) App.showSubtitle(chunk.text || '');
+    else App.showSubtitle(App._streamTextOn && chunk.text ? chunk.text : App.currentReplyText);
 
     // 释放上一个 Audio + MediaElementSource + 销毁旧的 blob URL
     if (App.currentAudio) {
@@ -168,6 +175,54 @@ export default (function init(App: AppKernel) {
       App.playNextAudio();
     });
   };
+  /** 创建/复用回复占位消息（回合气泡优先，否则普通气泡） */
+  function ensurePendingMsg() {
+    if (App.pendingAIMsgEl) return App.pendingAIMsgEl;
+    const turnB = App._turnMsgEl;
+    if (turnB && document.body.contains(turnB)) {
+      App.pendingAIMsgEl = turnB;
+      App.pendingAIMsgEl.classList.add('streaming');
+    } else {
+      App.pendingAIMsgEl = document.createElement('div');
+      App.pendingAIMsgEl.className = 'msg ai streaming';
+      App.messagesEl!.appendChild(App.pendingAIMsgEl);
+      if (App.bumpNewMsg) App.bumpNewMsg(App.pendingAIMsgEl); // 用户在翻历史：登记未读但不打扰
+      App.scrollToBottom();
+    }
+    return App.pendingAIMsgEl;
+  }
+  /* 即时文本流：回复正文到达立即显示，不等语音（服务端 stream_text） */
+  App.handleStreamText = function handleStreamText(text: string) {
+    if (!text) return;
+    // 正文开始流式 = 思考结束：收掉「思考中」实时指示行
+    if (App.clearReasoningLine) App.clearReasoningLine();
+    App._streamTextOn = true;
+    App.removeTyping();
+    App.setState(App.State.SPEAKING);
+    ensurePendingMsg();
+    App.currentReplyText += text;
+    if (App.pendingAIMsgEl) {
+      // 增量文本流式写入当前正文段（Markdown + 媒体内联渲染）
+      const container = App.turnTextContainer ? App.turnTextContainer() : App.pendingAIMsgEl;
+      if (App.setTurnStreamText) App.setTurnStreamText(text);
+      else if (container && App.mdToHtml) container.innerHTML = App.mdToHtml(App.currentReplyText);
+      else if (container) container.textContent = App.currentReplyText;
+    }
+    App.scrollToBottom();
+  };
+  /* 工具轮过程话撤回：把刚实时流出的文字从主回复移出（服务端已转成 thinking_text） */
+  App.handleRetractText = function handleRetractText(length: number) {
+    if (!length || !App.currentReplyText) return;
+    App.currentReplyText = App.currentReplyText.slice(
+      0, Math.max(0, App.currentReplyText.length - length));
+    const container = App.turnTextContainer ? App.turnTextContainer() : App.pendingAIMsgEl;
+    if (container) {
+      // 旧服务端兼容路径：正文段直接覆写剩余文本
+      container.textContent = App.currentReplyText;
+      if (container.dataset) container.dataset.raw = App.currentReplyText;
+    }
+    App.scrollToBottom();
+  };
   /* 流式音频分片到达 */
   App.handleAudioChunk = function handleAudioChunk(msg: AudioChunkMessage) {
     // 过滤过期 session 的消息
@@ -188,30 +243,19 @@ export default (function init(App: AppKernel) {
     App.setState(App.State.SPEAKING);
     // 首句到达时创建/复用占位消息：已有回合气泡（思考/工具内联）则直接
     // 在其 .turn-text 上继续，保持「思考 → 工具 → 回复」同一条气泡；否则新建普通气泡
-    if (!App.pendingAIMsgEl) {
-      const turnB = App._turnMsgEl;
-      if (turnB && document.body.contains(turnB)) {
-        App.pendingAIMsgEl = turnB;
-        App.pendingAIMsgEl.classList.add('streaming');
-      } else {
-        App.pendingAIMsgEl = document.createElement('div');
-        App.pendingAIMsgEl.className = 'msg ai streaming';
-        App.messagesEl!.appendChild(App.pendingAIMsgEl);
-        if (App.bumpNewMsg) App.bumpNewMsg(App.pendingAIMsgEl); // 用户在翻历史：登记未读但不打扰
-        App.scrollToBottom();
-      }
-    }
+    ensurePendingMsg();
     App.audioQueue.push({
       seq: msg.seq!,
       text: msg.text,
       audio_b64: msg.audio_b64,
-      audio_mime: msg.audio_mime
+      audio_mime: msg.audio_mime,
+      thinking: !!msg.thinking
     });
     App.currentReplySeg = msg.text || ''; // 流式分句（嘴型用）；气泡/字幕文本在播放时揭示
     App.scrollToBottom();
 
     // 情绪驱动：从累积回复文本检测情绪，每轮回复只触发一次
-    if (App.detectReplyEmotion && App.onReplyEmotion && !App._replyEmotionDone) {
+    if (!msg.thinking && App.detectReplyEmotion && App.onReplyEmotion && !App._replyEmotionDone) {
       const e = App.detectReplyEmotion((App.currentReplyText || '') + (msg.text || ''));
       if (e) {
         App.onReplyEmotion(e);
@@ -227,6 +271,9 @@ export default (function init(App: AppKernel) {
     if (App.currentReplySession && msg.session_id && msg.session_id !== App.currentReplySession) return;
     if (App._interruptedSession && msg.session_id === App._interruptedSession) return;
     console.log('[TTS] audio_end, full_text=', JSON.stringify((msg.full_text || '').slice(0, 40)));
+    // 收尾兜底：无论正文是否流式过，回复结束都清掉思考指示
+    if (App.clearReasoningLine) App.clearReasoningLine();
+    App._toolRunningSince = 0;
     // 完整文本先暂存：等语音队列全部播完（哨兵）再应用，
     // 避免音频还在逐句播放时全文提前刷出（字幕要跟随语音进度）
     if (msg.full_text && msg.full_text.trim()) {
@@ -250,6 +297,9 @@ export default (function init(App: AppKernel) {
   };
   /* 被打断 */
   App.handleInterrupted = function handleInterrupted() {
+    if (App.clearReasoningLine) App.clearReasoningLine();
+    if (App.clearStuckHint) App.clearStuckHint();
+    App._toolRunningSince = 0;
     App.clearAudioQueue();
     // 服务端确认取消后，该 session 不会再发分片，栅栏可解除
     App._interruptedSession = null;
@@ -310,6 +360,11 @@ export default (function init(App: AppKernel) {
     App.currentReplySeg = '';
     App.currentReplySession = null;
     App._pendingFullText = null;
+    // 立即复位状态徽章：不等服务端确认也要从「说话中」恢复，
+    // 避免打断后一直卡在说话中（服务端 interrupted 回执到达时再兜底一次）
+    if (App.vadState !== 'recording' && !App.isRecording) {
+      App.setState(App.State.IDLE);
+    }
     if (App.ws && App.ws.readyState === WebSocket.OPEN) {
       App.ws.send(JSON.stringify({
         type: 'interrupt'

@@ -104,6 +104,17 @@ class Reviewer:
         logs = self.logger.load_after(cursor)
         reviewed: list[dict] = [e for e in logs
                                 if e.get("outcome") in ("fail", "partial") or e.get("blockers")]
+        # 效率闭环：把「碎步低效」的成功任务合成卡点纳入复盘，
+        # 自动沉淀「批量执行」策略（见 efficiency.record_tool_task 埋点）
+        for e in logs:
+            meta = e.get("meta") or {}
+            if not meta.get("low_batch"):
+                continue
+            if e.get("outcome") in ("fail", "partial") or e.get("blockers"):
+                continue
+            clone = dict(e)
+            clone["blockers"] = [self._low_efficiency_blocker(meta)]
+            reviewed.append(clone)
         # ---- 1. 提取卡点并聚类 ----
         clusters: dict[tuple, dict] = {}   # (scene, symptom_fp) -> {scene, symptom, cause, log_ids, count}
         for entry in reviewed:
@@ -159,6 +170,22 @@ class Reviewer:
                 "strategies_added": added}
 
     # ---------- 规则模板 ----------
+    @staticmethod
+    def _low_efficiency_blocker(meta: dict) -> dict:
+        """把效率埋点指标翻译成一条「卡点」，供聚类后自动沉淀批量执行策略。"""
+        try:
+            rounds = int(meta.get("tool_rounds") or 0)
+            total = int(meta.get("tool_calls_total") or 0)
+            avg = (total / rounds) if rounds else 0.0
+        except (TypeError, ValueError):
+            rounds, total, avg = 0, 0, 0.0
+        return {
+            "stage": "执行",
+            "symptom": (f"任务执行过碎：{rounds} 轮只完成 {total} 次工具调用，"
+                        f"平均每轮 {avg:.1f} 个（目标 3~8 个/轮），轮数拖长"),
+            "cause": "模型单轮只发少量工具调用，反复探测/重读路径，轮数被白白拖长",
+        }
+
     def _build_strategy(self, c: dict) -> tuple[str, str, list]:
         """由卡点聚类生成 (标题, 规则文本, 触发关键词)。"""
         scene, symptom, cause, n = c["scene"], c["symptom"], c["cause"], c["count"]

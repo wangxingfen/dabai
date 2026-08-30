@@ -113,8 +113,78 @@ SKILL_HELP_TOOL = {
 # 渐进披露模式下注入 system prompt 的引导语
 PROGRESSIVE_HINT = (
     "【渐进式技能说明】部分技能采用按需加载：摘要已在上面列出。当你想使用某技能的工具时，"
-    "先调用 skill_help(\"技能名\") 读取它的完整使用说明，再执行对应工具；不要猜测参数。"
+    "先调用 skill_help(\"技能名\") 读取它的完整使用说明——读完该技能的工具会立即加载为"
+    "可调用，之后就可以直接执行对应工具；不要猜测参数。"
 )
+
+
+class EventBus:
+    """轻量事件总线：订阅/广播解耦（借鉴 crewAI event_bus 的同步/异步分流）。
+
+    - subscribe(event_type, handler) 注册监听；event_type 支持 '*' 通配；
+    - emit(event_type, payload) 广播：同步 handler 直接调用，异步 handler
+      用 asyncio.create_task 调度，绝不阻塞主流程；
+    - 单个 handler 抛异常只记日志，不影响其它 handler 与主流程
+      （与 harness「监督层永不成为故障源」原则一致）。
+    """
+
+    def __init__(self):
+        import threading
+        self._handlers: dict[str, list] = {}   # event_type -> [(sub_id, handler)]
+        self._wildcards: list = []             # '*' 通配订阅 [(sub_id, handler)]
+        self._seq = 0
+        self._emit_count = 0
+        self._lock = threading.Lock()
+
+    def subscribe(self, event_type: str, handler: Callable) -> str:
+        """订阅事件；返回订阅 ID（unsubscribe 用）。handler 可为同步或异步函数。"""
+        with self._lock:
+            self._seq += 1
+            sub_id = f"sub-{self._seq}"
+            if event_type == "*":
+                self._wildcards.append((sub_id, handler))
+            else:
+                self._handlers.setdefault(event_type, []).append((sub_id, handler))
+            return sub_id
+
+    def unsubscribe(self, sub_id: str) -> bool:
+        """按订阅 ID 退订；成功返回 True。"""
+        with self._lock:
+            for lst in self._handlers.values():
+                for i, (sid, _) in enumerate(lst):
+                    if sid == sub_id:
+                        lst.pop(i)
+                        return True
+            for i, (sid, _) in enumerate(self._wildcards):
+                if sid == sub_id:
+                    self._wildcards.pop(i)
+                    return True
+        return False
+
+    def emit(self, event_type: str, payload: Any = None) -> None:
+        """广播事件。同步 handler 直接执行；异步 handler 丢事件循环后台跑。"""
+        self._emit_count += 1
+        with self._lock:
+            handlers = list(self._handlers.get(event_type, [])) + list(self._wildcards)
+        for sub_id, handler in handlers:
+            try:
+                res = handler(event_type, payload)
+                if asyncio.iscoroutine(res):
+                    try:
+                        asyncio.get_running_loop().create_task(res)
+                    except RuntimeError:
+                        pass  # 无运行中事件循环时静默丢弃（不阻塞）
+            except Exception as e:
+                logger.warning("事件 %s 的订阅者 %s 异常: %s", event_type, sub_id, e)
+
+    def stats(self) -> dict:
+        """事件总线观测：订阅数、累计广播数、已注册事件类型。"""
+        with self._lock:
+            return {
+                "subscribers": sum(len(v) for v in self._handlers.values()) + len(self._wildcards),
+                "events_emitted": self._emit_count,
+                "types": sorted(self._handlers.keys()),
+            }
 
 
 class Harness:
@@ -132,6 +202,7 @@ class Harness:
                                      self._opt_dir("plugins_dir", "plugins"))
         self.started_at = time.time()
         self._events: deque = deque(maxlen=60)   # 最近事件（健康环形缓冲）
+        self.events = EventBus()                 # 事件总线（订阅/广播解耦）
         self._tool_index: dict = {}              # tool_name -> (kind, owner_name)
         self._index_lock = threading.Lock()
         self._server_app = None                  # server.py startup 注入的 FastAPI app
@@ -278,13 +349,26 @@ class Harness:
     def collect_tool_specs(self) -> list:
         """返回全部启用技能/插件的 OpenAI 工具定义（agent 合并进 _all_tools）。
 
+        渐进披露开启时：on_demand 技能的工具不注入（其用法经 skill_help 按需拉取），
+        只返回 full 技能的工具 + 插件工具，大幅削减每轮固定注入的 schema 体积。
         始终附带内置 skill_help 工具（唯一例外：已被某技能/插件占用同名工具时）。"""
         self.ensure_loaded()
-        tools = self.skills.tool_specs() + self.plugins.tool_specs()
+        if self._progressive_enabled():
+            tools = self.skills.tool_specs_progressive() + self.plugins.tool_specs()
+        else:
+            tools = self.skills.tool_specs() + self.plugins.tool_specs()
         names = {(t.get("function") or {}).get("name") for t in tools}
         if "skill_help" not in names:
             tools.append(SKILL_HELP_TOOL)
         return tools
+
+    def skill_tool_specs(self, skill_name: str) -> list:
+        """返回某个技能的全部工具定义（无论披露级别）。
+
+        供 skill_help 按需注册：模型读完说明书后，把该技能的工具动态加入可调用列表，
+        使渐进式披露真正做到「按需启用」，而不是只披露不启用。"""
+        self.ensure_loaded()
+        return self.skills.tool_specs_for(str(skill_name or "").strip())
 
     def collect_prompt_extras(self) -> str:
         """返回全部启用技能/插件注入 system prompt 的片段。

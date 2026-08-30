@@ -80,6 +80,21 @@ export default (function init(App: AppKernel) {
   App.mixamoMixer = null;
   App._mixamoActiveClip = null;
   App._mixamoActiveAction = null; // 当前正在播放的 AnimationAction（供 crossfade/fadeOut）
+  // —— 自然化播放参数（全链路一致,不再散落硬编码常数）——
+  // blend    : 动作间交叠过渡,旧的淡出与新的淡入同时进行,不跳切
+  // tail     : 单次动作演完后,末姿态向骨架静息位"回落"的时长;
+  //            回落结束再把控制权交给程序式微动作——消除"结尾定格 → 被动硬抢切"的机械感
+  // stopFade : 主动 stop 释放的淡出
+  App.ANIM_PLAY_PARAMS = {
+    blend: 0.4,     // 动作间交叠过渡
+    start: 0.28,    // 冷启动淡入（第一个动作不打抖,柔顺起身）
+    tail: 0.55,     // 单次动作自然演完 → 末姿态柔软回落时长
+    stopFade: 0.4   // 主动 stop 释放的淡出
+  };
+  App._mixamoTailActive = false;   // 尾收进行中
+  App._mixamoTailName = null;      // 正在"尾收回落"的动作名（= 单次动作已自然演完但尚未交付控制权）
+  App._mixamoTailRem = 0;          // 尾收回落剩余秒数
+  App._mixamoTailTotal = 0;        // 本次尾收回落总时长（秒, 用来算剩余占比）
 
   // ==================== hips 位移治理：动作一律原位播放 ====================
   // 规则：除非动作明确带速度（行走系统 WALK_SPEED / AI_LOBBY_WALK_SPEED /
@@ -215,10 +230,81 @@ export default (function init(App: AppKernel) {
     }
   };
 
+  /**
+   * 加载离线烘焙的 Mixamo 动作缓存（bake_animations.mjs 产物）
+   * 反序列化 JSON → AnimationClip，跳过 FBX 解析与骨骼重定向（秒开）。
+   * 轨道名存的是 humanoid 名（如 hips.quaternion），加载时映射到
+   * 当前模型 normalized 骨骼的实际节点名（Normalized_<原始骨骼名>）。
+   * 位移轨道按当前模型 hips 高度比缩放（与 retargetAnimation 一致）。
+   */
+  App.loadBakedMixamoClip = async function loadBakedMixamoClip(name: string, bakedUrl: string) {
+    if (!App.vrm || !App.vrm.humanoid) {
+      console.warn('[Mixamo] VRM 未加载，无法加载烘焙动作');
+      return null;
+    }
+    try {
+      const res = await fetch(bakedUrl);
+      if (!res.ok) return null; // 无烘焙缓存 → 调用方回退 FBX
+      const data = await res.json();
+      if (!data.tracks || data.tracks.length === 0) return null;
+
+      // 位移比例缩放：以当前模型 hips 高度为基准
+      const _vec3 = new THREE.Vector3();
+      const vrmHipsY = App.vrm.humanoid.getNormalizedBoneNode('hips')?.getWorldPosition(_vec3).y;
+      const vrmRootY = App.vrm.scene.getWorldPosition(_vec3).y;
+      const vrmHipsHeight = Math.abs(vrmHipsY - vrmRootY);
+      const hipsPositionScale = data.motionHipsHeight ? vrmHipsHeight / data.motionHipsHeight : 1;
+      const vrm0 = App.vrm.meta?.metaVersion === '0';
+
+      const tracks: THREE.KeyframeTrack[] = [];
+      for (const t of data.tracks) {
+        const dot = t.name.indexOf('.');
+        if (dot < 0) continue;
+        const humanoidName = t.name.slice(0, dot);
+        const propertyName = t.name.slice(dot + 1);
+        // humanoid 名 → 当前模型 normalized 骨骼实际节点名
+        const node = App.vrm.humanoid.getNormalizedBoneNode(humanoidName);
+        if (!node) continue;
+        const trackName = `${node.name}.${propertyName}`;
+        if (t.type === 'quaternion') {
+          tracks.push(new THREE.QuaternionKeyframeTrack(trackName, t.times, t.values));
+        } else if (t.type === 'vector') {
+          // 位移缩放 + VRM 0.x x/z 取反（与 retargetAnimation 一致）
+          const values = t.values.map((v: number, i: number) =>
+            (vrm0 && i % 3 !== 1 ? -v : v) * hipsPositionScale
+          );
+          tracks.push(new THREE.VectorKeyframeTrack(trackName, t.times, values));
+        }
+      }
+      if (tracks.length === 0) return null;
+
+      const clip = new THREE.AnimationClip('vrmAnimation', data.duration, tracks);
+      App.mixamoClips[name] = { name, clip };
+      // 预绑定 AnimationAction（与 loadMixamoAnimation 一致，播放零开销）
+      try {
+        if (!App.mixamoMixer) App.mixamoMixer = new THREE.AnimationMixer(App.vrm.scene);
+        App.mixamoMixer.clipAction(clip);
+      } catch (e) { /* 预绑定失败不影响注册 */ }
+      console.log(`[Mixamo] 已注册烘焙动作: ${name} (${clip.duration.toFixed(2)}s, ${clip.tracks.length} 轨道)`);
+      return clip;
+    } catch (e) {
+      console.error('[Mixamo] 烘焙动作加载失败:', name, e);
+      return null;
+    }
+  };
+
   /** 播放已注册的 Mixamo 片段 */
   App.playMixamoClip = function playMixamoClip(name: string, opts?: any) {
     const info = App.mixamoClips[name];
     if (!info || !App.vrm) return;
+    // 中止尾收回落：任何播放行为都可能来自最新指令,一律打断收尾切到新目标
+    if (App._mixamoTailActive) {
+      App._mixamoTailActive = false;
+      App._mixamoTailName = null;
+      App._mixamoTailRem = 0;
+      App._mixamoTailTotal = 0;
+    }
+    const P = App.ANIM_PLAY_PARAMS || { blend: 0.4, start: 0.28, tail: 0.55, stopFade: 0.4 };
     // 动作开局前把 hips 复位到静息位：任何残留位移（滑步/漂移/腾空）到此清零；
     // 动作期间 hips 位移轨道已被丢弃，身体位置完全由行走系统（显式速度）驱动
     App.resetMixamoHips();
@@ -229,15 +315,22 @@ export default (function init(App: AppKernel) {
     action.setLoop(opts && opts.loop === false ? THREE.LoopOnce : THREE.LoopRepeat, 1);
     action.clampWhenFinished = true;
     action.play();
-    // 动作间混合过渡：旧动作 fadeOut、新动作 fadeIn（0.35s），
-    // 避免上一个动作直接硬切到新动作的跳变；fade 结束后清理旧 action
+    // 动作进入：
+    //  - 有前一个动作 → crossfade（blend=0.4s）：老动作淡出与新动作淡入同时进行，
+    //    接缝处姿态交叠，抹掉"上一动作尾声定格一拍 → 硬切新动作"的跳变感
+    //  - 无前一个动作（首动作/尾收完毕后冷启动）→ 短淡入（start=0.28s）：
+    //    从程序式微动作的自然静息帧柔顺转进场，不会凭空蹦到动作首姿态
     if (prevAction && prevAction !== action) {
-      action.crossFadeFrom(prevAction, 0.35);
+      action.crossFadeFrom(prevAction, P.blend, false);
+      const old = prevAction;
+      // 交叠结束后清理旧 action（+0.1s 余量，避免过早停引发权重抖动）
       setTimeout(() => {
-        if (App._mixamoActiveAction !== prevAction && prevAction.isRunning()) {
-          prevAction.stop();
+        if (App._mixamoActiveAction !== old && old.isRunning()) {
+          old.stop();
         }
-      }, 450);
+      }, Math.ceil(P.blend * 1000) + 100);
+    } else {
+      action.fadeIn(P.start);
     }
     App._mixamoActiveAction = action;
     App._mixamoActiveClip = name;
@@ -246,24 +339,31 @@ export default (function init(App: AppKernel) {
     App._mixamoActiveClipLoop = !(opts && opts.loop === false);
     App._mixamoActiveClipStart = performance.now();
     App._mixamoSwitchTimer = null; // 轮换倒计时随新 clip 重置
-    // 单次动作播完自动释放 Mixamo 接管权，让程序式动画恢复（循环动作不会触发 finished）
+    // 单次动作（opts.loop===false）演完（LoopOnce+clampWhenFinished 定格在末帧）
+    // → 不放权、不变态，而是进入“尾收回落”：末姿态权重线性收敛回 0，
+    //   角色从动作定格缓缓回到自然静息帧，再衔回程序微动作——
+    //   无机械等待、无“结束硬丢权/定格冻结”的断点感。
     if (opts && opts.loop === false) {
-      const onFinished = () => {
-        if (App._mixamoActiveClip === name) {
-          App._mixamoActiveClip = null;
-          App._mixamoActiveAction = null;
-          if (App.clearAnimState) App.clearAnimState(); // 单次播完 → 上报无动作
-          App.resetMixamoHips(); // 播完复位 hips 位移，杜绝残留
+      const n = name;
+      const a = action;
+      const tailSec = P.tail;
+      const toTail = () => {
+        if (App._mixamoActiveClip === n && App._mixamoActiveAction === a && !App._mixamoTailActive) {
+          App._mixamoTailActive = true;
+          App._mixamoTailName = n;
+          App._mixamoTailRem = tailSec;
+          App._mixamoTailTotal = tailSec;
         }
-        action.removeEventListener('finished', onFinished);
       };
-      action.addEventListener('finished', onFinished);
+      action.removeEventListener('finished', toTail);
+      action.addEventListener('finished', toTail);
     }
   };
 
-  /** 停止 Mixamo 播放 */
-  App.stopMixamoClip = function stopMixamoClip(fadeMs) {
-    const fade = (fadeMs == null ? 300 : fadeMs); // 默认 0.3s 淡出，不突兀
+  /** 停止 Mixamo 播放（主动释放；统一短淡出，结束姿态自然软着陆，全链路走参数） */
+  App.stopMixamoClip = function stopMixamoClip(fadeMs?) {
+    const P = App.ANIM_PLAY_PARAMS || { blend: 0.4, start: 0.28, tail: 0.55, stopFade: 0.4 };
+    const fade = (fadeMs == null ? P.stopFade * 1000 : fadeMs); // 默认 0.4s 淡出
     const name = App._mixamoActiveClip;
     if (App.mixamoMixer && App._mixamoActiveAction && fade > 0) {
       App._mixamoActiveAction.fadeOut(fade / 1000);
@@ -277,6 +377,11 @@ export default (function init(App: AppKernel) {
         App._mixamoActiveAction = null;
         App._mixamoActiveClipLoop = false;
         App._mixamoActiveClipStart = 0;
+        // 尾收状态一并清零：用户主动 stop 优先级最高，命令即刻交权
+        App._mixamoTailActive = false;
+        App._mixamoTailName = null;
+        App._mixamoTailRem = 0;
+        App._mixamoTailTotal = 0;
         if (App.clearAnimState) App.clearAnimState(); // 上报“当前无库动作”
         App.resetMixamoHips(); // 释放接管权时复位 hips 位移，杜绝残留
       }
@@ -288,8 +393,43 @@ export default (function init(App: AppKernel) {
     }
   };
 
-  /** 渲染循环内调用：推进 Mixamo 动画时间 */
+  /** 渲染循环内调用：
+   *   - 普通播放：正常推进动画时间；
+   *   - 尾收回落：本窗口内逐帧把单次动作末姿态权重收敛回 0（线性软着陆），
+   *     直到静息后才一次性交还控制权，让 07 的程序微动作无缝接手。 */
   App.updateMixamoMixer = function updateMixamoMixer(dt: number) {
-    if (App.mixamoMixer) App.mixamoMixer.update(dt);
+    const m = App.mixamoMixer;
+    if (!m) return;
+
+    // —— 尾收回落窗口 ——
+    if (App._mixamoTailActive) {
+      const rem = Math.max(0, App._mixamoTailRem ?? 0);
+      const total = App._mixamoTailTotal || 1;
+      const act = App._mixamoActiveAction;
+      if (act && act.isRunning()) {
+        const w = total <= 0 ? 0 : rem / total; // 1 → 0 线性收拢
+        act.setEffectiveWeightScale(Math.max(0, Math.min(1, w)));
+        m.update(dt);
+      }
+      App._mixamoTailRem = rem - dt;
+      // 静息到达（或该动作已被外部清掉）→ 收尾完毕，交还控制权
+      if (rem - dt <= 0 || !act) {
+        App._mixamoTailActive = false;
+        App._mixamoTailName = null;
+        App._mixamoTailRem = 0;
+        App._mixamoTailTotal = 0;
+        if (App.mixamoMixer) App.mixamoMixer.stopAllAction();
+        App._mixamoActiveClip = null;
+        App._mixamoActiveAction = null;
+        App._mixamoActiveClipLoop = false;
+        App._mixamoActiveClipStart = 0;
+        if (App.clearAnimState) App.clearAnimState();
+        App.resetMixamoHips();
+      }
+      return; // 收尾窗口由这里独立管理：外部不做释放插入，保证软着陆完整
+    }
+
+    // —— 普通播放 ——
+    m.update(dt);
   };
 });

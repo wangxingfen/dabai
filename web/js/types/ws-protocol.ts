@@ -123,8 +123,13 @@ export type ServerMessage =
   | { type: 'ready' }
   | { type: 'pong' }
   | { type: 'user_set'; user_id?: string; history?: ChatHistoryItem[] }
-  | { type: 'thinking'; session_id?: string | null; text?: string }
+  | { type: 'thinking'; session_id?: string | null; text?: string; resume?: boolean }
+  | { type: 'thinking_text'; session_id?: string; text?: string }
+  | { type: 'reasoning'; session_id?: string; text?: string }
+  | { type: 'stream_text'; session_id?: string; text?: string }
+  | { type: 'retract_text'; session_id?: string; length?: number }
   | { type: 'listening' }
+  | { type: 'system_msg'; text?: string }
   | { type: 'transcript'; text?: string }
   | AudioChunkMessage
   | UsageMessage

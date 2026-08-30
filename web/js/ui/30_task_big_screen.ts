@@ -1,5 +1,13 @@
 import type { AppKernel } from '../types/app-kernel.js';
 
+// html2canvas 由 vendor 本地脚本动态注入（同源），补全局类型声明
+declare global {
+  interface Window {
+    html2canvas?: (el: HTMLElement, opts?: Record<string, unknown>) => Promise<HTMLCanvasElement>;
+  }
+  const html2canvas: ((el: HTMLElement, opts?: Record<string, unknown>) => Promise<HTMLCanvasElement>) | undefined;
+}
+
 export default (function init(App: AppKernel) {
   /* ============================================================
    *  任务直播大屏（自适应）—— 把任务中心进度实时投到大白角色身后
@@ -100,11 +108,93 @@ export default (function init(App: AppKernel) {
     // VR 世界锚定注册：_xrCaptureWorld 收集世界对象时带上大屏，
     // 使其随世界整体平移/旋转（VR 玩家移动 = 世界反向位移 → 大屏世界位置不变）
     App._vrScreenWorldObjs = [board, frame];
+// ============================================================
+    //  网页取帧模式（bigscreen.html）：大屏内容改为真正的网页绘制
+    //  - 隐藏 iframe 指向 /bigscreen.html（同源，浏览器直接打开即预览）
+    //  - 每帧用 html2canvas 把 iframe 的 DOM 画面取帧贴到 Billboard 纹理
+    //  - 3D 大屏与网页预览看到完全一致的画面（同源同视觉）
+    //  - 视频直播（大白影院）保持现有直接 drawImage 路径（html2canvas
+    //    不支持 video 元素，这是已知边界，影院画面仍走 Canvas 手绘）
+    // ============================================================
+    setupWebFrame();
 
     ready = true;
     applyDisplaySize();
     requestTasks();
-    console.log('[TaskBoard] 任务直播大屏已挂载（角色身后，尺寸自适应）');
+    console.log('[TaskBoard] 任务直播大屏已挂载（角色身后，尺寸自适应，网页取帧模式）');
+  }
+
+  // 隐藏 iframe + html2canvas 取帧（网页版大屏）
+  let webFrame = null;        // HTMLIFrameElement
+  let webFrameReady = false;  // iframe 加载完成
+  let webFrameCanvas = null;  // 取帧用的离屏 canvas（html2canvas 输出）
+  let webFrameCtx = null;
+  let webFrameLast = 0;       // 上次取帧时间（节流）
+  let webFrameFail = 0;       // 连续取帧失败次数（失败回退手绘）
+
+  function setupWebFrame() {
+    try {
+      // 1) 确保 html2canvas 已加载（vendor 本地文件，同源无跨域问题）
+      if (!window.html2canvas) {
+        const s = document.createElement('script');
+        s.src = '/static/vendor/html2canvas.min.js';
+        s.onload = () => { console.log('[TaskBoard] html2canvas 已加载'); };
+        s.onerror = () => { console.warn('[TaskBoard] html2canvas 加载失败，回退 Canvas 手绘'); };
+        document.head.appendChild(s);
+      }
+      // 2) 隐藏 iframe 指向网页版大屏（同源，直接可预览）
+      webFrame = document.createElement('iframe');
+      webFrame.src = '/static/bigscreen.html';
+      webFrame.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1280px;height:720px;border:0;visibility:hidden;pointer-events:none;';
+      webFrame.onload = () => {
+        webFrameReady = true;
+        console.log('[TaskBoard] 网页大屏 iframe 已加载');
+      };
+      document.body.appendChild(webFrame);
+    } catch (e) {
+      console.warn('[TaskBoard] 网页取帧初始化失败:', e);
+    }
+  }
+
+  // 从 iframe 取帧：html2canvas 渲染 DOM → 画到离屏 canvas → 贴纹理
+  function captureWebFrame(now) {
+    if (!webFrame || !webFrameReady || !webFrame.contentDocument) return false;
+    if (!window.html2canvas) return false;
+    // 节流：动画中 33ms，有媒体 110ms，待机 180ms（与手绘帧率一致）
+    // 有媒体 = 媒体墙有就绪视频/图片 或 全屏焦点是媒体（模块级可访问，避免引用局部变量）
+    const hasMediaNow = (showcase && showcase.kind === 'media') ||
+      mediaItems.some(it => it.ready && !it.dead);
+    // 动画中 = displayH 正在平滑变化（模块级变量，避免引用 updateTaskBigScreen 局部 targetH）
+    const animatingNow = Math.abs(displayH - DRAW_H) > 0.5 && Math.abs(displayH - MIN_CONTENT_H) > 0.5;
+    const frameMs = animatingNow ? 33 : (hasMediaNow ? 110 : 180);
+    if (now - webFrameLast < frameMs) return true; // 节流内：沿用上一帧（不重取）
+    webFrameLast = now;
+    const doc = webFrame.contentDocument;
+    const root = doc.getElementById('stage') || doc.body;
+    if (!root) return false;
+    try {
+      html2canvas(root, {
+        width: 1280, height: 720,
+        scale: 1,
+        backgroundColor: null,
+        useCORS: true,
+        logging: false,
+        windowWidth: 1280, windowHeight: 720
+      }).then(c => {
+        if (!c) return;
+        webFrameCanvas = c;
+        webFrameCtx = c.getContext('2d');
+        webFrameFail = 0;
+        dirty = true; // 取到新帧 → 触发重绘贴纹理
+      }).catch(() => {
+        webFrameFail++;
+        if (webFrameFail > 5) console.warn('[TaskBoard] 网页取帧连续失败，回退手绘');
+      });
+      return true;
+    } catch (e) {
+      webFrameFail++;
+      return false;
+    }
   }
 
   // 按"展示高度"驱动屏幕大小/形状（平滑插值期间每帧调用，纯数值更新）：
@@ -264,8 +354,9 @@ export default (function init(App: AppKernel) {
     let added = false;
     let newest = null;
     for (const raw of urls) {
-      const url = String(raw || '').trim();
+      let url = String(raw || '').trim();
       if (!url || mediaItems.some(it => it.url === url)) continue;
+      if (url.startsWith('/')) url = location.origin + url;
       const kind = /\.(mp4|webm|ogv|mov|m4v)(?:[?#]|$)/i.test(url) ? 'video' : 'img';
       const item = { url, kind, el: null, ready: false, dead: false, w: 1280, h: 720 };
       if (kind === 'video') {
@@ -1845,6 +1936,15 @@ export default (function init(App: AppKernel) {
   function draw(now, vNewFrame) {
     ctx.clearRect(0, 0, DRAW_W, DRAW_H); // 画布固定 720，下部透明区域由纹理裁切隐藏
 
+    // 网页取帧模式：iframe 已就绪且取帧成功 → 直接把网页画面贴纹理
+    // （3D 大屏与浏览器打开的 bigscreen.html 看到完全一致的画面）
+    if (webFrameCanvas && webFrameReady && webFrameFail < 5 && !videoLive) {
+      try {
+        ctx.drawImage(webFrameCanvas, 0, 0, DRAW_W, DRAW_H);
+        return;
+      } catch (e) { /* 取帧画布异常 → 回退手绘 */ }
+    }
+
     if (videoLive) { drawVideoLive(now, !!vNewFrame); return; }   // 大白影院：视频直播全屏
     if (showcase) { drawShowcase(now); return; }  // 全屏焦点：恒 16:9 满幅
 
@@ -2079,6 +2179,10 @@ export default (function init(App: AppKernel) {
       shouldDraw = (newFrame && now - lastDraw >= 33) ||
                    (dirty && !framesRecent) || now - lastDraw > (mobile ? 1000 : 500);
     }
+    // 网页取帧：iframe 就绪时优先从网页版大屏取帧（节流内沿用上一帧）
+    // 取帧成功会置 dirty → 下一轮重绘直接贴网页画面；失败回退手绘
+    if (webFrameReady && !videoLive) captureWebFrame(now);
+
     if (shouldDraw) {
       if (canvas && texture) {
         draw(now, newFrame);

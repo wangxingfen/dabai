@@ -1,0 +1,13 @@
+{
+  "name": "datadog-cli",
+  "title": "datadog-cli",
+  "version": "1.0.0",
+  "description": " datadog Plugin",
+  "author": "softaworks",
+  "enabled": true,
+  "prompt": "【技能 datadog-cli】已就绪：使用说明见本目录 SKILL.md；涉及  datadog Plugin 等需求时，先调用 skill_help('datadog-cli') 读取说明书再执行。",
+  "tools": [],
+  "_pulled_from": "softaworks/agent-toolkit",
+  "_pulled_path": "dist/plugins/datadog-cli/skills/datadog-cli",
+  "disclosure": "on_demand"
+}

@@ -7,7 +7,6 @@ node_modules/
 dist/
 
 # todo_list 插件运行时数据（用户任务数据，勿提交）
-plugins/todo_list/data/
 # harness 任务系统运行时日志（断点续跑状态，勿提交）
 harness_tasks.json
 harness_tasks.json.tmp
@@ -60,3 +59,4 @@ out.txt
 %TEMP%app_ts_probe.txt
 .trae-html-share-packages/
 harness_state.json
+skills/todo/data/  

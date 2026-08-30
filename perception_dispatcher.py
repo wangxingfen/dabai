@@ -154,6 +154,7 @@ class PerceptionDispatcher:
 
     # ── 全局配置 ──
     USER_ENGAGED_WINDOW = 10.0   # 用户互动窗口（秒），用于判断 is_user_engaged
+    USER_ACTIVE_GUARD = 60.0     # 用户活跃窗口（秒）：窗口内大厅自动行为不主动说话
 
     def __init__(self):
         self._history: list[dict] = []  # 最近调度记录（调试用）
@@ -257,6 +258,17 @@ class PerceptionDispatcher:
 
         # ── 2.5 全局闸门抑制说话（BEHAVIOR_FEEDBACK 冷却期仍返回移动指令）──
         if gate_blocked and result.should_speak:
+            result.should_speak = False
+            result.trigger_text = None
+
+        # ── 2.6 用户活跃窗口守卫（大厅自动闲聊抑制）──
+        # 用户 1 分钟内有主动对话/回复 → 大厅环境快照/行为反馈的"自言自语"
+        # 一律只保留行为指令（AI 仍可自主走动），抑制说话，避免"一直废话"。
+        # 游戏事件（game_update/game_state/game_result/召唤）属于外部触发，
+        # 不受此限制（由 _apply_dispatch_result 的 external 判定放行）。
+        if (result.should_speak and result.trigger_text
+                and time.time() - last_user_message_time < self.USER_ACTIVE_GUARD
+                and msg_type in ("environment_snapshot", "ai_behavior_result")):
             result.should_speak = False
             result.trigger_text = None
 

@@ -425,17 +425,7 @@ class GameWorld:
         lines = []
         for obj_type, obj_list in self.objects.items():
             label = self._obj_type_label(obj_type)
-
-            # 统计状态
-            total = len(obj_list)
-            active = 0
-            collected = 0
-            for obj in obj_list:
-                if obj.get("collected") or obj.get("found") or obj.get("completed"):
-                    collected += 1
-                else:
-                    active += 1
-
+            total, active, collected = self._count_object_states(obj_list)
             if total == 0:
                 continue
 
@@ -445,31 +435,56 @@ class GameWorld:
 
             # 谜题对象：直接展示题目与选项，让 AI 智能体看到正在解的题
             if obj_type == "quiz":
-                for obj in obj_list[:1]:
-                    title = obj.get("title", "")
-                    options = obj.get("options") or {}
-                    parts.append(f"（第 {obj.get('index', '?')}/{obj.get('total', '?')} 题，{obj.get('kind', '')}）")
-                    if title:
-                        lines.append(f"  · 题目：{title}")
-                        for k in ("A", "B", "C", "D"):
-                            v = options.get(k)
-                            if v:
-                                lines.append(f"    {k}. {v}")
+                parts_extra, lines_extra = self._summarize_quiz(obj_list)
+                parts.extend(parts_extra)
+                lines.extend(lines_extra)
 
             lines.append("".join(parts))
-
-            # 列出未收集的（最多5个）
-            if active > 0 and active <= 5:
-                uncollected = [obj for obj in obj_list if not (obj.get("collected") or obj.get("found"))]
-                for obj in uncollected:
-                    name = obj.get("id", "")
-                    color = obj.get("color", "")
-                    detail = f"  · {name}"
-                    if color:
-                        detail += f" ({color})"
-                    lines.append(detail)
+            lines.extend(self._list_uncollected(obj_list, active))
 
         return lines
+
+    def _list_uncollected(self, obj_list: list, active: int) -> list:
+        """列出未收集对象（最多5个）。"""
+        if not (0 < active <= 5):
+            return []
+        detail_lines = []
+        for obj in obj_list:
+            if obj.get("collected") or obj.get("found"):
+                continue
+            detail = f"  · {obj.get('id', '')}"
+            if obj.get("color"):
+                detail += f" ({obj.get('color')})"
+            detail_lines.append(detail)
+        return detail_lines
+
+    def _count_object_states(self, obj_list: list) -> tuple:
+        """统计对象状态，返回 (total, active, collected)。"""
+        total = len(obj_list)
+        active = 0
+        collected = 0
+        for obj in obj_list:
+            if obj.get("collected") or obj.get("found") or obj.get("completed"):
+                collected += 1
+            else:
+                active += 1
+        return total, active, collected
+
+    def _summarize_quiz(self, obj_list: list) -> tuple:
+        """谜题对象：返回 (追加到 parts 的片段, 追加到 lines 的题目行)。"""
+        parts_extra = []
+        lines_extra = []
+        for obj in obj_list[:1]:
+            title = obj.get("title", "")
+            options = obj.get("options") or {}
+            parts_extra.append(f"（第 {obj.get('index', '?')}/{obj.get('total', '?')} 题，{obj.get('kind', '')}）")
+            if title:
+                lines_extra.append(f"  · 题目：{title}")
+                for k in ("A", "B", "C", "D"):
+                    v = options.get(k)
+                    if v:
+                        lines_extra.append(f"    {k}. {v}")
+        return parts_extra, lines_extra
 
     def _describe_nearby(self, obj: dict) -> str:
         """描述一个视野内的对象。"""

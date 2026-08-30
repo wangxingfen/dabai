@@ -126,6 +126,20 @@ def _busy_work_running() -> bool:
     return False
 
 
+def _active_turns_running() -> bool:
+    """角色对话轮（含工具调用）是否正在执行。
+
+    大白自己在工具执行中修改核心代码（agent.py/server.py/harness 等）时，
+    不能立刻重启——否则正在跑的工具被掐断、前端闪现『已连接到 AI』、
+    执行链路被打断。这里把重启推迟到本轮对话结束（由断点续跑兜底保底）。
+    """
+    try:
+        from agent import active_turns
+        return active_turns() > 0
+    except Exception:
+        return False
+
+
 def _restart_process(changed_paths: list[Path], reason: str) -> None:
     if not _safe_to_compile(changed_paths):
         return
@@ -181,6 +195,15 @@ def _watch_loop(on_ext_reload: Optional[Callable[[], None]]) -> None:
                     if _busy_work_running() and time.time() < deadline:
                         logger.info(
                             "检测到核心代码变化（%s），但有子智能体执行中，延迟重启…",
+                            ", ".join(sorted(p.name for p in changed_paths)),
+                        )
+                        time.sleep(RESTART_DEFER_INTERVAL)
+                        continue
+                    # AI 自身对话轮（工具执行中改了自己的代码）也不立即重启：
+                    # 等本轮跑完再重启，避免『已连接到 AI』式中断执行链路
+                    if _active_turns_running() and time.time() < deadline:
+                        logger.info(
+                            "检测到核心代码变化（%s），但 AI 对话轮执行中，延迟重启…",
                             ", ".join(sorted(p.name for p in changed_paths)),
                         )
                         time.sleep(RESTART_DEFER_INTERVAL)

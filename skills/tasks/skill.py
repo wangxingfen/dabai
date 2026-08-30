@@ -9,10 +9,45 @@
 - 断点续跑：服务重启自动恢复，已成功步骤不重算；
 - 步骤级超时+重试退避，流程级整体看门狗；失败策略 abort / continue；
 - 同轮多步骤并行、批量并发受控；工具步骤经 harness 稳定路由 + runtime 监督。
+
+合并自原 4 个技能：
+- tasks（harness 任务系统 9 工具）
+- todo（TODO 任务清单 9 工具 + 提醒调度线程）
+- scheduler（定时任务 5 工具）
+- execution_loop（执行力自我迭代：执行日志/复盘/策略库 4 工具）
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import sys
+
+# 合并自原 todo 技能：TODO 任务清单 9 个工具 + 提醒调度线程
+# 合并自原 scheduler 技能：定时任务 5 个工具
+# 合并自原 execution_loop 技能：执行日志/复盘/策略库 4 个工具
+_SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SKILL_DIR not in sys.path:
+    sys.path.insert(0, _SKILL_DIR)
+import todo_impl  # noqa: E402
+import sched_impl  # noqa: E402
+import exec_loop_impl  # noqa: E402
+
+
+def on_load(ctx):
+    """技能加载时启动 todo 提醒调度线程（幂等）。"""
+    try:
+        todo_impl.on_load(ctx)
+    except Exception as e:  # noqa: BLE001
+        print(f'[tasks] todo 提醒调度器启动失败: {e}')
+
+
+def on_unload(ctx):
+    """技能卸载时停止 todo 提醒调度线程。"""
+    try:
+        todo_impl.on_unload(ctx)
+    except Exception as e:  # noqa: BLE001
+        print(f'[tasks] todo 提醒调度器停止失败: {e}')
 
 
 def _ts():
@@ -28,6 +63,68 @@ def _ok(data, extra: str = "") -> str:
 
 def _err(e) -> str:
     return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+
+async def _mirror_to_center(tid: str, title: str, goal: str) -> None:
+    """把 TaskSystem 任务镜像到任务中心（前端任务中心实时可见）。
+
+    创建 orchestrator 镜像任务（channel=sub），后台轮询 TaskSystem 状态，
+    把步骤里程碑/终态同步过去；任务中心打开即拉全量快照。
+    """
+    try:
+        from task_orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        task = await orch.create(
+            kind="flow", title=title or "Flow 流程",
+            ws=None, brief=goal or title or "",
+            channel="sub",
+        )
+    except Exception:
+        return  # 任务中心不可用时静默降级（TaskSystem 本身照常执行）
+
+    async def _poll():
+        ts = _ts()
+        last_steps: set = set()
+        try:
+            while True:
+                st = ts.status(tid)
+                if st is None:
+                    await orch.set_error(task, f"任务 {tid} 不存在")
+                    return
+                state = str(st.get("state") or "pending")
+                res = st.get("result")
+                steps = (res or {}).get("steps") if isinstance(res, dict) else None
+                if isinstance(steps, dict):
+                    for sid, s in steps.items():
+                        if sid in last_steps:
+                            continue
+                        sstate = s.get("state")
+                        if sstate == "succeeded":
+                            last_steps.add(sid)
+                            r = str(s.get("result") or "")[:120]
+                            await orch.add_step(task, f"✅ {sid}: {r}" if r else f"✅ {sid}")
+                        elif sstate == "failed":
+                            last_steps.add(sid)
+                            await orch.add_step(task, f"❌ {sid}: {str(s.get('error') or '')[:120]}")
+                if state in ("succeeded", "failed", "cancelled"):
+                    if state == "succeeded":
+                        final = ""
+                        if isinstance(steps, dict):
+                            done = [str(s.get("result")) for s in steps.values()
+                                    if s.get("state") == "succeeded" and s.get("result")]
+                            if done:
+                                final = done[-1][:2000]
+                        await orch.set_result(task, final or "流程完成", "done")
+                    elif state == "failed":
+                        await orch.set_error(task, str(st.get("error") or "流程失败")[:2000])
+                    else:
+                        await orch.set_status(task, "cancelled")
+                    return
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    asyncio.ensure_future(_poll())
 
 
 async def harness_flow_plan(args: dict) -> str:
@@ -69,12 +166,44 @@ async def harness_flow_submit(args: dict) -> str:
             policy=str(args.get("policy") or "abort"),
             timeout=float(args["timeout"]) if args.get("timeout") else None,
         )
+        asyncio.ensure_future(_mirror_to_center(
+            tid, str(args.get("name") or "未命名流程"),
+            str(args.get("goal") or "")))
         return _ok({"task_id": tid,
-                    "hint": "已后台执行；用 harness_task_status 查进度，不要反复重复提交。"})
+                    "hint": "已后台执行并挂到任务中心；用 harness_task_status 查进度，不要反复重复提交。"})
     except Exception as e:
         return _err(e)
 
 
+async def harness_flow_dsl_submit(args: dict) -> str:
+    """把一段声明式 Flow 类定义（Python 代码）提交给 TaskSystem 后台执行。
+
+    flow_code 里用 @start / @listen 装饰器定义 Flow 子类（可省略 import，
+    已预置 Flow/start/listen），提交后断点续跑/失败反思/LLM 预算全生效。
+    """
+    try:
+        code = str(args.get("flow_code") or "").strip()
+        if not code:
+            return _err("flow_code 不能为空：需要一段定义 Flow 子类的 Python 代码")
+        from harness.flow_dsl import Flow, start, listen
+        ns = {"Flow": Flow, "start": start, "listen": listen}
+        exec(compile(code, "<flow_dsl>", "exec"), ns)
+        flow_cls = next((v for v in ns.values()
+                         if isinstance(v, type) and issubclass(v, Flow) and v is not Flow),
+                        None)
+        if flow_cls is None:
+            return _err("代码里没有定义 Flow 子类（class XXX(Flow): ...）")
+        flow = flow_cls()
+        tid = flow.submit_to_tasks(_ts(),
+                                   name=str(args.get("name") or ""),
+                                   goal=str(args.get("goal") or ""))
+        asyncio.ensure_future(_mirror_to_center(
+            tid, str(args.get("name") or flow_cls.__name__),
+            str(args.get("goal") or "")))
+        return _ok({"task_id": tid, "flow_class": flow_cls.__name__,
+                    "hint": "已后台执行并挂到任务中心；用 harness_task_status 查进度，不要反复重复提交。"})
+    except Exception as e:
+        return _err(e)
 async def harness_batch_submit(args: dict) -> str:
     try:
         tid = _ts().submit_batch(
@@ -183,10 +312,32 @@ async def harness_task_retry(args: dict) -> str:
 HANDLERS = {
     "harness_flow_plan": harness_flow_plan,
     "harness_flow_submit": harness_flow_submit,
+    "harness_flow_dsl_submit": harness_flow_dsl_submit,
     "harness_batch_submit": harness_batch_submit,
     "harness_task_status": harness_task_status,
     "harness_task_list": harness_task_list,
     "harness_task_cancel": harness_task_cancel,
     "harness_task_retry": harness_task_retry,
     "harness_task_confirm": harness_task_confirm,
+    # ---- 合并自原 todo 技能（9 个 TODO 任务清单工具）----
+    "todo_breakdown": todo_impl._do_breakdown,
+    "todo_create": todo_impl._do_create,
+    "todo_plan": todo_impl._do_plan,
+    "todo_list": todo_impl._do_list,
+    "todo_get": todo_impl._do_get,
+    "todo_update": todo_impl._do_update,
+    "todo_subtask": todo_impl._do_subtask,
+    "todo_remind": todo_impl._do_remind,
+    "todo_delete": todo_impl._do_delete,
+    # ---- 合并自原 scheduler 技能（5 个定时任务工具）----
+    "sched_add": sched_impl.sched_add,
+    "sched_list": sched_impl.sched_list,
+    "sched_run_now": sched_impl.sched_run_now,
+    "sched_toggle": sched_impl.sched_toggle,
+    "sched_remove": sched_impl.sched_remove,
+    # ---- 合并自原 execution_loop 技能（4 个策略复盘工具）----
+    "execution_review": exec_loop_impl._review,
+    "strategy_lookup": exec_loop_impl._lookup,
+    "execution_record": exec_loop_impl._record,
+    "strategy_feedback": exec_loop_impl._feedback,
 }

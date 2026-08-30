@@ -1,0 +1,13 @@
+{
+  "name": "continuous-learning",
+  "title": "continuous-learning",
+  "version": "1.0.0",
+  "description": "从 rohitg00/awesome-claude-code-toolkit 拉取的 Agent Skill。",
+  "author": "rohitg00",
+  "enabled": true,
+  "prompt": "【技能 continuous-learning】已就绪：使用说明见本目录 SKILL.md；涉及 从 rohitg00/awesome-claude-code-toolkit 拉 等需求时，先调用 skill_help('continuous-learning') 读取说明书再执行。",
+  "tools": [],
+  "_pulled_from": "rohitg00/awesome-claude-code-toolkit",
+  "_pulled_path": "skills/continuous-learning",
+  "disclosure": "on_demand"
+}

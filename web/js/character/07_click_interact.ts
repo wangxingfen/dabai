@@ -1232,12 +1232,13 @@ export default (function init(App: AppKernel) {
     for (const j of joints) {
       const s = j.settings;
       if (!s) continue;
-      // 增大阻尼 (默认 0.4 → 0.9)：减少震荡
-      s.dragForce = Math.min(0.95, (s.dragForce ?? 0.4) * 2.5);
-      // 降低刚度 (默认 1.0 → 0.35)：减少回弹力度
-      s.stiffness = Math.min(0.4, (s.stiffness ?? 1) * 0.35);
+      // 增大阻尼 (默认 0.4 → 0.85)：减少震荡
+      s.dragForce = Math.min(0.95, (s.dragForce ?? 0.4) * 2.0);
+      // 保持刚度 (默认 1.0 → 0.85)：裙子/头发靠 stiffness 撑住形态，
+      // 压太低（0.35）会让裙子失去刚性 → 乱飞
+      s.stiffness = Math.max(0.8, Math.min(1.0, (s.stiffness ?? 1) * 0.85));
       // 降低重力 (减少下垂幅度)
-      s.gravityPower = (s.gravityPower ?? 0) * 0.4;
+      s.gravityPower = (s.gravityPower ?? 0) * 0.6;
       count++;
     }
     console.log(`[VRM] 弹簧骨骼调优完成: ${count} 个关节 (dragForce↑ stiffness↓ gravity↓)`);
